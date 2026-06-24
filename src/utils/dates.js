@@ -1,54 +1,54 @@
-// Financial year: April 1 to March 31
-// FY 2024-25 → code "2425"
+/** Format date string/Date to "15 Jun 2025" */
+export function fmtDate(d) {
+  if (!d) return '—'
+  return new Date(d).toLocaleDateString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric',
+  })
+}
 
+/** Format to YYYY-MM-DD for date inputs */
+export function toInputDate(d) {
+  if (!d) return ''
+  return new Date(d).toISOString().split('T')[0]
+}
+
+/** Today as YYYY-MM-DD */
 export function today() {
-  return new Date().toISOString().slice(0, 10)
+  return new Date().toISOString().split('T')[0]
 }
 
-export function getFYCode(date) {
-  const d = date ? new Date(date) : new Date()
-  const year = d.getFullYear()
-  const month = d.getMonth() + 1 // 1-12
-  // April (4) onwards = new FY
-  if (month >= 4) {
-    return String(year).slice(2) + String(year + 1).slice(2)
-  }
-  return String(year - 1).slice(2) + String(year).slice(2)
+/** Current financial year label e.g. "FY 2025-26" */
+export function currentFYLabel() {
+  const now = new Date()
+  const m = now.getMonth() // 0-indexed
+  const y = now.getFullYear()
+  const start = m >= 3 ? y : y - 1
+  return `FY ${start}-${String(start + 1).slice(2)}`
 }
 
-export function getFYName(date) {
-  const code = getFYCode(date)
-  return `FY 20${code.slice(0, 2)}-${code.slice(2)}`
+/** FY code for doc numbering e.g. "2526" for FY 2025-26 */
+export function currentFYCode() {
+  const now = new Date()
+  const m = now.getMonth()
+  const y = now.getFullYear()
+  const start = m >= 3 ? y : y - 1
+  return `${String(start).slice(2)}${String(start + 1).slice(2)}`
 }
 
-export function getFYDates(code) {
-  // code = "2425"
-  const startYear = 2000 + parseInt(code.slice(0, 2))
-  return {
-    start: `${startYear}-04-01`,
-    end: `${startYear + 1}-03-31`,
-  }
-}
-
-export function formatDate(dateStr) {
-  if (!dateStr) return '—'
-  const d = new Date(dateStr)
-  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
-}
-
-export function formatDateShort(dateStr) {
-  if (!dateStr) return '—'
-  const d = new Date(dateStr)
-  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })
-}
-
-export function daysUntil(dateStr) {
-  if (!dateStr) return null
-  const diff = new Date(dateStr) - new Date()
-  return Math.ceil(diff / (1000 * 60 * 60 * 24))
-}
-
-export function isOverdue(dateStr) {
-  if (!dateStr) return false
-  return new Date(dateStr) < new Date()
+/** List of FY options for selects */
+export function fyOptions(count = 3) {
+  const now = new Date()
+  const m = now.getMonth()
+  const y = now.getFullYear()
+  const currentStart = m >= 3 ? y : y - 1
+  return Array.from({ length: count }, (_, i) => {
+    const s = currentStart - i
+    const e = s + 1
+    return {
+      label: `FY ${s}-${String(e).slice(2)}`,
+      start: `${s}-04-01`,
+      end:   `${e}-03-31`,
+      code:  `${String(s).slice(2)}${String(e).slice(2)}`,
+    }
+  })
 }

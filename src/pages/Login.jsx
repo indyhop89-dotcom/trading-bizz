@@ -1,84 +1,95 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 
-export default function LoginPage() {
+export default function Login() {
   const { signIn } = useAuth()
-  const [email, setEmail] = useState('')
+  const navigate = useNavigate()
+  const [email, setEmail]       = useState('')
   const [password, setPassword] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError]       = useState('')
+  const [loading, setLoading]   = useState(false)
 
   async function handleSubmit(e) {
     e.preventDefault()
     setLoading(true)
     setError('')
-    try {
-      await signIn(email, password)
-    } catch (err) {
-      setError(err.message || 'Login failed')
-    } finally {
-      setLoading(false)
-    }
+    const { error } = await signIn(email, password)
+    setLoading(false)
+    if (error) setError(error.message)
+    else navigate('/')
   }
 
   return (
     <div style={{
-      minHeight: '100vh',
-      background: 'var(--bg)',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      padding: 24,
+      minHeight: '100vh', background: '#f5f0e8',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: "'Inter', 'Segoe UI', sans-serif",
+      padding: '24px',
     }}>
-      <div style={{ width: '100%', maxWidth: 400 }}>
-        <div style={{ textAlign: 'center', marginBottom: 32 }}>
-          <div style={{ fontSize: 32, marginBottom: 8 }}>📊</div>
-          <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: -0.5 }}>Trading Bizz</h1>
-          <p style={{ color: 'var(--ink2)', marginTop: 6, fontSize: 13 }}>
-            Multi-entity B2B tracking
-          </p>
+      <div style={{
+        background: '#fffdf6', border: '1px solid #e8dfc8',
+        borderRadius: '14px', padding: '40px',
+        width: '100%', maxWidth: '400px',
+        boxShadow: '0 8px 40px rgba(26,18,8,0.1)',
+      }}>
+        <div style={{ marginBottom: '32px' }}>
+          <div style={{ fontSize: '22px', fontWeight: 800, color: '#1a1208', marginBottom: '4px' }}>
+            Trading Bizz
+          </div>
+          <div style={{ fontSize: '13px', color: '#9a8a6a' }}>Vananam Group — Sign in to continue</div>
         </div>
 
-        <div className="card">
-          <form onSubmit={handleSubmit}>
-            <div className="field">
-              <label className="field-label">Email</label>
-              <input
-                className="field-input"
-                type="email"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                placeholder="you@example.com"
-                required
-                autoFocus
-              />
-            </div>
-            <div className="field">
-              <label className="field-label">Password</label>
-              <input
-                className="field-input"
-                type="password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                placeholder="••••••••"
-                required
-              />
-            </div>
-            {error && <div className="alert alert-danger">{error}</div>}
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={loading}
-              style={{ width: '100%', justifyContent: 'center', marginTop: 4 }}
-            >
-              {loading ? <><span className="spinner spinner-sm" style={{ borderTopColor: '#fff', borderColor: 'rgba(255,255,255,0.3)' }} /> Signing in…</> : 'Sign In'}
-            </button>
-          </form>
-        </div>
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          <div>
+            <label style={{ fontSize: '11px', fontWeight: 700, color: '#7a6a4a', textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: '4px' }}>
+              Email
+            </label>
+            <input
+              type='email' value={email} onChange={e => setEmail(e.target.value)}
+              required placeholder='you@vananam.in'
+              style={{
+                width: '100%', padding: '9px 12px', boxSizing: 'border-box',
+                border: '1.5px solid #e8dfc8', borderRadius: '6px',
+                background: '#fffdf6', fontSize: '14px', color: '#1a1208',
+                outline: 'none', fontFamily: 'inherit',
+              }}
+            />
+          </div>
+          <div>
+            <label style={{ fontSize: '11px', fontWeight: 700, color: '#7a6a4a', textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: '4px' }}>
+              Password
+            </label>
+            <input
+              type='password' value={password} onChange={e => setPassword(e.target.value)}
+              required placeholder='••••••••'
+              style={{
+                width: '100%', padding: '9px 12px', boxSizing: 'border-box',
+                border: '1.5px solid #e8dfc8', borderRadius: '6px',
+                background: '#fffdf6', fontSize: '14px', color: '#1a1208',
+                outline: 'none', fontFamily: 'inherit',
+              }}
+            />
+          </div>
 
-        <p style={{ textAlign: 'center', marginTop: 16, fontSize: 12, color: 'var(--ink3)' }}>
-          Contact your admin to get access
-        </p>
+          {error && (
+            <div style={{ background: '#f0e8e8', color: '#8a2020', padding: '10px 12px', borderRadius: '6px', fontSize: '13px' }}>
+              {error}
+            </div>
+          )}
+
+          <button
+            type='submit' disabled={loading}
+            style={{
+              background: '#1a1208', color: '#f5f0e8',
+              border: 'none', padding: '10px', borderRadius: '6px',
+              fontSize: '14px', fontWeight: 600, cursor: loading ? 'not-allowed' : 'pointer',
+              opacity: loading ? 0.6 : 1, fontFamily: 'inherit', marginTop: '4px',
+            }}
+          >
+            {loading ? 'Signing in…' : 'Sign in'}
+          </button>
+        </form>
       </div>
     </div>
   )

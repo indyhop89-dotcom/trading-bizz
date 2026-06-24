@@ -1,57 +1,66 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from './hooks/useAuth'
-import { useToast, ToastContainer } from './components/UI/Toast'
-import { Layout } from './components/Layout'
-import LoginPage from './pages/Login'
-import DashboardPage from './pages/Dashboard'
-import EntitiesPage from './pages/Entities'
-import StockPage from './pages/Stock'
-import OrdersPage from './pages/Orders'
-import PIPage from './pages/PI'
-import POPage from './pages/PO'
-import InvoicesPage from './pages/Invoices'
-import PaymentsPage from './pages/Payments'
-import ExpensesPage from './pages/Expenses'
-import BillDiscountingPage from './pages/BillDiscounting'
-import ReportsPage from './pages/Reports'
-import SettingsPage from './pages/Settings'
-import { Loading } from './components/UI'
+import Layout from './components/Layout/Layout'
+import { Spinner } from './components/UI/index'
+
+import Login            from './pages/Login'
+import Dashboard        from './pages/Dashboard/index'
+import Entities         from './pages/Entities/index'
+import Stock            from './pages/Stock/index'
+import Orders           from './pages/Orders/index'
+import PI               from './pages/PI/index'
+import PO               from './pages/PO/index'
+import Invoices         from './pages/Invoices/index'
+import CreditDebitNotes from './pages/CreditDebitNotes/index'
+import Payments         from './pages/Payments/index'
+import Expenses         from './pages/Expenses/index'
+import BillDiscounting  from './pages/BillDiscounting/index'
+import Reports          from './pages/Reports/index'
+import Notifications    from './pages/Notifications/index'
+import Reconciliation   from './pages/Reconciliation/index'
+import Settings         from './pages/Settings/index'
+
+function AuthGuard({ children }) {
+  const { user, loading } = useAuth()
+  if (loading) return (
+    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f5f0e8' }}>
+      <Spinner size={32} />
+    </div>
+  )
+  if (!user) return <Navigate to='/login' replace />
+  return children
+}
 
 function AppRoutes() {
-  const { user, profile, loading, signOut } = useAuth()
-  const { toasts, addToast } = useToast()
-
-  if (loading) {
-    return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <Loading message="Loading Trading Bizz…" />
-      </div>
-    )
-  }
-
-  if (!user) return <LoginPage />
-
+  const { user } = useAuth()
   return (
-    <>
-      <Layout user={profile} onSignOut={signOut}>
-        <Routes>
-          <Route path="/"             element={<DashboardPage />} />
-          <Route path="/orders/*"     element={<OrdersPage />} />
-          <Route path="/entities/*"   element={<EntitiesPage />} />
-          <Route path="/stock/*"      element={<StockPage />} />
-          <Route path="/pi/*"         element={<PIPage />} />
-          <Route path="/po/*"         element={<POPage />} />
-          <Route path="/invoices/*"   element={<InvoicesPage />} />
-          <Route path="/payments/*"   element={<PaymentsPage />} />
-          <Route path="/expenses/*"   element={<ExpensesPage />} />
-          <Route path="/discounting/*" element={<BillDiscountingPage />} />
-          <Route path="/reports/*"    element={<ReportsPage />} />
-          <Route path="/settings/*"   element={<SettingsPage />} />
-          <Route path="*"             element={<Navigate to="/" replace />} />
-        </Routes>
-      </Layout>
-      <ToastContainer toasts={toasts} />
-    </>
+    <Routes>
+      <Route path='/login' element={user ? <Navigate to='/' replace /> : <Login />} />
+      <Route path='/*' element={
+        <AuthGuard>
+          <Layout>
+            <Routes>
+              <Route path='/'                     element={<Dashboard />} />
+              <Route path='/entities/*'           element={<Entities />} />
+              <Route path='/stock/*'              element={<Stock />} />
+              <Route path='/orders/*'             element={<Orders />} />
+              <Route path='/pi/*'                 element={<PI />} />
+              <Route path='/po/*'                 element={<PO />} />
+              <Route path='/invoices/*'           element={<Invoices />} />
+              <Route path='/credit-debit-notes/*' element={<CreditDebitNotes />} />
+              <Route path='/payments/*'           element={<Payments />} />
+              <Route path='/expenses/*'           element={<Expenses />} />
+              <Route path='/bill-discounting/*'   element={<BillDiscounting />} />
+              <Route path='/reports/*'            element={<Reports />} />
+              <Route path='/notifications/*'      element={<Notifications />} />
+              <Route path='/reconciliation/*'     element={<Reconciliation />} />
+              <Route path='/settings/*'           element={<Settings />} />
+              <Route path='*'                     element={<Navigate to='/' replace />} />
+            </Routes>
+          </Layout>
+        </AuthGuard>
+      } />
+    </Routes>
   )
 }
 

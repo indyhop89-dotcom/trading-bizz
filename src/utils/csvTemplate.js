@@ -1,0 +1,158 @@
+/**
+ * CSV Template utility
+ * downloadCSV(filename, headers, rows) — triggers browser download instantly.
+ * No server, no libraries — pure browser.
+ */
+
+export function downloadCSV(filename, headers, rows) {
+  const escape = val => {
+    if (val === null || val === undefined) return ''
+    const str = String(val)
+    // wrap in quotes if contains comma, quote, or newline
+    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+      return `"${str.replace(/"/g, '""')}"`
+    }
+    return str
+  }
+
+  const lines = [
+    headers.map(escape).join(','),
+    ...rows.map(row => headers.map(h => escape(row[h] ?? '')).join(',')),
+  ]
+
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' })
+  const url  = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href     = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
+// ─── Templates ────────────────────────────────────────────────────────────────
+
+export const TEMPLATES = {
+
+  products: {
+    filename: 'products_template.csv',
+    headers:  ['name', 'hsn_code', 'gst_rate', 'unit', 'default_rate', 'description'],
+    rows: [
+      { name: 'T-Shirt Basic Round Neck', hsn_code: '6109', gst_rate: 12, unit: 'Nos', default_rate: 250, description: 'Basic round neck t-shirt' },
+      { name: 'Cotton Woven Fabric', hsn_code: '5208', gst_rate: 5,  unit: 'Mtr', default_rate: 180, description: 'Cotton fabric 200gsm' },
+      { name: 'Polo T-Shirt', hsn_code: '6110', gst_rate: 12, unit: 'Nos', default_rate: 450, description: 'Polo collar t-shirt' },
+    ],
+  },
+
+  opening_stock: {
+    filename: 'opening_stock_template.csv',
+    headers:  ['entity', 'product', 'fy', 'qty', 'rate', 'as_of_date'],
+    rows: [
+      { entity: 'Siddi', product: 'T-Shirt Basic Round Neck', fy: 'FY 2025-26', qty: 1000, rate: 250, as_of_date: '2025-04-01' },
+      { entity: 'Retail', product: 'Cotton Woven Fabric',      fy: 'FY 2025-26', qty: 500,  rate: 180, as_of_date: '2025-04-01' },
+      { entity: 'MVL',    product: 'Polo T-Shirt',             fy: 'FY 2025-26', qty: 300,  rate: 450, as_of_date: '2025-04-01' },
+    ],
+    notes: [
+      '# entity   = short name or full name exactly as in Entities module',
+      '# product  = product name exactly as in Products',
+      '# fy       = financial year name exactly as in Settings → Financial Years',
+      '# rate     = rate per unit in rupees',
+      '# as_of_date = YYYY-MM-DD format',
+    ],
+  },
+
+  hsn_master: {
+    filename: 'hsn_master_template.csv',
+    headers:  ['hsn_code', 'description', 'rate_type', 'fixed_rate', 'slabs'],
+    rows: [
+      { hsn_code: '5208', description: 'Cotton woven fabric >=85%, <=200gsm', rate_type: 'fixed', fixed_rate: 5,  slabs: '' },
+      { hsn_code: '6109', description: 'T-shirts, singlets, vests knitted',    rate_type: 'slab',  fixed_rate: '', slabs: '1000:5|null:12' },
+      { hsn_code: '6201', description: 'Mens overcoats and capes',             rate_type: 'slab',  fixed_rate: '', slabs: '1000:5|5000:12|null:18' },
+    ],
+    notes: [
+      '# rate_type  = fixed OR slab',
+      '# fixed_rate = GST % for fixed type (leave blank for slab)',
+      '# slabs      = for slab type: threshold_rupees:gst_rate pairs separated by |',
+      '#             null threshold = open-ended final slab (must be last)',
+      '#             example: 1000:5|null:12 means <=Rs1000 @ 5%, above @ 12%',
+    ],
+  },
+
+  pi: {
+    filename: 'pi_template.csv',
+    headers:  ['pi_date', 'from_entity', 'to_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'valid_upto', 'notes'],
+    rows: [
+      { pi_date: '2025-04-15', from_entity: 'Siddi', to_entity: 'Retail', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, valid_upto: '2025-05-15', notes: '' },
+      { pi_date: '2025-04-15', from_entity: 'Siddi', to_entity: 'Retail', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, valid_upto: '2025-05-15', notes: '' },
+      { pi_date: '2025-04-20', from_entity: 'Retail', to_entity: 'MVL',   is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, valid_upto: '2025-05-20', notes: 'Export order' },
+    ],
+    notes: [
+      '# Each row = one LINE ITEM. Multiple rows with same pi_date+from+to = same PI.',
+      '# from_entity / to_entity = short name or full name exactly as in Entities',
+      '# is_interstate = true or false',
+      '# rate = rate per unit in rupees (no symbols)',
+      '# gst_rate = GST % number only e.g. 12 or 18',
+    ],
+  },
+
+  po: {
+    filename: 'po_template.csv',
+    headers:  ['po_date', 'buyer_entity', 'seller_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'delivery_date', 'notes'],
+    rows: [
+      { po_date: '2025-04-16', buyer_entity: 'Retail', seller_entity: 'Siddi', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, delivery_date: '2025-05-01', notes: '' },
+      { po_date: '2025-04-16', buyer_entity: 'Retail', seller_entity: 'Siddi', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, delivery_date: '2025-05-01', notes: '' },
+      { po_date: '2025-04-21', buyer_entity: 'MVL',   seller_entity: 'Retail', is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, delivery_date: '2025-05-10', notes: '' },
+    ],
+    notes: [
+      '# Each row = one LINE ITEM. Multiple rows with same po_date+buyer+seller = same PO.',
+      '# buyer_entity / seller_entity = short name or full name exactly as in Entities',
+      '# is_interstate = true or false',
+      '# rate = rate per unit in rupees',
+    ],
+  },
+
+  invoices: {
+    filename: 'invoices_template.csv',
+    headers:  ['invoice_date', 'invoice_type', 'seller_entity', 'buyer_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'due_date', 'notes'],
+    rows: [
+      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, due_date: '2025-05-30', notes: '' },
+      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, due_date: '2025-05-30', notes: '' },
+      { invoice_date: '2025-05-05', invoice_type: 'sales', seller_entity: 'Retail', buyer_entity: 'MVL',  is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, due_date: '2025-06-05', notes: 'Export invoice' },
+    ],
+    notes: [
+      '# Each row = one LINE ITEM. Multiple rows with same invoice_date+seller+buyer = same Invoice.',
+      '# invoice_type = sales or purchase',
+      '# seller_entity / buyer_entity = short name or full name exactly as in Entities',
+      '# is_interstate = true or false',
+      '# rate = rate per unit in rupees',
+    ],
+  },
+
+  entities: {
+    filename: 'entities_template.csv',
+    headers:  ['name', 'short_name', 'type', 'gstin', 'pan', 'state_code', 'state_name', 'city', 'pincode', 'email', 'phone', 'bank_name', 'bank_account_no', 'bank_ifsc'],
+    rows: [
+      { name: 'Siddhi Garments Pvt Ltd', short_name: 'Siddi', type: 'associate', gstin: '29AABCS1234A1Z5', pan: 'AABCS1234A', state_code: '29', state_name: 'Karnataka', city: 'Bangalore', pincode: '560001', email: 'siddi@vananam.in', phone: '9876543210', bank_name: 'HDFC Bank', bank_account_no: '12345678901234', bank_ifsc: 'HDFC0001234' },
+      { name: 'Retail Solutions LLP',    short_name: 'Retail', type: 'associate', gstin: '29AABCR5678A1Z5', pan: 'AABCR5678A', state_code: '29', state_name: 'Karnataka', city: 'Bangalore', pincode: '560002', email: 'retail@vananam.in', phone: '9876543211', bank_name: 'ICICI Bank', bank_account_no: '98765432109876', bank_ifsc: 'ICIC0001234' },
+      { name: 'Creative Vision Textiles LLC', short_name: 'CVT', type: 'external', gstin: '',              pan: '',           state_code: '',   state_name: '',          city: 'Dubai',     pincode: '',       email: 'cvt@example.com',    phone: '+971501234567', bank_name: '', bank_account_no: '', bank_ifsc: '' },
+    ],
+    notes: [
+      '# type = group | associate | external',
+      '# state_code = 2-digit GST state code e.g. 29 for Karnataka',
+      '# Leave fields blank if not applicable',
+    ],
+  },
+
+}
+
+/** Download a template by key */
+export function downloadTemplate(key) {
+  const t = TEMPLATES[key]
+  if (!t) return
+  // Add notes as comment rows at the top if present
+  const allRows = t.rows
+  downloadCSV(t.filename, t.headers, allRows)
+  // Also log notes to console for reference
+  if (t.notes) console.log(`[${key} template notes]\n` + t.notes.join('\n'))
+}
