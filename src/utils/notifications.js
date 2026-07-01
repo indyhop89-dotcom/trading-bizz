@@ -17,47 +17,55 @@ export async function generateNotifications(userId) {
 
   const notifs = []
 
-  // 1. Overdue invoice payments
-  const { data: overdueInv } = await supabase
-    .from('invoice_payments')
-    .select('id, invoice_no, amount, currency, entity_id')
+  // 1 & 2. Invoice payment overdue / due soon — computed per INVOICE, aggregating
+  // all payment tranches recorded against it (invoice_payments is now one row
+  // per payment tranche, not a single snapshot of the whole invoice).
+  const { data: invForNotif } = await supabase
+    .from('invoices')
+    .select('id, invoice_no, total_amount, due_date, buyer_entity_id')
     .eq('is_deleted', false)
-    .is('actual_payment_date', null)
-    .lt('due_date', today)
+    .neq('status', 'cancelled')
     .not('due_date', 'is', null)
 
-  for (const r of (overdueInv || [])) {
-    notifs.push({
-      user_id:           userId,
-      title:             `Invoice payment overdue`,
-      message:           `Invoice ${r.invoice_no || r.id.slice(0,8)} payment of ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} is past due.`,
-      notification_type: 'overdue_invoice',
-      source_type:       'invoice_payments',
-      source_id:         r.id,
-      entity_id:         r.entity_id || null,
-    })
+  const invIds = (invForNotif || []).map(i => i.id)
+  const settledMap = new Map()
+  if (invIds.length > 0) {
+    const { data: tranches } = await supabase
+      .from('invoice_payments')
+      .select('invoice_id, amount, tds_amount, adjustments')
+      .eq('is_deleted', false)
+      .in('invoice_id', invIds)
+    for (const t of (tranches || [])) {
+      const prev = settledMap.get(t.invoice_id) || 0
+      settledMap.set(t.invoice_id, prev + (Number(t.amount) || 0) + (Number(t.tds_amount) || 0) + (Number(t.adjustments) || 0))
+    }
   }
 
-  // 2. Invoice payments due within 7 days
-  const { data: dueSoonInv } = await supabase
-    .from('invoice_payments')
-    .select('id, invoice_no, amount, currency, due_date, entity_id')
-    .eq('is_deleted', false)
-    .is('actual_payment_date', null)
-    .gte('due_date', today)
-    .lte('due_date', soon)
-
-  for (const r of (dueSoonInv || [])) {
-    notifs.push({
-      user_id:           userId,
-      title:             `Invoice payment due soon`,
-      message:           `Invoice ${r.invoice_no || r.id.slice(0,8)} — ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} due on ${r.due_date}.`,
-      notification_type: 'payment_due',
-      source_type:       'invoice_payments',
-      source_id:         r.id,
-      entity_id:         r.entity_id || null,
-      due_date:          r.due_date,
-    })
+  for (const inv of (invForNotif || [])) {
+    const pending = Math.round((Number(inv.total_amount) || 0) - (settledMap.get(inv.id) || 0))
+    if (pending <= 0) continue
+    if (inv.due_date < today) {
+      notifs.push({
+        user_id:           userId,
+        title:             `Invoice payment overdue`,
+        message:           `Invoice ${inv.invoice_no || inv.id.slice(0,8)} — ${pending.toLocaleString('en-IN')} pending, past due.`,
+        notification_type: 'overdue_invoice',
+        source_type:       'invoices',
+        source_id:         inv.id,
+        entity_id:         inv.buyer_entity_id || null,
+      })
+    } else if (inv.due_date <= soon) {
+      notifs.push({
+        user_id:           userId,
+        title:             `Invoice payment due soon`,
+        message:           `Invoice ${inv.invoice_no || inv.id.slice(0,8)} — ${pending.toLocaleString('en-IN')} due on ${inv.due_date}.`,
+        notification_type: 'payment_due',
+        source_type:       'invoices',
+        source_id:         inv.id,
+        entity_id:         inv.buyer_entity_id || null,
+        due_date:          inv.due_date,
+      })
+    }
   }
 
   // 3. Expense payments overdue

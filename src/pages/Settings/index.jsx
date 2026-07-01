@@ -1,959 +1,921 @@
 import { useState, useEffect, useCallback } from 'react'
+import { Routes, Route, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Modal, ConfirmModal, Toast, EmptyState,
-  Card, FormRow, Input, Select, Textarea, SectionDivider, Badge,
+  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop,
 } from '../../components/UI/index'
-import { fmtDate } from '../../utils/dates'
-import { formatSlabSummary } from '../../utils/hsn'
-import { downloadTemplate } from '../../utils/csvTemplate'
+import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
+import { formatINR, toNum } from '../../utils/money'
+import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { buildHSNMap } from '../../utils/hsn'
+import DocumentAttachments from '../../components/DocumentAttachments'
+import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
 
-const TABS = ['Financial Years', 'Entity Groups', 'HSN Master', 'Users', 'Reliance Tracker']
-
-// ─── Financial Years ──────────────────────────────────────────────────────────
-function FYSettings() {
-  const [fys, setFys]       = useState([])
-  const [loading, setLoading] = useState(true)
-  const [modalOpen, setModalOpen] = useState(false)
-  const [editing, setEditing] = useState(null)
-  const [form, setForm]     = useState({ name: '', start_date: '', end_date: '', is_active: true })
-  const [saving, setSaving] = useState(false)
-  const [toast, setToast]   = useState(null)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    const { data } = await supabase.from('financial_years').select('*').order('start_date', { ascending: false })
-    setFys(data || [])
-    setLoading(false)
-  }, [])
-
-  useEffect(() => { load() }, [load])
-
-  function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
-
-  function openNew() {
-    setEditing(null)
-    setForm({ name: '', start_date: '', end_date: '', is_active: true })
-    setModalOpen(true)
-  }
-
-  function openEdit(fy) {
-    setEditing(fy)
-    setForm({ name: fy.name, start_date: fy.start_date, end_date: fy.end_date, is_active: fy.is_active })
-    setModalOpen(true)
-  }
-
-  async function handleSave() {
-    if (!form.name || !form.start_date || !form.end_date) return setToast({ message: 'All fields required', type: 'error' })
-    setSaving(true)
-    let error
-    if (editing) {
-      const res = await supabase.from('financial_years').update(form).eq('id', editing.id)
-      error = res.error
-    } else {
-      const res = await supabase.from('financial_years').insert(form)
-      error = res.error
-    }
-    setSaving(false)
-    if (error) return setToast({ message: error.message, type: 'error' })
-    setToast({ message: editing ? 'FY updated' : 'FY created', type: 'success' })
-    setModalOpen(false)
-    load()
-  }
-
-  return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-        <div style={{ fontWeight: 700 }}>Financial Years</div>
-        <Btn size='sm' onClick={openNew}>+ Add FY</Btn>
-      </div>
-      <Card>
-        {loading
-          ? <div style={{ padding: '32px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
-          : fys.length === 0
-            ? <EmptyState icon='📅' title='No financial years' action={<Btn onClick={openNew}>+ Add FY</Btn>} />
-            : fys.map(fy => (
-              <div key={fy.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', borderBottom: `1px solid ${C.border}` }}>
-                <div>
-                  <div style={{ fontWeight: 600 }}>{fy.name}</div>
-                  <div style={{ fontSize: '12px', color: C.textSoft }}>{fmtDate(fy.start_date)} → {fmtDate(fy.end_date)}</div>
-                </div>
-                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <Badge status={fy.is_active ? 'active' : 'cancelled'} label={fy.is_active ? 'Active' : 'Inactive'} />
-                  <Btn size='sm' variant='ghost' onClick={() => openEdit(fy)}>Edit</Btn>
-                </div>
-              </div>
-            ))
-        }
-      </Card>
-
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? 'Edit FY' : 'New Financial Year'} width={440}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          <FormRow label='Name' required hint='e.g. FY 2025-26'>
-            <Input value={form.name} onChange={e => setF('name', e.target.value)} placeholder='FY 2025-26' />
-          </FormRow>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='Start Date' required><Input type='date' value={form.start_date} onChange={e => setF('start_date', e.target.value)} /></FormRow>
-            <FormRow label='End Date' required><Input type='date' value={form.end_date} onChange={e => setF('end_date', e.target.value)} /></FormRow>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <input type='checkbox' id='fy_active' checked={form.is_active} onChange={e => setF('is_active', e.target.checked)} style={{ width: '14px', height: '14px' }} />
-            <label htmlFor='fy_active' style={{ fontSize: '13px', color: C.textMid, cursor: 'pointer' }}>Active</label>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
-            <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save' : 'Create'}</Btn>
-          </div>
-        </div>
-      </Modal>
-      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
-    </div>
-  )
+const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
+const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
+const TDS_SECTION_LABELS = {
+  '194C': 'Payment to Contractors',
+  '194H': 'Commission or Brokerage',
+  '194I': 'Rent',
+  '194J': 'Professional/Technical Services',
+  '194Q': 'Purchase of Goods',
+  '206C': 'TCS on Sale of Goods',
 }
 
-// ─── Entity Groups ────────────────────────────────────────────────────────────
-function GroupSettings() {
-  const [groups, setGroups]   = useState([])
-  const [loading, setLoading] = useState(true)
-  const [modalOpen, setModalOpen] = useState(false)
-  const [editing, setEditing] = useState(null)
-  const [form, setForm]       = useState({ name: '', description: '' })
-  const [saving, setSaving]   = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState(null)
-  const [toast, setToast]     = useState(null)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    const { data } = await supabase.from('entity_groups').select('*, entities(count)').order('name')
-    setGroups(data || [])
-    setLoading(false)
-  }, [])
-
-  useEffect(() => { load() }, [load])
-
-  function openNew()    { setEditing(null); setForm({ name: '', description: '' }); setModalOpen(true) }
-  function openEdit(g)  { setEditing(g); setForm({ name: g.name, description: g.description || '' }); setModalOpen(true) }
-
-  async function handleSave() {
-    if (!form.name) return setToast({ message: 'Name required', type: 'error' })
-    setSaving(true)
-    let error
-    if (editing) {
-      const res = await supabase.from('entity_groups').update(form).eq('id', editing.id)
-      error = res.error
-    } else {
-      const res = await supabase.from('entity_groups').insert(form)
-      error = res.error
-    }
-    setSaving(false)
-    if (error) return setToast({ message: error.message, type: 'error' })
-    setToast({ message: editing ? 'Group updated' : 'Group created', type: 'success' })
-    setModalOpen(false)
-    load()
-  }
-
-  async function handleDelete() {
-    await supabase.from('entity_groups').delete().eq('id', confirmDelete.id)
-    setConfirmDelete(null)
-    load()
-  }
-
-  return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
-        <div style={{ fontWeight: 700 }}>Entity Groups</div>
-        <Btn size='sm' onClick={openNew}>+ Add Group</Btn>
-      </div>
-      <Card>
-        {loading
-          ? <div style={{ padding: '32px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
-          : groups.length === 0
-            ? <EmptyState icon='🏷️' title='No groups' action={<Btn onClick={openNew}>+ Add Group</Btn>} />
-            : groups.map(g => (
-              <div key={g.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', borderBottom: `1px solid ${C.border}` }}>
-                <div>
-                  <div style={{ fontWeight: 600 }}>{g.name}</div>
-                  {g.description && <div style={{ fontSize: '12px', color: C.textSoft }}>{g.description}</div>}
-                </div>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <Btn size='sm' variant='ghost' onClick={() => openEdit(g)}>Edit</Btn>
-                  <Btn size='sm' variant='ghost' onClick={() => setConfirmDelete(g)} style={{ color: C.danger }}>Delete</Btn>
-                </div>
-              </div>
-            ))
-        }
-      </Card>
-
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? 'Edit Group' : 'New Group'} width={400}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-          <FormRow label='Name' required><Input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} /></FormRow>
-          <FormRow label='Description'><Input value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} /></FormRow>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
-            <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save' : 'Create'}</Btn>
-          </div>
-        </div>
-      </Modal>
-      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
-        title='Delete Group' message={`Delete "${confirmDelete?.name}"?`} danger />
-      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
-    </div>
-  )
+const EMPTY_FORM = {
+  invoice_date: today(), due_date: '', invoice_type: 'sales', status: 'draft',
+  seller_entity_id: '', buyer_entity_id: '',
+  order_id: '', order_leg_id: '', pi_id: '', po_id: '',
+  is_interstate: false,
+  bill_from: '', bill_to: '', ship_from: '', ship_to: '',
+  eway_bill_no: '', eway_bill_date: '',
+  einvoice_irn: '', einvoice_ack_no: '', einvoice_ack_date: '',
+  tds_amount: 0, tcs_amount: 0,
+  notes: '',
 }
 
-// ─── Users ────────────────────────────────────────────────────────────────────
-function UserSettings() {
-  const [profiles, setProfiles] = useState([])
+
+// Resolve current FY — next_inv_no takes (ent_id, fy_id)
+async function resolveFY() {
+  const label = currentFYLabel()
+  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
+  return (data||[]).find(f=>f.name===label)||data?.[0]
+}
+
+async function writeStockMovements(invoice, lines) {
+  if (!lines?.length) return
+  const entries = []
+  for (const l of lines) {
+    if (!l.product_id||!Number(l.qty)) continue
+    const qty=Number(l.qty), rate=Number(l.rate), date=invoice.invoice_date
+    entries.push({entity_id:invoice.seller_entity_id,product_id:l.product_id,posting_date:date,qty_in:0,qty_out:qty,rate,voucher_type:'sales_invoice',voucher_id:invoice.id,voucher_no:invoice.invoice_no||invoice.id,notes:`Invoice outgoing — ${invoice.invoice_no||''}`})
+    entries.push({entity_id:invoice.buyer_entity_id,product_id:l.product_id,posting_date:date,qty_in:qty,qty_out:0,rate,voucher_type:'sales_invoice',voucher_id:invoice.id,voucher_no:invoice.invoice_no||invoice.id,notes:`Invoice incoming — ${invoice.invoice_no||''}`})
+  }
+  if (entries.length) await supabase.from('stock_movements').insert(entries)
+}
+
+// ─── Invoice List ─────────────────────────────────────────────────────────────
+function InvoiceList() {
+  const navigate = useNavigate()
+  const [invoices, setInvoices] = useState([])
+  const [entities, setEntities] = useState([])
   const [loading, setLoading]   = useState(true)
-
-  useEffect(() => {
-    supabase.from('profiles').select('*').order('full_name').then(({ data }) => {
-      setProfiles(data || [])
-      setLoading(false)
-    })
-  }, [])
-
-  return (
-    <div>
-      <div style={{ fontWeight: 700, marginBottom: '16px' }}>Users</div>
-      <Card>
-        {loading
-          ? <div style={{ padding: '32px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
-          : profiles.length === 0
-            ? <EmptyState icon='👤' title='No users' message='Users are managed via Supabase Authentication.' />
-            : profiles.map(p => (
-              <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', borderBottom: `1px solid ${C.border}` }}>
-                <div>
-                  <div style={{ fontWeight: 600 }}>{p.full_name || p.email || p.id.slice(0, 8)}</div>
-                  <div style={{ fontSize: '12px', color: C.textSoft }}>{p.email}</div>
-                </div>
-                <Badge status='active' label={p.role || 'user'} />
-              </div>
-            ))
-        }
-      </Card>
-      <div style={{ marginTop: '12px', fontSize: '12px', color: C.textMuted }}>
-        To add or remove users, use the Supabase dashboard → Authentication → Users.
-      </div>
-    </div>
-  )
-}
-
-// ─── HSN Master ───────────────────────────────────────────────────────────────
-const EMPTY_HSN = {
-  hsn_code: '', description: '', rate_type: 'fixed',
-  fixed_rate: '', is_active: true,
-}
-
-// Default empty slab row
-const EMPTY_SLAB = { max_rate_rupees: '', gst_rate: '' }
-
-function HSNMasterSettings() {
-  const [rows, setRows]           = useState([])
-  const [loading, setLoading]     = useState(true)
-  const [search, setSearch]       = useState('')
-  const [typeFilter, setTypeFilter] = useState('all')
-  const [modalOpen, setModalOpen] = useState(false)
-  const [editing, setEditing]     = useState(null)
-  const [form, setForm]           = useState(EMPTY_HSN)
-  const [slabs, setSlabs]         = useState([EMPTY_SLAB])
-  const [saving, setSaving]       = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState(null)
-  const [toast, setToast]         = useState(null)
-  // CSV upload
-  const [csvText, setCsvText]     = useState('')
+  const [search, setSearch]     = useState('')
+  const [statusFilter, setStatus] = useState('all')
+  const [typeFilter, setType]   = useState('all')
+  const [entityFilter, setEntityF] = useState('')
+  const [toast, setToast]       = useState(null)
   const [csvModal, setCsvModal]   = useState(false)
+  const [csvText, setCsvText]     = useState('')
   const [csvResult, setCsvResult] = useState(null)
   const [csvSaving, setCsvSaving] = useState(false)
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
-    const { data } = await supabase.from('hsn_master').select('*').order('hsn_code')
-    setRows(data || [])
+    const [{ data: invs }, { data: es }] = await Promise.all([
+      supabase.from('invoices')
+        .select('*, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name)')
+        .eq('is_deleted', false).neq('invoice_type', 'intercompany')
+        .order('invoice_date', { ascending: false }),
+      supabase.from('entities').select('id,name,short_name,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
+    ])
+    setInvoices(invs || [])
+    setEntities(es || [])
     setLoading(false)
   }, [])
 
   useEffect(() => { load() }, [load])
 
-  function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
-
-  function openNew() {
-    setEditing(null)
-    setForm(EMPTY_HSN)
-    setSlabs([{ ...EMPTY_SLAB }])
-    setModalOpen(true)
-  }
-
-  function openEdit(row) {
-    setEditing(row)
-    setForm({
-      hsn_code:    row.hsn_code,
-      description: row.description || '',
-      rate_type:   row.rate_type,
-      fixed_rate:  row.fixed_rate != null ? String(row.fixed_rate) : '',
-      is_active:   row.is_active,
-    })
-    if (row.rate_type === 'slab' && Array.isArray(row.slabs)) {
-      setSlabs(row.slabs.map(s => ({
-        max_rate_rupees: s.max_rate != null ? String(s.max_rate) : '',
-        gst_rate:        String(s.gst_rate),
-      })))
-    } else {
-      setSlabs([{ ...EMPTY_SLAB }])
-    }
-    setModalOpen(true)
-  }
-
-  // Slab helpers
-  function addSlab()           { setSlabs(s => [...s, { ...EMPTY_SLAB }]) }
-  function removeSlab(i)       { setSlabs(s => s.filter((_, idx) => idx !== i)) }
-  function updateSlab(i, k, v) { setSlabs(s => { const n = [...s]; n[i] = { ...n[i], [k]: v }; return n }) }
-
-  // Build slabs jsonb (max_rate in rupees)
-  function buildSlabsPayload() {
-    return slabs.map(s => ({
-      max_rate: s.max_rate_rupees !== '' && s.max_rate_rupees !== null
-        ? Number(s.max_rate_rupees)
-        : null,
-      gst_rate: Number(s.gst_rate),
-    }))
-  }
-
-  async function handleSave() {
-    if (!form.hsn_code.trim()) return setToast({ message: 'HSN code is required', type: 'error' })
-    if (form.rate_type === 'fixed' && (form.fixed_rate === '' || isNaN(Number(form.fixed_rate))))
-      return setToast({ message: 'GST rate is required for fixed type', type: 'error' })
-    if (form.rate_type === 'slab') {
-      for (const s of slabs) {
-        if (s.gst_rate === '' || isNaN(Number(s.gst_rate)))
-          return setToast({ message: 'All slab GST rates are required', type: 'error' })
-      }
-      // Last slab must have null max_rate (open-ended)
-      const last = slabs[slabs.length - 1]
-      if (last.max_rate_rupees !== '' && last.max_rate_rupees !== null)
-        return setToast({ message: 'Last slab must have no upper limit (leave threshold blank)', type: 'error' })
-    }
-
-    setSaving(true)
-    const payload = {
-      hsn_code:    form.hsn_code.trim(),
-      description: form.description || null,
-      rate_type:   form.rate_type,
-      fixed_rate:  form.rate_type === 'fixed' ? Number(form.fixed_rate) : null,
-      slabs:       form.rate_type === 'slab' ? buildSlabsPayload() : null,
-      is_active:   form.is_active,
-      updated_at:  new Date(),
-    }
-
-    let error
-    if (editing) {
-      const res = await supabase.from('hsn_master').update(payload).eq('id', editing.id)
-      error = res.error
-    } else {
-      const res = await supabase.from('hsn_master').insert(payload)
-      error = res.error
-    }
-    setSaving(false)
-    if (error) return setToast({ message: error.message, type: 'error' })
-    setToast({ message: editing ? 'HSN updated' : 'HSN created', type: 'success' })
-    setModalOpen(false)
-    load()
-  }
-
-  async function handleDelete() {
-    await supabase.from('hsn_master').delete().eq('id', confirmDelete.id)
-    setConfirmDelete(null)
-    setToast({ message: 'HSN deleted', type: 'success' })
-    load()
-  }
-
-  // ── CSV Upload ─────────────────────────────────────────────────────────────
-  // CSV format:
-  // hsn_code,description,rate_type,fixed_rate,slabs
-  // 6109,T-shirts,slab,,1000:5|null:12
-  // 5208,Cotton fabric,fixed,5,
-  //
-  // Slab format: threshold_rupees:gst_rate pairs separated by |
-  //   "null" threshold = open-ended final slab
-  function parseCSV(text) {
-    const lines = text.trim().split('\n').filter(l => l.trim())
-    if (lines.length < 2) return { error: 'CSV must have header + at least 1 row' }
-
-    const header = lines[0].split(',').map(h => h.trim().toLowerCase())
-    const required = ['hsn_code', 'rate_type']
-    for (const r of required) {
-      if (!header.includes(r)) return { error: `Missing column: ${r}` }
-    }
-
-    const results = []
-    const errors  = []
-
+  async function handleCSV() {
+    setCsvSaving(true)
+    const lines = csvText.trim().split('\n').filter(l => l.trim())
+    if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
+    const delim = detectDelimiter(lines[0])
+    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    let created = 0, errors = []
+    const groups = {}
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(',').map(c => c.trim())
+      const cols = lines[i].split(delim).map(c => c.trim())
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
-
-      if (!row.hsn_code) { errors.push(`Row ${i + 1}: hsn_code missing`); continue }
-      if (!['fixed', 'slab'].includes(row.rate_type)) {
-        errors.push(`Row ${i + 1}: rate_type must be 'fixed' or 'slab'`); continue
-      }
-
-      const parsed = {
-        hsn_code:    row.hsn_code.trim(),
-        description: row.description || null,
-        rate_type:   row.rate_type,
-        fixed_rate:  null,
-        slabs:       null,
-        is_active:   true,
-      }
-
-      if (row.rate_type === 'fixed') {
-        if (!row.fixed_rate || isNaN(Number(row.fixed_rate))) {
-          errors.push(`Row ${i + 1}: fixed_rate required for fixed type`); continue
-        }
-        parsed.fixed_rate = Number(row.fixed_rate)
-      }
-
-      if (row.rate_type === 'slab') {
-        if (!row.slabs) { errors.push(`Row ${i + 1}: slabs required for slab type`); continue }
-        try {
-          parsed.slabs = row.slabs.split('|').map(pair => {
-            const [maxRaw, gstRaw] = pair.trim().split(':')
-            return {
-              max_rate: maxRaw === 'null' || maxRaw === '' ? null : Number(maxRaw),
-              gst_rate: Number(gstRaw),
-            }
-          })
-        } catch {
-          errors.push(`Row ${i + 1}: invalid slab format — use "threshold_rupees:gst|null:gst"`); continue
-        }
-      }
-
-      results.push(parsed)
+      const key = `${row.invoice_date}__${row.seller_entity}__${row.buyer_entity}`
+      if (!groups[key]) groups[key] = { meta: row, lines: [] }
+      groups[key].lines.push(row)
     }
-
-    return { rows: results, errors }
+    for (const [key, group] of Object.entries(groups)) {
+      const { meta, lines: gLines } = group
+      const sellerE = entities.find(e => e.short_name?.toLowerCase() === meta.seller_entity?.toLowerCase() || e.name?.toLowerCase() === meta.seller_entity?.toLowerCase())
+      const buyerE  = entities.find(e => e.short_name?.toLowerCase() === meta.buyer_entity?.toLowerCase()  || e.name?.toLowerCase() === meta.buyer_entity?.toLowerCase())
+      if (!sellerE) { errors.push(`Seller "${meta.seller_entity}" not found`); continue }
+      if (!buyerE)  { errors.push(`Buyer "${meta.buyer_entity}" not found`); continue }
+      const interstate = meta.is_interstate === 'true' || (sellerE.state_code && buyerE.state_code && sellerE.state_code !== buyerE.state_code)
+      const invLines = gLines.map((r, i) => {
+        const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
+        const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
+        const igst = interstate ? Math.round(taxable * gstRate / 100) : 0
+        const cgst = !interstate ? Math.round(taxable * half / 100) : 0
+        return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
+      })
+      const totals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
+      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_date: meta.invoice_date, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: meta.due_date||null, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
+      if (invErr) { errors.push(`Invoice ${meta.invoice_date}: ${invErr.message}`); continue }
+      await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
+      created++
+    }
+    setCsvSaving(false); setCsvResult({ created, errors }); load()
   }
 
-  async function handleCSVUpload() {
-    const parsed = parseCSV(csvText)
-    if (parsed.error) return setToast({ message: parsed.error, type: 'error' })
-
-    setCsvSaving(true)
-    const { rows: toUpsert, errors } = parsed
-
-    let upserted = 0, failed = 0
-    for (const row of toUpsert) {
-      const { error } = await supabase
-        .from('hsn_master')
-        .upsert({ ...row, updated_at: new Date() }, { onConflict: 'hsn_code' })
-      if (error) { failed++; errors.push(`${row.hsn_code}: ${error.message}`) }
-      else upserted++
-    }
-
-    setCsvSaving(false)
-    setCsvResult({ upserted, failed, errors })
-    load()
+  function handleExportCSV() {
+    downloadCSV(`invoices_export_${today()}.csv`,['invoice_no','invoice_date','invoice_type','seller','buyer','tax_type','status','taxable_amount','total_amount','outstanding_amount'],filtered.map(i=>({invoice_no:i.invoice_no||'',invoice_date:i.invoice_date,invoice_type:i.invoice_type,seller:i.seller?.name||'',buyer:i.buyer?.name||'',tax_type:i.is_interstate?'Interstate':'Local',status:i.status,taxable_amount:i.taxable_amount||0,total_amount:i.total_amount||0,outstanding_amount:i.outstanding_amount||0})))
   }
 
-  const filtered = rows.filter(r => {
-    const ms = !search || r.hsn_code.includes(search) ||
-      (r.description || '').toLowerCase().includes(search.toLowerCase())
-    const mt = typeFilter === 'all' || r.rate_type === typeFilter
-    return ms && mt
+  const filtered = invoices.filter(i => {
+    const ms  = !search || (i.invoice_no || '').toLowerCase().includes(search.toLowerCase()) ||
+      i.seller?.name?.toLowerCase().includes(search.toLowerCase()) ||
+      i.buyer?.name?.toLowerCase().includes(search.toLowerCase())
+    const mst = statusFilter === 'all' || i.status === statusFilter
+    const mt  = typeFilter === 'all' || i.invoice_type === typeFilter
+    const me  = !entityFilter || i.seller_entity_id === entityFilter || i.buyer_entity_id === entityFilter
+    return ms && mst && mt && me
   })
 
-  // ── styles ─────────────────────────────────────────────────────────────────
-  const inlineInput = {
-    padding: '6px 10px', border: `1.5px solid ${C.border}`, borderRadius: '5px',
-    background: '#fffdf6', fontSize: '13px', fontFamily: 'inherit', outline: 'none',
-    boxSizing: 'border-box',
-  }
+  // summary totals
+  const totalOutstanding = filtered.reduce((s, i) => s + (i.outstanding_amount || 0), 0)
+  const totalAmount      = filtered.reduce((s, i) => s + (i.total_amount || 0), 0)
+
+  const columns = [
+    { label: 'Invoice No', render: i => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{i.invoice_no || '—'}</span> },
+    { label: 'Type',    render: i => <Badge status={i.invoice_type} label={i.invoice_type === 'sales' ? 'Sales' : 'Purchase'} /> },
+    { label: 'Seller',  render: i => <span style={{ fontSize: '12px' }}>{i.seller?.short_name || i.seller?.name}</span> },
+    { label: 'Buyer',   render: i => <span style={{ fontSize: '12px' }}>{i.buyer?.short_name || i.buyer?.name}</span> },
+    { label: 'Date',    render: i => <span style={{ fontSize: '12px' }}>{fmtDate(i.invoice_date)}</span> },
+    { label: 'Due',     render: i => {
+      if (!i.due_date) return <span style={{ color: C.textMuted }}>—</span>
+      const overdue = new Date(i.due_date) < new Date() && i.status !== 'paid'
+      return <span style={{ fontSize: '12px', color: overdue ? C.danger : C.text, fontWeight: overdue ? 700 : 400 }}>{fmtDate(i.due_date)}{overdue ? ' ⚠️' : ''}</span>
+    }},
+    { label: 'Amount',  right: true, render: i => <span style={{ fontWeight: 600 }}>{formatINR(i.total_amount)}</span> },
+    { label: 'Outstanding', right: true, render: i => <span style={{ fontWeight: 600, color: i.outstanding_amount > 0 ? C.warning : C.success }}>{formatINR(i.outstanding_amount)}</span> },
+    { label: 'Status',  render: i => <Badge status={i.status} /> },
+  ]
 
   return (
     <div>
-      {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', flexWrap: 'wrap', gap: '8px' }}>
-        <div style={{ fontWeight: 700, fontSize: '15px' }}>HSN Master</div>
-        <div style={{ display: 'flex', gap: '8px' }}>
-          <Btn size='sm' variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>
-            ↑ CSV Upload
-          </Btn>
-          <Btn size='sm' onClick={openNew}>+ Add HSN</Btn>
-        </div>
+      <PageHeader
+        title='Invoices'
+        subtitle='Tax invoices — sales and purchases'
+        action={
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
+            <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
+            <Btn onClick={() => navigate('/invoices/new')}>+ New Invoice</Btn>
+          </div>
+        }
+      />
+
+      {/* summary */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px,1fr))', gap: '12px', marginBottom: '20px' }}>
+        <StatCard label='Total Invoiced' value={formatINR(totalAmount)} />
+        <StatCard label='Outstanding' value={formatINR(totalOutstanding)} color={totalOutstanding > 0 ? C.warning : C.success} />
+        <StatCard label='Invoices' value={filtered.length} />
       </div>
 
-      {/* Filters */}
-      <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' }}>
-        <input
-          value={search} onChange={e => setSearch(e.target.value)}
-          placeholder='Search HSN code or description…'
-          style={{ ...inlineInput, flex: 1, minWidth: '180px' }}
-        />
-        <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)}
-          style={{ ...inlineInput, cursor: 'pointer' }}>
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search invoice no, entity…'
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
+        <select value={typeFilter} onChange={e => setType(e.target.value)}
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value='all'>All types</option>
-          <option value='fixed'>Fixed rate</option>
-          <option value='slab'>Slab (rate-dependent)</option>
+          <option value='sales'>Sales</option>
+          <option value='purchase'>Purchase</option>
         </select>
-      </div>
-
-      {/* Summary */}
-      <div style={{ display: 'flex', gap: '16px', marginBottom: '12px', fontSize: '12px', color: C.textSoft }}>
-        <span><strong style={{ color: C.text }}>{rows.length}</strong> HSN codes</span>
-        <span><strong style={{ color: C.text }}>{rows.filter(r => r.rate_type === 'slab').length}</strong> slab-based</span>
-        <span><strong style={{ color: C.text }}>{rows.filter(r => !r.is_active).length}</strong> inactive</span>
+        <select value={statusFilter} onChange={e => setStatus(e.target.value)}
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value='all'>All statuses</option>
+          {INV_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select value={entityFilter} onChange={e => setEntityF(e.target.value)}
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All entities</option>
+          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
+        <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
+        {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
       </div>
 
       <Card>
-        {loading ? (
-          <div style={{ padding: '40px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
-        ) : filtered.length === 0 ? (
-          <EmptyState icon='🏷️' title='No HSN codes' message='Add HSN codes to enable auto GST calculation in line items.'
-            action={<Btn onClick={openNew}>+ Add HSN</Btn>} />
-        ) : (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
-              <thead>
-                <tr>
-                  {['HSN Code', 'Description', 'Type', 'Rate / Slabs', 'Status', 'Actions'].map((h, i) => (
-                    <th key={i} style={{
-                      padding: '9px 14px', background: C.bg, borderBottom: `1px solid ${C.border}`,
-                      fontSize: '11px', fontWeight: 700, color: C.textSoft,
-                      textTransform: 'uppercase', letterSpacing: '0.05em',
-                      textAlign: i >= 3 ? 'left' : 'left', whiteSpace: 'nowrap',
-                    }}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {filtered.map((row, i) => (
-                  <tr key={row.id} style={{ background: i % 2 === 0 ? '#fffdf6' : '#faf6ed' }}>
-                    <td style={{ padding: '10px 14px', borderBottom: `1px solid #f0e8d8`, fontFamily: 'monospace', fontWeight: 700, fontSize: '13px' }}>
-                      {row.hsn_code}
-                    </td>
-                    <td style={{ padding: '10px 14px', borderBottom: `1px solid #f0e8d8`, color: C.textMid, maxWidth: '220px' }}>
-                      {row.description || <span style={{ color: C.textMuted }}>—</span>}
-                    </td>
-                    <td style={{ padding: '10px 14px', borderBottom: `1px solid #f0e8d8` }}>
-                      {row.rate_type === 'fixed'
-                        ? <span style={{ fontSize: '11px', fontWeight: 700, background: '#e8f0f3', color: '#1a4a6a', padding: '2px 7px', borderRadius: '4px' }}>Fixed</span>
-                        : <span style={{ fontSize: '11px', fontWeight: 700, background: '#ede8f3', color: '#3a1a6a', padding: '2px 7px', borderRadius: '4px' }}>Slab</span>
-                      }
-                    </td>
-                    <td style={{ padding: '10px 14px', borderBottom: `1px solid #f0e8d8`, fontSize: '12px', color: C.textMid }}>
-                      {row.rate_type === 'fixed'
-                        ? <strong style={{ color: C.text }}>{row.fixed_rate}%</strong>
-                        : <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{formatSlabSummary(row.slabs)}</span>
-                      }
-                    </td>
-                    <td style={{ padding: '10px 14px', borderBottom: `1px solid #f0e8d8` }}>
-                      <Badge status={row.is_active ? 'active' : 'cancelled'} label={row.is_active ? 'Active' : 'Inactive'} />
-                    </td>
-                    <td style={{ padding: '10px 14px', borderBottom: `1px solid #f0e8d8` }}>
-                      <div style={{ display: 'flex', gap: '6px' }}>
-                        <Btn size='sm' variant='ghost' onClick={() => openEdit(row)}>Edit</Btn>
-                        <Btn size='sm' variant='ghost' onClick={() => setConfirmDelete(row)} style={{ color: C.danger }}>Delete</Btn>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
+        {loading
+          ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
+          : <Table columns={columns} rows={filtered} onRowClick={i => navigate(`/invoices/${i.id}`)}
+              emptyState={<EmptyState icon='🧾' title='No invoices' action={<Btn onClick={() => navigate('/invoices/new')}>+ New Invoice</Btn>} />} />
+        }
       </Card>
 
-      {/* ── Add / Edit Modal ── */}
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? `Edit HSN — ${editing.hsn_code}` : 'Add HSN Code'} width={600}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-
-          <SectionDivider label='HSN Details' />
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '12px' }}>
-            <FormRow label='HSN Code' required>
-              <Input value={form.hsn_code} onChange={e => setF('hsn_code', e.target.value)}
-                placeholder='e.g. 6109' disabled={!!editing} />
-            </FormRow>
-            <FormRow label='Description'>
-              <Input value={form.description} onChange={e => setF('description', e.target.value)}
-                placeholder='Short description of goods' />
-            </FormRow>
-          </div>
-
-          <SectionDivider label='GST Rate Rule' />
-
-          {/* Rate type toggle */}
-          <div style={{ display: 'flex', gap: '0', border: `1.5px solid ${C.border}`, borderRadius: '6px', overflow: 'hidden', alignSelf: 'flex-start' }}>
-            {['fixed', 'slab'].map(t => (
-              <button key={t} onClick={() => setF('rate_type', t)}
-                style={{
-                  padding: '7px 20px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-                  fontWeight: 600, fontSize: '13px',
-                  background: form.rate_type === t ? C.accent : C.surface,
-                  color:      form.rate_type === t ? '#f5f0e8' : C.textSoft,
-                  transition: 'all 0.15s',
-                }}>
-                {t === 'fixed' ? 'Fixed Rate' : 'Slab (rate-dependent)'}
-              </button>
-            ))}
-          </div>
-
-          {/* Fixed rate */}
-          {form.rate_type === 'fixed' && (
-            <FormRow label='GST Rate %' required hint='Applied to all transactions with this HSN code'>
-              <Select value={form.fixed_rate} onChange={e => setF('fixed_rate', e.target.value)}
-                style={{ maxWidth: '180px' }}>
-                <option value=''>Select rate</option>
-                {[0, 3, 5, 12, 18, 28].map(r => <option key={r} value={r}>{r}%</option>)}
-              </Select>
-            </FormRow>
-          )}
-
-          {/* Slab rules */}
-          {form.rate_type === 'slab' && (
-            <div>
-              <div style={{ fontSize: '12px', color: C.textSoft, marginBottom: '10px', lineHeight: 1.6 }}>
-                Define slabs in ascending order. <strong>Leave the last slab's threshold blank</strong> — it becomes the fallback for all values above the previous threshold.
-                Threshold is the <strong>rate per unit in ₹</strong>.
-              </div>
-
-              <div style={{ border: `1px solid ${C.border}`, borderRadius: '7px', overflow: 'hidden' }}>
-                {/* Header */}
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 32px', background: C.bg, borderBottom: `1px solid ${C.border}`, padding: '7px 12px', fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', gap: '8px' }}>
-                  <span>Upper threshold (₹/unit)</span>
-                  <span>GST Rate %</span>
-                  <span></span>
-                </div>
-
-                {slabs.map((slab, i) => {
-                  const isLast = i === slabs.length - 1
-                  return (
-                    <div key={i} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 32px', gap: '8px', padding: '8px 12px', borderBottom: i < slabs.length - 1 ? `1px solid ${C.border}` : 'none', alignItems: 'center', background: i % 2 === 0 ? '#fffdf6' : '#faf6ed' }}>
-                      <div>
-                        {isLast ? (
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <input disabled value='' placeholder='No limit (fallback)'
-                              style={{ padding: '6px 10px', border: `1.5px solid ${C.border}`, borderRadius: '5px', background: C.bg, fontSize: '12px', fontFamily: 'inherit', width: '100%', color: C.textMuted, cursor: 'not-allowed', boxSizing: 'border-box' }} />
-                          </div>
-                        ) : (
-                          <input type='number' value={slab.max_rate_rupees}
-                            onChange={e => updateSlab(i, 'max_rate_rupees', e.target.value)}
-                            placeholder='e.g. 1000'
-                            style={{ padding: '6px 10px', border: `1.5px solid ${C.border}`, borderRadius: '5px', background: '#fffdf6', fontSize: '12px', fontFamily: 'inherit', width: '100%', boxSizing: 'border-box', outline: 'none' }} />
-                        )}
-                        {!isLast && slab.max_rate_rupees && (
-                          <div style={{ fontSize: '10px', color: C.textMuted, marginTop: '2px' }}>
-                            Applies when rate ≤ ₹{Number(slab.max_rate_rupees).toLocaleString('en-IN')}
-                          </div>
-                        )}
-                        {isLast && (
-                          <div style={{ fontSize: '10px', color: C.textMuted, marginTop: '2px' }}>
-                            Applies when rate is above all other thresholds
-                          </div>
-                        )}
-                      </div>
-
-                      <div>
-                        <select value={slab.gst_rate} onChange={e => updateSlab(i, 'gst_rate', e.target.value)}
-                          style={{ padding: '6px 10px', border: `1.5px solid ${C.border}`, borderRadius: '5px', background: '#fffdf6', fontSize: '12px', fontFamily: 'inherit', width: '100%', boxSizing: 'border-box', outline: 'none', cursor: 'pointer' }}>
-                          <option value=''>— select %</option>
-                          {[0, 3, 5, 12, 18, 28].map(r => <option key={r} value={r}>{r}%</option>)}
-                        </select>
-                      </div>
-
-                      <div style={{ textAlign: 'center' }}>
-                        {slabs.length > 1 && (
-                          <button onClick={() => removeSlab(i)}
-                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: C.danger, fontSize: '16px', padding: '2px 5px' }}>
-                            ×
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-
-              <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                <Btn size='sm' variant='ghost' onClick={addSlab}>+ Add Slab</Btn>
-                <span style={{ fontSize: '11px', color: C.textMuted }}>
-                  Add slabs in ascending threshold order. Last slab = open-ended fallback.
-                </span>
-              </div>
-
-              {/* Live preview */}
-              {slabs.some(s => s.gst_rate !== '') && (
-                <div style={{ marginTop: '10px', background: '#f0ebe0', border: `1px solid ${C.borderDark}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
-                  <div style={{ fontWeight: 700, color: C.textMid, marginBottom: '5px' }}>Preview</div>
-                  {slabs.map((s, i) => {
-                    const prev = slabs[i - 1]
-                    const lower = prev?.max_rate_rupees ? `> ₹${Number(prev.max_rate_rupees).toLocaleString('en-IN')}` : null
-                    const upper = s.max_rate_rupees ? `≤ ₹${Number(s.max_rate_rupees).toLocaleString('en-IN')}` : null
-                    const range = [lower, upper].filter(Boolean).join(' & ') || 'All values'
-                    return (
-                      <div key={i} style={{ color: C.textMid, marginBottom: '2px' }}>
-                        {range} → <strong>{s.gst_rate || '?'}%</strong>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-
-          <SectionDivider label='Status' />
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <input type='checkbox' id='hsn_active' checked={form.is_active} onChange={e => setF('is_active', e.target.checked)}
-              style={{ width: '14px', height: '14px', cursor: 'pointer' }} />
-            <label htmlFor='hsn_active' style={{ fontSize: '13px', color: C.textMid, cursor: 'pointer' }}>Active</label>
-          </div>
-
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
-            <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save Changes' : 'Add HSN'}</Btn>
-          </div>
-        </div>
-      </Modal>
-
-      {/* ── CSV Upload Modal ── */}
-      <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload HSN Master (CSV)' width={680}>
+      {/* CSV Upload Modal */}
+      <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Invoices' width={680}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px 14px', fontSize: '12px', color: C.textMid, lineHeight: 1.7 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '6px' }}>
-              <strong>CSV Format:</strong>
-              <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('hsn_master')}>↓ Download Template</Btn>
+              <strong>CSV Format — one row per line item:</strong>
+              <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('invoices')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>hsn_code,description,rate_type,fixed_rate,slabs</code><br /><br />
-            <strong>Examples:</strong><br />
-            <code style={{ fontFamily: 'monospace', fontSize: '11px', display: 'block', marginTop: '2px' }}>
-              5208,Cotton woven fabric,fixed,5,<br />
-              6109,T-shirts knitted,slab,,1000:5|null:12<br />
-              6201,Mens overcoats,slab,,1000:5|5000:12|null:18
-            </code><br />
-            <strong>Slab format:</strong> <code style={{ fontFamily: 'monospace' }}>threshold_rupees:gst_rate</code> pairs separated by <code>|</code>.
-            Use <code>null</code> for the open-ended final slab.
-            Threshold is rate per unit in <strong>rupees</strong> (e.g. 1000 = ₹1,000).
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes</code><br /><br />
+            Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice.
           </div>
-
-          <FormRow label='Paste CSV'>
-            <textarea value={csvText} onChange={e => setCsvText(e.target.value)}
-              rows={10} placeholder='Paste CSV data here…'
-              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
+          <FormRow label='Upload or Paste CSV'>
+            <CsvFileDrop onText={setCsvText} />
           </FormRow>
-
+          <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
+              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
           {csvResult && (
-            <div style={{ background: csvResult.failed > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.failed > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '12px 14px', fontSize: '12px' }}>
-              <div style={{ fontWeight: 700, marginBottom: '4px', color: C.text }}>
-                Upload complete: {csvResult.upserted} upserted{csvResult.failed > 0 ? `, ${csvResult.failed} failed` : ''}
-              </div>
-              {csvResult.errors.length > 0 && (
-                <div style={{ color: '#7a5000', marginTop: '6px' }}>
-                  {csvResult.errors.map((e, i) => <div key={i}>• {e}</div>)}
-                </div>
-              )}
+            <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
+              <strong>{csvResult.created} invoices created.</strong>
+              {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
             </div>
           )}
-
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setCsvModal(false)}>Close</Btn>
-            <Btn onClick={handleCSVUpload} disabled={csvSaving || !csvText.trim()}>
-              {csvSaving ? 'Uploading…' : 'Upload CSV'}
-            </Btn>
+            <Btn onClick={handleCSV} disabled={csvSaving || !csvText.trim()}>{csvSaving ? 'Uploading…' : 'Upload'}</Btn>
           </div>
         </div>
       </Modal>
-
-      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
-        title='Delete HSN' message={`Delete HSN ${confirmDelete?.hsn_code}? All PI/Invoice lines with this HSN will lose auto-rate detection.`} danger />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
 }
 
+// ─── New Invoice Form ─────────────────────────────────────────────────────────
+function NewInvoice() {
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const fromPiId = searchParams.get('from_pi')
 
-// ─── Reliance Tracker ─────────────────────────────────────────────────────────
-function RelianceSettings() {
   const [entities, setEntities] = useState([])
-  const [loading, setLoading]   = useState(true)
-  const [filter, setFilter]     = useState('all')
-  const [search, setSearch]     = useState('')
-  const [editModal, setEditModal] = useState(null)
-  const [editForm, setEditForm]   = useState({})
-  const [saving, setSaving]       = useState(false)
-  const [toast, setToast]         = useState(null)
+  const [orders, setOrders]     = useState([])
+  const [pis, setPIs]           = useState([])
+  const [pos, setPOs]           = useState([])
+  const [legs, setLegs]         = useState([])
+  const [lines, setLines]       = useState([])
+  const [hsnMap, setHsnMap]     = useState(new Map())
+  const [form, setForm]         = useState({ ...EMPTY_FORM, pi_id: fromPiId || '' })
+  const [saving, setSaving]     = useState(false)
+  const [toast, setToast]       = useState(null)
+  // CHANGED: TDS/TCS entries
+  const [tdsEntries, setTdsEntries] = useState([])  // [{type,section,rate,base_amount}]
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    const { data } = await supabase
-      .from('entities')
-      .select('id,name,short_name,type,state_name,gstin,reliance_vendor_id,reliance_sales_id,reliance_onboarded,reliance_notes')
-      .eq('is_deleted', false).order('name')
-    setEntities(data || [])
-    setLoading(false)
+  function addTdsRow(type) {
+    setTdsEntries(rows => [...rows, { _id: Date.now(), type, section: type === 'tcs' ? '206C' : '194C', rate: type === 'tcs' ? 0.1 : 1, base_amount: '' }])
+  }
+  function updateTdsRow(id, key, val) {
+    setTdsEntries(rows => rows.map(r => r._id === id ? { ...r, [key]: val } : r))
+  }
+  function removeTdsRow(id) {
+    setTdsEntries(rows => rows.filter(r => r._id !== id))
+  }
+
+  useEffect(() => {
+    Promise.all([
+      supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
+      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,total_amount').eq('is_deleted', false).order('pi_date', { ascending: false }),
+      supabase.from('purchase_orders').select('id,po_no,buyer_entity_id,seller_entity_id').eq('is_deleted', false).order('po_date', { ascending: false }),
+      supabase.from('hsn_master').select('*').eq('is_active', true),
+    ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }]) => {
+      setEntities(es || [])
+      setOrders(os || [])
+      setPIs(piData || [])
+      setPOs(poData || [])
+      setHsnMap(buildHSNMap(hsnRows || []))
+    })
   }, [])
 
-  useEffect(() => { load() }, [load])
+  // Pre-fill from PI if coming from convert button
+  useEffect(() => {
+    if (!fromPiId || !pis.length) return
+    const pi = pis.find(p => p.id === fromPiId)
+    if (!pi) return
+    setF('seller_entity_id', pi.from_entity_id)
+    setF('buyer_entity_id',  pi.to_entity_id)
+    // Load PI lines
+    supabase.from('proforma_invoice_lines').select('*').eq('pi_id', fromPiId).order('line_no').then(({ data }) => {
+      if (data) setLines(data.map(l => ({ ...l, _id: l.id })))
+    })
+  }, [fromPiId, pis])
 
-  function openEdit(e) {
-    setEditForm({ reliance_onboarded: e.reliance_onboarded || false, reliance_vendor_id: e.reliance_vendor_id || '', reliance_sales_id: e.reliance_sales_id || '', reliance_notes: e.reliance_notes || '' })
-    setEditModal(e)
+  function setF(k, v) {
+    setForm(f => {
+      const updated = { ...f, [k]: v }
+      if (k === 'seller_entity_id' || k === 'buyer_entity_id') {
+        const sid = k === 'seller_entity_id' ? v : f.seller_entity_id
+        const bid = k === 'buyer_entity_id'  ? v : f.buyer_entity_id
+        const se  = entities.find(e => e.id === sid)
+        const be  = entities.find(e => e.id === bid)
+        if (se?.state_code && be?.state_code)
+          updated.is_interstate = se.state_code !== be.state_code
+      }
+      return updated
+    })
+  }
+
+  async function loadLegs(orderId) {
+    if (!orderId) { setLegs([]); return }
+    const { data } = await supabase.from('order_legs')
+      .select('id,leg_no,from_entity:from_entity_id(name,short_name),to_entity:to_entity_id(name,short_name)')
+      .eq('order_id', orderId).order('leg_no')
+    setLegs(data || [])
   }
 
   async function handleSave() {
+    if (!form.seller_entity_id || !form.buyer_entity_id) return setToast({ message: 'Seller and Buyer are required', type: 'error' })
+    if (lines.length === 0) return setToast({ message: 'At least one line item is required', type: 'error' })
+
+    const computedLines = lines.map(l => computeLine(l, form.is_interstate))
+    const totals = computeTotals(computedLines)
     setSaving(true)
-    const { error } = await supabase.from('entities').update({
-      reliance_onboarded: editForm.reliance_onboarded,
-      reliance_vendor_id: editForm.reliance_vendor_id || null,
-      reliance_sales_id:  editForm.reliance_sales_id  || null,
-      reliance_notes:     editForm.reliance_notes     || null,
-      updated_at:         new Date().toISOString(),
-    }).eq('id', editModal.id)
+
+    const payload = {
+      ...form,
+      ...totals,
+      outstanding_amount: totals.total_amount,
+      paid_amount: 0,
+    }
+    if (!payload.order_id)      delete payload.order_id
+    if (!payload.order_leg_id)  delete payload.order_leg_id
+    if (!payload.pi_id)         delete payload.pi_id
+    if (!payload.po_id)         delete payload.po_id
+    if (!payload.due_date)      delete payload.due_date
+    if (!payload.einvoice_ack_date) delete payload.einvoice_ack_date
+    if (!payload.tds_amount)    delete payload.tds_amount
+    if (!payload.tcs_amount)    delete payload.tcs_amount
+
+    const { data: inv, error } = await supabase.from('invoices').insert(payload).select().single()
+    if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
+
+    // Insert lines
+    const linesPayload = computedLines.map((l, i) => ({
+      ...l, invoice_id: inv.id, line_no: i + 1,
+      _id: undefined,
+    }))
+    await supabase.from('invoice_lines').insert(linesPayload)
+
+    // CHANGED: Insert TDS/TCS entries
+    if (tdsEntries.length > 0) {
+      const tdsPayload = tdsEntries
+        .filter(r => r.base_amount && parseFloat(r.base_amount) > 0)
+        .map(r => {
+          const base   = Math.round(parseFloat(r.base_amount))
+          const amount = Math.round(base * parseFloat(r.rate) / 100)
+          return {
+            invoice_id:            inv.id,
+            entry_type:            r.type,
+            section_code:          r.section,
+            section_desc:          TDS_SECTION_LABELS[r.section] || r.section,
+            deducted_by_entity_id: r.type === 'tds' ? form.buyer_entity_id  : form.seller_entity_id,
+            deductee_entity_id:    r.type === 'tds' ? form.seller_entity_id : form.buyer_entity_id,
+            base_amount:           base,
+            rate:                  parseFloat(r.rate),
+            amount,
+          }
+        })
+      if (tdsPayload.length > 0) await supabase.from('tds_tcs_entries').insert(tdsPayload)
+    }
+
+    // Mark PI as converted if applicable
+    if (form.pi_id) {
+      await supabase.from('proforma_invoices').update({ status: 'converted', converted_to_invoice_id: inv.id }).eq('id', form.pi_id)
+    }
+
     setSaving(false)
-    if (error) return setToast({ message: error.message, type: 'error' })
-    setToast({ message: `${editModal.short_name || editModal.name} updated`, type: 'success' })
-    setEditModal(null)
-    load()
+    navigate(`/invoices/${inv.id}`)
   }
-
-  const onboarded = entities.filter(e => e.reliance_onboarded).length
-  const pending   = entities.filter(e => !e.reliance_onboarded).length
-
-  const filtered = entities.filter(e => {
-    const mf = filter === 'all' ? true : filter === 'onboarded' ? e.reliance_onboarded : !e.reliance_onboarded
-    const ms = !search || e.name?.toLowerCase().includes(search.toLowerCase()) || e.short_name?.toLowerCase().includes(search.toLowerCase()) || (e.reliance_vendor_id || '').toLowerCase().includes(search.toLowerCase())
-    return mf && ms
-  })
 
   return (
     <div>
-      {/* Summary */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px', marginBottom: '20px' }}>
-        {[['Total', entities.length, C.accent], ['Onboarded', onboarded, C.success], ['Pending', pending, C.warning]].map(([l,v,c]) => (
-          <div key={l} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '14px 16px' }}>
-            <div style={{ fontSize: '11px', color: C.textMuted, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{l}</div>
-            <div style={{ fontSize: '24px', fontWeight: 800, color: c, lineHeight: 1, marginTop: '4px' }}>{v}</div>
+      <button onClick={() => navigate('/invoices')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '13px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', marginBottom: '4px' }}>← Invoices</button>
+      <PageHeader title={fromPiId ? 'Convert PI to Invoice' : 'New Invoice'} />
+      <div style={{background:'#e8f3ec',border:'1px solid #b8dfca',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#1a5c30',marginBottom:'16px'}}>📅 Will be created under <strong>{currentFYLabel()}</strong> — stock movements recorded automatically. Internal buyers get an auto-created purchase entry.</div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '100%' }}>
+        <Card style={{ padding: '20px' }}>
+          <SectionDivider label='Invoice Details' />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginTop: '12px' }}>
+            <FormRow label='Invoice Date' required>
+              <Input type='date' value={form.invoice_date} onChange={e => setF('invoice_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='Due Date'>
+              <Input type='date' value={form.due_date} onChange={e => setF('due_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='Type'>
+              <Select value={form.invoice_type} onChange={e => setF('invoice_type', e.target.value)}>
+                <option value='sales'>Sales Invoice</option>
+                <option value='purchase'>Purchase Invoice</option>
+              </Select>
+            </FormRow>
+            <FormRow label='Seller Entity' required>
+              <Select value={form.seller_entity_id} onChange={e => setF('seller_entity_id', e.target.value)}>
+                <option value=''>Select seller</option>
+                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Buyer Entity' required>
+              <Select value={form.buyer_entity_id} onChange={e => setF('buyer_entity_id', e.target.value)}>
+                <option value=''>Select buyer</option>
+                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Tax Type' hint='Auto-detected from state codes'>
+              <Select value={form.is_interstate ? '1' : '0'} onChange={e => setF('is_interstate', e.target.value === '1')}>
+                <option value='0'>Local — Same State (CGST + SGST)</option>
+                <option value='1'>Interstate — Different State (IGST)</option>
+              </Select>
+            </FormRow>
+            <FormRow label='Linked PI'>
+              <Select value={form.pi_id} onChange={e => setF('pi_id', e.target.value)}>
+                <option value=''>No PI</option>
+                {pis.map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0,8)}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Linked PO'>
+              <Select value={form.po_id} onChange={e => setF('po_id', e.target.value)}>
+                <option value=''>No PO</option>
+                {pos.map(p => <option key={p.id} value={p.id}>{p.po_no || p.id.slice(0,8)}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Order'>
+              <Select value={form.order_id} onChange={e => { setF('order_id', e.target.value); loadLegs(e.target.value) }}>
+                <option value=''>No order</option>
+                {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+              </Select>
+            </FormRow>
           </div>
-        ))}
+        </Card>
+
+        <Card style={{ padding: '20px' }}>
+          <SectionDivider label='Line Items' />
+          <div style={{ marginTop: '12px' }}>
+            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} />
+          </div>
+        </Card>
+
+        <Card style={{ padding: '20px' }}>
+          <SectionDivider label='E-Invoice (GST Portal)' />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginTop: '12px' }}>
+            <FormRow label='IRN'>
+              <Input value={form.einvoice_irn} onChange={e => setF('einvoice_irn', e.target.value)} placeholder='Invoice Reference Number' />
+            </FormRow>
+            <FormRow label='Ack No'>
+              <Input value={form.einvoice_ack_no} onChange={e => setF('einvoice_ack_no', e.target.value)} />
+            </FormRow>
+            <FormRow label='Ack Date'>
+              <Input type='date' value={form.einvoice_ack_date} onChange={e => setF('einvoice_ack_date', e.target.value)} />
+            </FormRow>
+          </div>
+        </Card>
+
+        <Card style={{ padding: '20px' }}>
+          <SectionDivider label='Billing, Shipping & E-way Bill' />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '12px' }}>
+            <FormRow label='Bill From'>
+              <Input value={form.bill_from} onChange={e => setF('bill_from', e.target.value)} placeholder='Billing address of seller' />
+            </FormRow>
+            <FormRow label='Bill To'>
+              <Input value={form.bill_to} onChange={e => setF('bill_to', e.target.value)} placeholder='Billing address of buyer' />
+            </FormRow>
+            <FormRow label='Ship From'>
+              <Input value={form.ship_from} onChange={e => setF('ship_from', e.target.value)} placeholder='Dispatch location' />
+            </FormRow>
+            <FormRow label='Ship To'>
+              <Input value={form.ship_to} onChange={e => setF('ship_to', e.target.value)} placeholder='Delivery location' />
+            </FormRow>
+            <FormRow label='E-way Bill No'>
+              <Input value={form.eway_bill_no} onChange={e => setF('eway_bill_no', e.target.value)} placeholder='EWB number' />
+            </FormRow>
+            <FormRow label='E-way Bill Date' hint='Can differ from invoice date'>
+              <Input type='date' value={form.eway_bill_date} onChange={e => setF('eway_bill_date', e.target.value)} />
+            </FormRow>
+          </div>
+        </Card>
+
+        {/* CHANGED: TDS/TCS section */}
+        <Card style={{ padding: '20px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+            <SectionDivider label='TDS / TCS (optional)' />
+            <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+              <Btn size='sm' variant='ghost' onClick={() => addTdsRow('tds')}>+ TDS</Btn>
+              <Btn size='sm' variant='ghost' onClick={() => addTdsRow('tcs')}>+ TCS</Btn>
+            </div>
+          </div>
+          {tdsEntries.length === 0 ? (
+            <div style={{ fontSize: '12px', color: C.textMuted, padding: '8px 0' }}>No TDS/TCS entries. Click + TDS or + TCS to add.</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {tdsEntries.map(row => {
+                const base   = parseFloat(row.base_amount) || 0
+                const amount = Math.round(base * parseFloat(row.rate) / 100)
+                return (
+                  <div key={row._id} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr 1fr auto', gap: '10px', alignItems: 'center', padding: '10px 12px', background: C.bg, borderRadius: '6px', border: `1px solid ${C.border}` }}>
+                    <Badge status={row.type === 'tcs' ? 'export' : 'domestic'} label={row.type.toUpperCase()} />
+                    <Select value={row.section} onChange={e => updateTdsRow(row._id, 'section', e.target.value)}>
+                      {TDS_SECTIONS.map(s => <option key={s} value={s}>{s} — {TDS_SECTION_LABELS[s]}</option>)}
+                    </Select>
+                    <FormRow label='Base Amount (₹)'>
+                      <Input type='number' value={row.base_amount} onChange={e => updateTdsRow(row._id, 'base_amount', e.target.value)} placeholder='0' />
+                    </FormRow>
+                    <FormRow label={`Rate % → ₹${amount.toLocaleString('en-IN')}`}>
+                      <Input type='number' step='0.01' value={row.rate} onChange={e => updateTdsRow(row._id, 'rate', e.target.value)} />
+                    </FormRow>
+                    <button onClick={() => removeTdsRow(row._id)} style={{ background: 'none', border: 'none', color: C.danger, cursor: 'pointer', fontSize: '18px', padding: '0 4px' }}>×</button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </Card>
+
+        <Card style={{ padding: '20px' }}>
+          <SectionDivider label='Notes' />
+          <div style={{ marginTop: '12px' }}>
+            <Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} />
+          </div>
+        </Card>
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+          <Btn variant='ghost' onClick={() => navigate('/invoices')}>Cancel</Btn>
+          <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Create Invoice'}</Btn>
+        </div>
       </div>
 
-      {/* Progress bar */}
-      {entities.length > 0 && (
-        <div style={{ marginBottom: '20px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: C.textMuted, marginBottom: '6px' }}>
-            <span>Onboarding Progress</span>
-            <span>{onboarded}/{entities.length} ({Math.round(onboarded/entities.length*100)}%)</span>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  )
+}
+
+// ─── Invoice Detail ───────────────────────────────────────────────────────────
+function InvoiceDetail() {
+  const { id } = useParams()
+  const navigate = useNavigate()
+  const [inv, setInv]     = useState(null)
+  const [lines, setLines] = useState([])
+  const [tdsRows, setTdsRows] = useState([])  // CHANGED: TDS/TCS entries
+  const [loading, setLoading] = useState(true)
+  const [toast, setToast] = useState(null)
+  const [confirmCancel, setConfirmCancel] = useState(false)
+  // CHANGED: inline edit state for EWB/Challan and IRN sections
+  const [ewbEdit, setEwbEdit]   = useState(false)
+  const [ewbForm, setEwbForm]   = useState({})
+  const [irnEdit, setIrnEdit]   = useState(false)
+  const [irnForm, setIrnForm]   = useState({})
+  const [sectSaving, setSectSaving] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    const [{ data: i }, { data: ls }, { data: tds }] = await Promise.all([
+      supabase.from('invoices')
+        .select('*, seller:seller_entity_id(name,short_name,gstin,state_code,address,city), buyer:buyer_entity_id(name,short_name,gstin,state_code,address,city), orders(name)')
+        .eq('id', id).single(),
+      supabase.from('invoice_lines').select('*').eq('invoice_id', id).order('line_no'),
+      supabase.from('tds_tcs_entries').select('*').eq('invoice_id', id),  // CHANGED
+    ])
+    setInv(i)
+    setLines(ls || [])
+    setTdsRows(tds || [])  // CHANGED
+    setLoading(false)
+  }, [id])
+
+  useEffect(() => { load() }, [load])
+
+  async function updateStatus(status) {
+    await supabase.from('invoices').update({ status, updated_at: new Date() }).eq('id', id)
+    setToast({ message: `Invoice ${status}`, type: 'success' })
+    load()
+  }
+
+  // CHANGED: save EWB + Challan fields
+  function openEwbEdit() {
+    setEwbForm({
+      eway_bill_no:     inv.eway_bill_no     || '',
+      eway_bill_date:   inv.eway_bill_date   || '',
+      challan_no:       inv.challan_no       || '',
+      vehicle_no:       inv.vehicle_no       || '',
+      transporter_name: inv.transporter_name || '',
+    })
+    setEwbEdit(true)
+  }
+  async function saveEwbForm() {
+    setSectSaving(true)
+    const { error } = await supabase.from('invoices').update({
+      eway_bill_no:     ewbForm.eway_bill_no     || null,
+      eway_bill_date:   ewbForm.eway_bill_date   || null,
+      challan_no:       ewbForm.challan_no       || null,
+      vehicle_no:       ewbForm.vehicle_no       || null,
+      transporter_name: ewbForm.transporter_name || null,
+      updated_at:       new Date(),
+    }).eq('id', id)
+    setSectSaving(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setEwbEdit(false)
+    setToast({ message: 'E-way Bill & Challan saved', type: 'success' })
+    load()
+  }
+
+  // CHANGED: save IRN fields
+  function openIrnEdit() {
+    setIrnForm({
+      einvoice_irn:      inv.einvoice_irn      || '',
+      einvoice_ack_no:   inv.einvoice_ack_no   || '',
+      einvoice_ack_date: inv.einvoice_ack_date || '',
+      einvoice_qr_code:  inv.einvoice_qr_code  || '',
+    })
+    setIrnEdit(true)
+  }
+  async function saveIrnForm() {
+    setSectSaving(true)
+    const { error } = await supabase.from('invoices').update({
+      einvoice_irn:      irnForm.einvoice_irn      || null,
+      einvoice_ack_no:   irnForm.einvoice_ack_no   || null,
+      einvoice_ack_date: irnForm.einvoice_ack_date || null,
+      einvoice_qr_code:  irnForm.einvoice_qr_code  || null,
+      updated_at:        new Date(),
+    }).eq('id', id)
+    setSectSaving(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setIrnEdit(false)
+    setToast({ message: 'E-Invoice IRN saved', type: 'success' })
+    load()
+  }
+
+  if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
+  if (!inv)    return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>Invoice not found.</div>
+
+  return (
+    <div>
+      <button onClick={() => navigate('/invoices')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '13px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', marginBottom: '4px' }}>← Invoices</button>
+      <PageHeader
+        title={inv.invoice_no || `Invoice — ${fmtDate(inv.invoice_date)}`}
+        subtitle={`${inv.seller?.name} → ${inv.buyer?.name} · ${fmtDate(inv.invoice_date)}`}
+        action={
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            {inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
+            {inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
+            {!['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            <Badge status={inv.invoice_type} label={inv.invoice_type === 'sales' ? 'Sales Invoice' : 'Purchase Invoice'} />
+            <Badge status={inv.status} />
           </div>
-          <div style={{ height: 8, background: C.border, borderRadius: 4, overflow: 'hidden' }}>
-            <div style={{ height: '100%', width: `${Math.round(onboarded/entities.length*100)}%`, background: onboarded===entities.length ? C.success : C.accent, borderRadius: 4, transition: 'width 0.3s' }} />
+        }
+      />
+
+      {/* Seller / Buyer */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '24px' }}>
+        <Card style={{ padding: '16px' }}>
+          <div style={{ fontSize: '11px', fontWeight: 700, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>Seller</div>
+          <div style={{ fontWeight: 700, fontSize: '14px' }}>{inv.seller?.name}</div>
+          {inv.seller?.gstin && <div style={{ fontSize: '12px', color: C.textSoft, fontFamily: 'monospace' }}>GSTIN: {inv.seller.gstin}</div>}
+          {inv.seller?.city  && <div style={{ fontSize: '12px', color: C.textSoft }}>{inv.seller.city}</div>}
+        </Card>
+        <Card style={{ padding: '16px' }}>
+          <div style={{ fontSize: '11px', fontWeight: 700, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>Buyer</div>
+          <div style={{ fontWeight: 700, fontSize: '14px' }}>{inv.buyer?.name}</div>
+          {inv.buyer?.gstin && <div style={{ fontSize: '12px', color: C.textSoft, fontFamily: 'monospace' }}>GSTIN: {inv.buyer.gstin}</div>}
+          {inv.buyer?.city  && <div style={{ fontSize: '12px', color: C.textSoft }}>{inv.buyer.city}</div>}
+        </Card>
+      </div>
+
+      {/* Details strip */}
+      <div style={{ display: 'flex', gap: '20px', marginBottom: '20px', flexWrap: 'wrap', fontSize: '13px' }}>
+        <div><span style={{ color: C.textMuted }}>Date:</span> <strong>{fmtDate(inv.invoice_date)}</strong></div>
+        {inv.due_date && <div>
+          <span style={{ color: C.textMuted }}>Due:</span>{' '}
+          <strong style={{ color: inv.due_date < new Date().toISOString().slice(0,10) && inv.status !== 'paid' ? C.danger : C.text }}>
+            {fmtDate(inv.due_date)}
+          </strong>
+        </div>}
+        <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={inv.is_interstate ? 'export' : 'domestic'} label={inv.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
+        {inv.einvoice_irn && <div><span style={{ color: C.textMuted }}>IRN:</span> <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{inv.einvoice_irn}</span></div>}
+        {inv.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{inv.orders.name}</strong></div>}
+      </div>
+
+      {/* Outstanding */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
+        <StatCard label='Invoice Total' value={formatINR(inv.total_amount)} />
+        <StatCard label='Paid' value={formatINR(inv.paid_amount)} color={C.success} />
+        <StatCard label='Outstanding' value={formatINR(inv.outstanding_amount)} color={inv.outstanding_amount > 0 ? C.warning : C.success} />
+      </div>
+
+      <Card>
+        <LineItemsEditor lines={lines.map(l => ({ ...l, _id: l.id }))} setLines={() => {}} interstate={inv.is_interstate} readOnly />
+      </Card>
+
+      {(inv.bill_from || inv.bill_to || inv.ship_from || inv.ship_to || inv.eway_bill_no) && (
+        <div style={{ marginTop: '12px', padding: '12px 14px', background: '#f8f4ee', borderRadius: '6px', border: `1px solid ${C.border}`, fontSize: '13px' }}>
+          <div style={{ fontWeight: 700, marginBottom: '8px', color: C.textMid }}>Billing & Shipping</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 20px' }}>
+            {inv.bill_from && <div><span style={{ color: C.textMuted }}>Bill From:</span> {inv.bill_from}</div>}
+            {inv.bill_to   && <div><span style={{ color: C.textMuted }}>Bill To:</span> {inv.bill_to}</div>}
+            {inv.ship_from && <div><span style={{ color: C.textMuted }}>Ship From:</span> {inv.ship_from}</div>}
+            {inv.ship_to   && <div><span style={{ color: C.textMuted }}>Ship To:</span> {inv.ship_to}</div>}
           </div>
         </div>
       )}
 
-      {/* Filters */}
-      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
-        <div style={{ display: 'flex', borderRadius: '6px', border: `1px solid ${C.border}`, overflow: 'hidden' }}>
-          {[['all','All'],[' pending',`Pending (${pending})`],['onboarded',`Onboarded (${onboarded})`]].map(([k,l]) => (
-            <button key={k} onClick={() => setFilter(k.trim())} style={{ padding: '6px 14px', fontSize: '12px', fontWeight: 600, background: filter===k.trim() ? C.accent : 'transparent', color: filter===k.trim() ? '#f5f0e8' : C.textMuted, border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>{l}</button>
-          ))}
+      {/* CHANGED: E-way Bill & Challan section */}
+      <div style={{ marginTop: '12px', border: `1px solid ${C.border}`, borderRadius: '6px', overflow: 'hidden' }}>
+        <div style={{ padding: '10px 14px', background: C.bg, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontWeight: 700, fontSize: '13px', color: C.textMid }}>
+            🚛 E-way Bill & Challan
+            {(inv.eway_bill_no || inv.challan_no) && (
+              <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
+            )}
+          </div>
+          {!ewbEdit && (
+            <Btn size='sm' variant='ghost' onClick={openEwbEdit}>
+              {(inv.eway_bill_no || inv.challan_no) ? 'Edit' : '+ Add'}
+            </Btn>
+          )}
         </div>
-        <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search entity, vendor ID…' style={{ flex: 1, minWidth: 180, padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+        {ewbEdit ? (
+          <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <FormRow label='EWB Number'>
+                <Input value={ewbForm.eway_bill_no} onChange={e => setEwbForm(f => ({...f, eway_bill_no: e.target.value}))} placeholder='e.g. 421234567890' />
+              </FormRow>
+              <FormRow label='EWB Date'>
+                <Input type='date' value={ewbForm.eway_bill_date} onChange={e => setEwbForm(f => ({...f, eway_bill_date: e.target.value}))} />
+              </FormRow>
+              <FormRow label='Challan No'>
+                <Input value={ewbForm.challan_no} onChange={e => setEwbForm(f => ({...f, challan_no: e.target.value}))} placeholder='Transporter challan number' />
+              </FormRow>
+              <FormRow label='Vehicle No'>
+                <Input value={ewbForm.vehicle_no} onChange={e => setEwbForm(f => ({...f, vehicle_no: e.target.value}))} placeholder='e.g. KA01AB1234' />
+              </FormRow>
+              <FormRow label='Transporter Name' style={{ gridColumn: '1 / -1' }}>
+                <Input value={ewbForm.transporter_name} onChange={e => setEwbForm(f => ({...f, transporter_name: e.target.value}))} />
+              </FormRow>
+            </div>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <Btn variant='ghost' onClick={() => setEwbEdit(false)}>Cancel</Btn>
+              <Btn onClick={saveEwbForm} disabled={sectSaving}>{sectSaving ? 'Saving…' : 'Save'}</Btn>
+            </div>
+          </div>
+        ) : (inv.eway_bill_no || inv.challan_no || inv.vehicle_no || inv.transporter_name) ? (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0', fontSize: '13px' }}>
+            {[
+              ['EWB No',       inv.eway_bill_no],
+              ['EWB Date',     fmtDate(inv.eway_bill_date)],
+              ['Challan No',   inv.challan_no],
+              ['Vehicle No',   inv.vehicle_no],
+              ['Transporter',  inv.transporter_name],
+            ].filter(([, v]) => v).map(([label, val]) => (
+              <div key={label} style={{ padding: '8px 14px', borderTop: `1px solid ${C.border}` }}>
+                <span style={{ color: C.textMuted }}>{label}: </span>
+                <strong>{val}</strong>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ padding: '12px 14px', fontSize: '12px', color: C.textMuted }}>
+            No E-way Bill or Challan details entered. Click <strong>+ Add</strong> to fill in.
+          </div>
+        )}
       </div>
 
-      {/* Table */}
-      <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '8px', overflow: 'hidden' }}>
-        {loading ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div> : (
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+      {/* CHANGED: E-Invoice IRN section */}
+      <div style={{ marginTop: '12px', border: `1px solid ${C.border}`, borderRadius: '6px', overflow: 'hidden' }}>
+        <div style={{ padding: '10px 14px', background: C.bg, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontWeight: 700, fontSize: '13px', color: C.textMid }}>
+            📄 E-Invoice IRN
+            {inv.einvoice_irn && inv.einvoice_ack_no && (
+              <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
+            )}
+          </div>
+          {!irnEdit && (
+            <Btn size='sm' variant='ghost' onClick={openIrnEdit}>
+              {(inv.einvoice_irn || inv.einvoice_ack_no) ? 'Edit' : '+ Add'}
+            </Btn>
+          )}
+        </div>
+        {irnEdit ? (
+          <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            <FormRow label='IRN (Invoice Reference Number)'>
+              <Input
+                value={irnForm.einvoice_irn}
+                onChange={e => setIrnForm(f => ({...f, einvoice_irn: e.target.value}))}
+                placeholder='64-character hash from GST portal'
+                style={{ fontFamily: 'monospace', fontSize: '12px' }}
+              />
+            </FormRow>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <FormRow label='Acknowledgement No'>
+                <Input
+                  value={irnForm.einvoice_ack_no}
+                  onChange={e => setIrnForm(f => ({...f, einvoice_ack_no: e.target.value}))}
+                  placeholder='Ack number'
+                  style={{ fontFamily: 'monospace' }}
+                />
+              </FormRow>
+              <FormRow label='Acknowledgement Date'>
+                <Input type='date' value={irnForm.einvoice_ack_date} onChange={e => setIrnForm(f => ({...f, einvoice_ack_date: e.target.value}))} />
+              </FormRow>
+            </div>
+            <FormRow label='QR Code Data'>
+              <Textarea
+                value={irnForm.einvoice_qr_code}
+                onChange={e => setIrnForm(f => ({...f, einvoice_qr_code: e.target.value}))}
+                rows={3}
+                placeholder='Paste QR code data from signed e-invoice PDF'
+                style={{ fontFamily: 'monospace', fontSize: '11px' }}
+              />
+            </FormRow>
+            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+              <Btn variant='ghost' onClick={() => setIrnEdit(false)}>Cancel</Btn>
+              <Btn onClick={saveIrnForm} disabled={sectSaving}>{sectSaving ? 'Saving…' : 'Save'}</Btn>
+            </div>
+          </div>
+        ) : (inv.einvoice_irn || inv.einvoice_ack_no) ? (
+          <div style={{ fontSize: '13px' }}>
+            {inv.einvoice_irn && (
+              <div style={{ padding: '8px 14px', borderTop: `1px solid ${C.border}` }}>
+                <div style={{ fontSize: '10px', color: C.textMuted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '3px' }}>IRN</div>
+                <div style={{ fontFamily: 'monospace', fontSize: '11px', wordBreak: 'break-all', color: C.text }}>{inv.einvoice_irn}</div>
+              </div>
+            )}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
+              {inv.einvoice_ack_no && (
+                <div style={{ padding: '8px 14px', borderTop: `1px solid ${C.border}` }}>
+                  <span style={{ color: C.textMuted }}>Ack No: </span><strong style={{ fontFamily: 'monospace' }}>{inv.einvoice_ack_no}</strong>
+                </div>
+              )}
+              {inv.einvoice_ack_date && (
+                <div style={{ padding: '8px 14px', borderTop: `1px solid ${C.border}` }}>
+                  <span style={{ color: C.textMuted }}>Ack Date: </span><strong>{fmtDate(inv.einvoice_ack_date)}</strong>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div style={{ padding: '12px 14px', fontSize: '12px', color: C.textMuted }}>
+            No IRN entered yet. Click <strong>+ Add</strong> after generating from GST portal.
+          </div>
+        )}
+      </div>
+      {inv.notes && <div style={{ marginTop: '12px', fontSize: '13px', color: C.textSoft }}><strong>Notes:</strong> {inv.notes}</div>}
+
+      <div style={{marginTop:'12px',marginBottom:'16px'}}>
+        <Btn size='sm' variant='ghost' onClick={()=>downloadCSV(`${inv.invoice_no||'invoice'}_lines_${today()}.csv`,['line_no','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'],lines)}>↓ Export Lines CSV</Btn>
+      </div>
+
+      {/* CHANGED: TDS/TCS display */}
+      {tdsRows.length > 0 && (
+        <div style={{ marginTop: '12px', border: `1px solid ${C.border}`, borderRadius: '6px', overflow: 'hidden' }}>
+          <div style={{ padding: '10px 14px', background: C.bg, fontWeight: 700, fontSize: '13px', color: C.textMid }}>TDS / TCS Entries</div>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
             <thead>
-              <tr>{['Entity','Type','GSTIN','Status','Vendor ID','Sales ID','Notes',''].map((h,i) => (
-                <th key={i} style={{ padding: '8px 12px', textAlign: 'left', fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.05em', background: C.bg, borderBottom: `1px solid ${C.border}` }}>{h}</th>
+              <tr>{['Type','Section','Description','Base Amount','Rate %','Amount','Paid'].map(h => (
+                <th key={h} style={{ padding: '7px 12px', textAlign: h==='Base Amount'||h==='Rate %'||h==='Amount'?'right':'left', fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.05em', background: C.bg, borderBottom: `1px solid ${C.border}` }}>{h}</th>
               ))}</tr>
             </thead>
             <tbody>
-              {filtered.length === 0 && <tr><td colSpan={8} style={{ padding: '32px', textAlign: 'center', color: C.textMuted }}>No entities found.</td></tr>}
-              {filtered.map((e, ri) => (
-                <tr key={e.id} style={{ background: ri%2===0 ? C.surface : '#faf6ed' }}>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}` }}>
-                    <div style={{ fontWeight: 600 }}>{e.short_name || e.name}</div>
-                    {e.short_name && <div style={{ fontSize: '11px', color: C.textMuted }}>{e.name}</div>}
-                  </td>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}` }}><Badge status={e.type} label={e.type} /></td>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontFamily: 'monospace', color: C.textSoft }}>{e.gstin || '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}` }}>
-                    {e.reliance_onboarded ? <Badge status='active' label='Onboarded' /> : <Badge status='pending' label='Pending' />}
-                  </td>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontFamily: 'monospace', fontSize: '12px', color: e.reliance_vendor_id ? C.text : C.textMuted }}>{e.reliance_vendor_id || '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontFamily: 'monospace', fontSize: '12px', color: e.reliance_sales_id ? C.text : C.textMuted }}>{e.reliance_sales_id || '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontSize: '12px', color: C.textSoft, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{e.reliance_notes || '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}` }}>
-                    <Btn size='sm' variant='ghost' onClick={() => openEdit(e)}>Edit</Btn>
-                  </td>
+              {tdsRows.map((r,i) => (
+                <tr key={r.id} style={{ background: i%2===0?C.surface:'#faf6ed' }}>
+                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}><Badge status={r.entry_type==='tcs'?'export':'domestic'} label={r.entry_type.toUpperCase()} /></td>
+                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, fontFamily: 'monospace', fontWeight: 600 }}>{r.section_code}</td>
+                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, color: C.textSoft }}>{r.section_desc || '—'}</td>
+                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(r.base_amount)}</td>
+                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{r.rate}%</td>
+                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>{formatINR(r.amount)}</td>
+                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}><Badge status={r.is_paid?'paid':'pending'} label={r.is_paid?'Paid':'Pending'} /></td>
                 </tr>
               ))}
             </tbody>
           </table>
-        )}
+        </div>
+      )}
+      <div style={{ marginTop: '20px' }}>
+        <div style={{ fontWeight: 700, fontSize: '14px', marginBottom: '10px' }}>Documents</div>
+        <DocumentAttachments
+          sourceType='invoices'
+          sourceId={inv.id}
+          entityName={inv.seller?.name || 'General'}
+        />
       </div>
 
-      {/* Edit Modal */}
-      <Modal open={!!editModal} onClose={() => setEditModal(null)} title={`Reliance — ${editModal?.short_name || editModal?.name}`} width={480}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 14px', background: editForm.reliance_onboarded ? '#edf7f1' : '#fef6e4', border: `1px solid ${editForm.reliance_onboarded ? '#b8dfca' : '#f0d890'}`, borderRadius: '6px' }}>
-            <div>
-              <div style={{ fontSize: '13px', fontWeight: 700, color: editForm.reliance_onboarded ? C.success : C.warning }}>{editForm.reliance_onboarded ? '✓ Onboarded' : '⏳ Pending'}</div>
-              <div style={{ fontSize: '12px', color: C.textSoft, marginTop: '2px' }}>{editForm.reliance_onboarded ? 'Registered on Reliance portal' : 'Not yet registered'}</div>
-            </div>
-            <button onClick={() => setEditForm(f => ({ ...f, reliance_onboarded: !f.reliance_onboarded }))} style={{ padding: '6px 16px', borderRadius: '6px', fontSize: '12px', fontWeight: 700, background: editForm.reliance_onboarded ? C.success : C.accent, color: '#f5f0e8', border: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-              {editForm.reliance_onboarded ? 'Mark Pending' : 'Mark Onboarded'}
-            </button>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='Vendor ID'><Input value={editForm.reliance_vendor_id} onChange={e => setEditForm(f => ({...f, reliance_vendor_id: e.target.value}))} placeholder='Reliance Vendor ID' /></FormRow>
-            <FormRow label='Sales ID'><Input value={editForm.reliance_sales_id} onChange={e => setEditForm(f => ({...f, reliance_sales_id: e.target.value}))} placeholder='Reliance Sales ID' /></FormRow>
-          </div>
-          <FormRow label='Notes'><Textarea value={editForm.reliance_notes} onChange={e => setEditForm(f => ({...f, reliance_notes: e.target.value}))} rows={3} /></FormRow>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
-            <Btn variant='ghost' onClick={() => setEditModal(null)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Save'}</Btn>
-          </div>
-        </div>
-      </Modal>
+      <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
+        title='Cancel Invoice' message='Cancel this invoice? All GL entries will be reversed.' danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
 }
 
-export default function Settings() {
-  const [tab, setTab] = useState('Financial Years')
-
+export default function Invoices() {
   return (
-    <div>
-      <div style={{ marginBottom: '24px' }}>
-        <h1 style={{ fontSize: '20px', fontWeight: 700, color: C.text, margin: 0 }}>Settings</h1>
-        <p style={{ fontSize: '13px', color: C.textMuted, margin: '4px 0 0' }}>Manage financial years, groups, HSN master, and users</p>
-      </div>
-
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '24px', borderBottom: `2px solid ${C.border}` }}>
-        {TABS.map(t => (
-          <button key={t} onClick={() => setTab(t)}
-            style={{
-              padding: '8px 18px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-              fontWeight: tab === t ? 700 : 500, fontSize: '13px',
-              color: tab === t ? C.text : C.textSoft,
-              background: 'transparent',
-              borderBottom: tab === t ? `2px solid ${C.accent}` : '2px solid transparent',
-              marginBottom: '-2px',
-            }}>
-            {t}
-          </button>
-        ))}
-      </div>
-
-      {tab === 'Financial Years'  && <FYSettings />}
-      {tab === 'Entity Groups'    && <GroupSettings />}
-      {tab === 'HSN Master'       && <HSNMasterSettings />}
-      {tab === 'Users'            && <UserSettings />}
-      {tab === 'Reliance Tracker' && <RelianceSettings />}
-    </div>
+    <Routes>
+      <Route index         element={<InvoiceList />} />
+      <Route path='new'    element={<NewInvoice />} />
+      <Route path=':id'    element={<InvoiceDetail />} />
+    </Routes>
   )
 }

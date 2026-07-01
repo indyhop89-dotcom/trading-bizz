@@ -4,6 +4,21 @@
  * No server, no libraries — pure browser.
  */
 
+/**
+ * Detect the delimiter actually used in a CSV line. Handles the common case
+ * where a user copies cells straight out of Excel (tab-separated) or a
+ * regional Excel build that uses semicolons, instead of true comma-CSV.
+ */
+export function detectDelimiter(headerLine) {
+  const counts = {
+    ',':  (headerLine.match(/,/g)  || []).length,
+    '\t': (headerLine.match(/\t/g) || []).length,
+    ';':  (headerLine.match(/;/g)  || []).length,
+  }
+  const best = Object.entries(counts).sort((a, b) => b[1] - a[1])[0]
+  return best[1] > 0 ? best[0] : ','
+}
+
 export function downloadCSV(filename, headers, rows) {
   const escape = val => {
     if (val === null || val === undefined) return ''
@@ -47,17 +62,20 @@ export const TEMPLATES = {
 
   opening_stock: {
     filename: 'opening_stock_template.csv',
-    headers:  ['entity', 'product', 'fy', 'qty', 'rate', 'as_of_date'],
+    headers:  ['entity', 'product', 'fy', 'qty', 'unit', 'rate', 'hsn_code', 'gst_rate', 'as_of_date'],
     rows: [
-      { entity: 'Siddi', product: 'T-Shirt Basic Round Neck', fy: 'FY 2025-26', qty: 1000, rate: 250, as_of_date: '2025-04-01' },
-      { entity: 'Retail', product: 'Cotton Woven Fabric',      fy: 'FY 2025-26', qty: 500,  rate: 180, as_of_date: '2025-04-01' },
-      { entity: 'MVL',    product: 'Polo T-Shirt',             fy: 'FY 2025-26', qty: 300,  rate: 450, as_of_date: '2025-04-01' },
+      { entity: 'Siddi', product: 'T-Shirt Basic Round Neck', fy: 'FY 2025-26', qty: 1000, unit: 'Nos', rate: 250, hsn_code: '6109', gst_rate: 12, as_of_date: '2025-04-01' },
+      { entity: 'Retail', product: 'Cotton Woven Fabric',      fy: 'FY 2025-26', qty: 500,  unit: 'Mtr', rate: 180, hsn_code: '5208', gst_rate: 5,  as_of_date: '2025-04-01' },
+      { entity: 'MVL',    product: 'Polo T-Shirt',             fy: 'FY 2025-26', qty: 300,  unit: 'Nos', rate: 450, hsn_code: '6110', gst_rate: 12, as_of_date: '2025-04-01' },
     ],
     notes: [
       '# entity   = short name or full name exactly as in Entities module',
       '# product  = product name exactly as in Products',
       '# fy       = financial year name exactly as in Settings → Financial Years',
       '# rate     = rate per unit in rupees',
+      '# unit     = Nos / Kg / Pcs / Box / Mtr / Ltr / Set — leave blank to use the product\'s default unit',
+      '# hsn_code = leave blank to use the product\'s default HSN code',
+      '# gst_rate = GST % number only, e.g. 12 — leave blank to use the product\'s default GST rate',
       '# as_of_date = YYYY-MM-DD format',
     ],
   },

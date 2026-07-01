@@ -3,7 +3,7 @@ import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
@@ -11,7 +11,7 @@ import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
-import { downloadTemplate, downloadCSV } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 
@@ -193,13 +193,14 @@ function PIList() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
-    const header = lines[0].split(',').map(h => h.trim().toLowerCase())
+    const delim = detectDelimiter(lines[0])
+    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
 
     // Group rows by pi_date+from_entity+to_entity
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(',').map(c => c.trim())
+      const cols = lines[i].split(delim).map(c => c.trim())
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       const key = `${row.pi_date}__${row.from_entity}__${row.to_entity}`
@@ -332,10 +333,11 @@ function PIList() {
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes</code><br /><br />
             Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically.
           </div>
-          <FormRow label='Paste CSV'>
-            <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
-              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
+          <FormRow label='Upload or Paste CSV'>
+            <CsvFileDrop onText={setCsvText} />
           </FormRow>
+          <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
+              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>{csvResult.created} PIs created.</strong>

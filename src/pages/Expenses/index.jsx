@@ -8,27 +8,10 @@ import { formatINR, toNum, roundRupees, round2 } from '../../utils/money'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import DocumentAttachments from '../../components/DocumentAttachments'
 
-const EXPENSE_TYPES = [
-  'Hangtags',
-  'Freight',
-  'Transport',
-  'Labour',
-  'Loading/Unloading',
-  'Brokerage',
-  'Bank Charges',
-  'Duty/Tax',
-  'Insurance',
-  'Office',
-  'Professional',
-  'Repair',
-  'Sampling',
-  'Packaging',
-  'Other',
-]
 const GST_RATES     = [0, 5, 12, 18, 28]
 
 const EMPTY = {
-  expense_date: today(), entity_id: '', expense_type: 'Hangtags',
+  expense_date: today(), entity_id: '', expense_type: '',
   description: '', amount: '', gst_rate: 0,
   vendor_entity_id: '', vendor_name: '', vendor_gstin: '',
   order_id: '', order_leg_id: '', status: 'unpaid', notes: '',
@@ -46,6 +29,7 @@ export default function Expenses() {
   const [expenses, setExpenses] = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
+  const [categories, setCategories] = useState([]) // CHANGED: loaded from expense_categories master table
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
   const [typeFilter, setType]   = useState('all')
@@ -56,16 +40,18 @@ export default function Expenses() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: exps }, { data: es }, { data: os }] = await Promise.all([
+    const [{ data: exps }, { data: es }, { data: os }, { data: cats }] = await Promise.all([
       supabase.from('expenses')
         .select('*, entity:entity_id(name,short_name), vendor:vendor_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('expense_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      supabase.from('expense_categories').select('id,name').eq('is_active', true).order('sort_order'), // CHANGED
     ])
     setExpenses(exps || [])
     setEntities(es || [])
     setOrders(os || [])
+    setCategories((cats || []).map(c => c.name)) // CHANGED: keep same string[] shape the UI already expects
     setLoading(false)
   }, [])
 
@@ -79,6 +65,7 @@ export default function Expenses() {
 
   async function handleSave() {
     if (!form.entity_id || !form.description) return setToast({ message: 'Entity and description are required', type: 'error' })
+    if (!form.expense_type) return setToast({ message: 'Expense type is required', type: 'error' })
     const amount    = roundRupees(toNum(form.amount))
     if (!amount) return setToast({ message: 'Amount is required', type: 'error' })
     setSaving(true)
@@ -152,7 +139,7 @@ export default function Expenses() {
         <select value={typeFilter} onChange={e => setType(e.target.value)}
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value='all'>All types</option>
-          {EXPENSE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+          {categories.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
       </div>
 
@@ -178,7 +165,8 @@ export default function Expenses() {
             </FormRow>
             <FormRow label='Expense Type' required>
               <Select value={form.expense_type} onChange={e => setF('expense_type', e.target.value)}>
-                {EXPENSE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                <option value=''>Select category</option>
+                {categories.map(t => <option key={t} value={t}>{t}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Status'>
