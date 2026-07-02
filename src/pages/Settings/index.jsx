@@ -63,10 +63,34 @@ function FinancialYears() {
     load()
   }
 
+  // CHANGED: check usage before attempting delete, so an in-use FY gets a
+  // clear "X orders / Y stock rows linked" message instead of a raw
+  // Postgres FK-violation error surfaced straight from the delete attempt.
   async function handleDelete() {
     if (!confirmDelete) return
+    setSaving(true)
+
+    const [{ count: orderCount }, { count: stockCount }] = await Promise.all([
+      supabase.from('orders').select('id', { count: 'exact', head: true }).eq('financial_year_id', confirmDelete.id),
+      supabase.from('stock_opening_balance').select('id', { count: 'exact', head: true }).eq('financial_year_id', confirmDelete.id),
+    ])
+
+    if (orderCount > 0 || stockCount > 0) {
+      setSaving(false)
+      setConfirmDelete(null)
+      return setToast({
+        message: `Can't delete "${confirmDelete.name}" — it has ${orderCount} order(s) and ${stockCount} opening stock row(s) linked to it.`,
+        type: 'error',
+      })
+    }
+
+    // CHANGED: safe to delete — order_sequence has a UNIQUE, non-cascading
+    // FK on financial_year_id, so it must be cleared before the FY itself.
+    await supabase.from('order_sequence').delete().eq('financial_year_id', confirmDelete.id)
     const { error } = await supabase.from('financial_years').delete().eq('id', confirmDelete.id)
+    setSaving(false)
     if (error) setToast({ message: error.message, type: 'error' })
+    else setToast({ message: 'Financial year deleted', type: 'success' })
     setConfirmDelete(null)
     load()
   }
