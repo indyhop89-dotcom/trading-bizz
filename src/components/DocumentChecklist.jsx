@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { supabase } from '../supabaseClient'
 import { C, Btn, ConfirmModal, Toast } from './UI/index'
-import { uploadFileToDrive, getDriveViewUrl, getDriveDownloadUrl, formatFileSize, fileIcon } from '../utils/drive'
+import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl, getDriveDownloadUrl, formatFileSize, fileIcon } from '../utils/drive'
 import { fmtDate } from '../utils/dates'
 
 // ── Document type definitions ─────────────────────────────────────────────────
@@ -28,6 +28,21 @@ const EXPORT_DOCS = [
 ]
 
 const STATUS_OPTIONS = ['Uploaded', 'Pending', 'N/A']
+
+// CHANGED: map checklist slot to a clean B2 subfolder label, e.g. Siddi/E-way Bill/file.pdf
+const SLOT_FOLDER = {
+  invoice:               'Invoice',
+  packing_list:          'Packing List',
+  pi:                    'PI',
+  po:                    'PO',
+  eway_bill:             'E-way Bill',
+  einvoice:              'E-invoice',
+  lr:                    'LR',
+  airway_bill:           'Airway Bill',
+  coo:                   'COO',
+  boe:                   'BOE',
+  air_freight_clearance: 'Air Freight Clearance',
+}
 
 const STATUS_STYLE = {
   Uploaded: { bg: '#e6f4ec', color: '#1a6b35', border: '#b3d9c0' },
@@ -180,7 +195,10 @@ export default function DocumentChecklist({
     if (!file || !legId) return
     setUploading(slot)
     try {
-      const result = await uploadFileToDrive(file, entityName)
+      // CHANGED: capture the file being replaced (if any) so we can clean it up after the new one lands
+      const oldDoc = rowFor(slot)?.document || null
+
+      const result = await uploadFileToDrive(file, entityName, SLOT_FOLDER[slot] || '') // CHANGED: nest by doc type
 
       // Insert document record
       const docPayload = {
@@ -223,6 +241,16 @@ export default function DocumentChecklist({
         })
       }
 
+      // CHANGED: clean up the replaced file now that the checklist points at the new one
+      if (oldDoc?.id) {
+        try {
+          await deleteFileFromDrive(oldDoc.drive_file_id)
+        } catch (err) {
+          console.error('Storage delete error (replaced file):', err)
+        }
+        await supabase.from('documents').delete().eq('id', oldDoc.id)
+      }
+
       setToast({ message: `${file.name} uploaded`, type: 'success' })
       load()
     } catch (err) {
@@ -238,7 +266,7 @@ export default function DocumentChecklist({
     if (!file || !legId) return
     setUploadingOther(true)
     try {
-      const result = await uploadFileToDrive(file, entityName)
+      const result = await uploadFileToDrive(file, entityName, 'Other') // CHANGED: nest under Other subfolder
       await supabase.from('documents').insert({
         entity_id:       entityId || null,
         leg_id:          legId,
@@ -261,6 +289,11 @@ export default function DocumentChecklist({
   }
 
   async function handleDeleteOther() {
+    try {
+      await deleteFileFromDrive(confirmDelete.drive_file_id)
+    } catch (err) {
+      console.error('Storage delete error:', err)
+    }
     await supabase.from('documents').delete().eq('id', confirmDelete.id)
     setConfirmDelete(null)
     setToast({ message: 'Document removed', type: 'success' })
@@ -601,7 +634,7 @@ export default function DocumentChecklist({
         onClose={() => setConfirmDelete(null)}
         onConfirm={handleDeleteOther}
         title='Remove Document'
-        message={`Remove "${confirmDelete?.file_name}"? The file will stay in Google Drive.`}
+        message={`Remove "${confirmDelete?.file_name}"? This deletes the file permanently.`}
         danger
       />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
