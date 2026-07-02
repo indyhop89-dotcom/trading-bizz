@@ -17,6 +17,27 @@ export function today() {
   return new Date().toISOString().split('T')[0]
 }
 
+/**
+ * Parse a CSV date cell that may be YYYY-MM-DD (ISO, preferred) or DD-MM-YYYY
+ * / DD/MM/YYYY (common when typed or copied from Excel in India). Returns
+ * ISO YYYY-MM-DD, or null if the value is blank or doesn't match either shape.
+ * Postgres's default DateStyle reads unquoted "15-06-2026" as MDY and throws
+ * "date/time field value out of range" the moment the day exceeds 12 — this
+ * normalizes on the JS side before the value ever reaches the DB.
+ */
+export function parseFlexibleDate(raw) {
+  const s = (raw || '').trim()
+  if (!s) return null
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (iso) return s
+  const dmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/)
+  if (dmy) {
+    const [, d, m, y] = dmy
+    return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`
+  }
+  return null
+}
+
 /** Current financial year label e.g. "FY 2025-26" */
 export function currentFYLabel() {
   const now = new Date()

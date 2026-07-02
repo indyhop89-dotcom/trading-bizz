@@ -7,7 +7,7 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/dates'
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
@@ -161,6 +161,23 @@ function POList() {
       const sellerE = entities.find(e => e.short_name?.toLowerCase() === meta.seller_entity?.toLowerCase() || e.name?.toLowerCase() === meta.seller_entity?.toLowerCase())
       if (!buyerE)  { errors.push(`Buyer "${meta.buyer_entity}" not found`); continue }
       if (!sellerE) { errors.push(`Seller "${meta.seller_entity}" not found`); continue }
+
+      // CHANGED: same fix as PI — accept YYYY-MM-DD or DD-MM-YYYY, normalize to ISO,
+      // otherwise Postgres throws "date/time field value out of range" on any
+      // DD-MM-YYYY value where the day exceeds 12.
+      const poDate = parseFlexibleDate(meta.po_date)
+      if (!poDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: po_date "${meta.po_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
+      const deliveryDate = meta.delivery_date ? parseFlexibleDate(meta.delivery_date) : null
+      if (meta.delivery_date && !deliveryDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: delivery_date "${meta.delivery_date}" is not a valid date`); continue }
+
+      // CHANGED: po_no and financial_year_id are NOT NULL with no DB default —
+      // previously omitted here, so this insert would have failed on that
+      // constraint right after the date fix. Mirrors the single-PO create flow.
+      const fy = await resolveFY()
+      if (!fy) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: no financial year found`); continue }
+      const { data: poNo, error: noErr } = await supabase.rpc('next_po_no', { ent_id: buyerE.id, fy_id: fy.id })
+      if (noErr) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: could not generate PO number — ${noErr.message}`); continue }
+
       const interstate = meta.is_interstate === 'true' || (buyerE.state_code && sellerE.state_code && buyerE.state_code !== sellerE.state_code)
       const poLines = gLines.map((r, i) => {
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
@@ -170,7 +187,7 @@ function POList() {
         return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
       const totals = poLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
-      const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: meta.po_date, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: meta.delivery_date||null, notes: meta.notes||null, status: 'open', ...totals }).select().single()
+      const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, financial_year_id: fy.id, ...totals }).select().single()
       if (poErr) { errors.push(`PO ${meta.po_date}: ${poErr.message}`); continue }
       await supabase.from('purchase_order_lines').insert(poLines.map(l => ({ ...l, po_id: po.id })))
       created++

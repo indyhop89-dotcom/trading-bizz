@@ -7,7 +7,7 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/dates'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
@@ -215,6 +215,23 @@ function PIList() {
       if (!fromE) { errors.push(`Row group ${meta.from_entity}: entity not found`); continue }
       if (!toE)   { errors.push(`Row group ${meta.to_entity}: entity not found`);   continue }
 
+      // CHANGED: accept YYYY-MM-DD or DD-MM-YYYY from the CSV, normalize to ISO.
+      // Raw DD-MM-YYYY strings sent straight to Postgres fail with
+      // "date/time field value out of range" once the day exceeds 12.
+      const piDate = parseFlexibleDate(meta.pi_date)
+      if (!piDate) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: pi_date "${meta.pi_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
+      const validUpto = meta.valid_upto ? parseFlexibleDate(meta.valid_upto) : null
+      if (meta.valid_upto && !validUpto) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: valid_upto "${meta.valid_upto}" is not a valid date`); continue }
+
+      // CHANGED: pi_no and financial_year_id are NOT NULL columns with no DB
+      // default — they were previously omitted here, so every CSV-created PI
+      // would have failed on that constraint right after the date fix. This
+      // mirrors the single-PI create flow: resolve FY, then call next_pi_no().
+      const fy = await resolveFY()
+      if (!fy) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: no financial year found`); continue }
+      const { data: piNo, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: fromE.id, fy_id: fy.id })
+      if (noErr) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: could not generate PI number — ${noErr.message}`); continue }
+
       const interstate = meta.is_interstate === 'true' || (fromE.state_code && toE.state_code && fromE.state_code !== toE.state_code)
 
       const piLines = gLines.map((r, i) => {
@@ -246,9 +263,9 @@ function PIList() {
       }), { taxable_amount: 0, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 0 })
 
       const { data: pi, error: piErr } = await supabase.from('proforma_invoices').insert({
-        pi_date: meta.pi_date, from_entity_id: fromE.id, to_entity_id: toE.id,
-        is_interstate: interstate, valid_upto: meta.valid_upto || null,
-        notes: meta.notes || null, status: 'draft', ...totals,
+        pi_date: piDate, from_entity_id: fromE.id, to_entity_id: toE.id,
+        is_interstate: interstate, valid_upto: validUpto,
+        notes: meta.notes || null, status: 'draft', pi_no: piNo, financial_year_id: fy.id, ...totals,
       }).select().single()
 
       if (piErr) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: ${piErr.message}`); continue }
