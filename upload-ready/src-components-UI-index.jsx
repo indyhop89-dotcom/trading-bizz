@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 
 // ─── Design tokens (mirrors CSS variables — use for inline styles) ────────────
 export const C = {
@@ -425,7 +425,51 @@ export function Card({ children, style: extra, onClick }) {
   )
 }
 
-// ─── CardHeader ───────────────────────────────────────────────────────────────
+// ─── CsvFileDrop — file picker / drag-drop that loads a .csv file's text ──────
+// Drop a .csv file or click "Choose File"; the file's contents are handed to
+// onText(text) so callers can feed it into their existing paste-CSV state.
+export function CsvFileDrop({ onText, label = 'Choose File' }) {
+  const inputRef = useRef(null)
+  const [dragOver, setDragOver] = useState(false)
+  const [fileName, setFileName] = useState('')
+  const [error, setError] = useState('')
+
+  async function readFile(file) {
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.csv')) { setError('Please choose a .csv file'); return }
+    setError('')
+    setFileName(file.name)
+    const text = await file.text()
+    onText(text)
+  }
+
+  return (
+    <div>
+      <div
+        onDragOver={e => { e.preventDefault(); setDragOver(true) }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={e => { e.preventDefault(); setDragOver(false); readFile(e.dataTransfer.files?.[0]) }}
+        style={{
+          display: 'flex', alignItems: 'center', gap: '10px',
+          border: `1.5px dashed ${dragOver ? 'var(--accent)' : 'var(--border-dark)'}`,
+          borderRadius: 'var(--radius)', padding: '12px 14px',
+          background: dragOver ? 'var(--accent-light)' : 'var(--bg)',
+          transition: 'all var(--transition-fast)',
+        }}
+      >
+        <span style={{ fontSize: '12px', color: 'var(--text-muted)', flex: 1 }}>
+          {fileName ? `Loaded: ${fileName}` : 'Drag a .csv file here, or'}
+        </span>
+        <Btn size='sm' variant='ghost' onClick={() => inputRef.current?.click()}>↑ {label}</Btn>
+        <input
+          ref={inputRef} type='file' accept='.csv' style={{ display: 'none' }}
+          onChange={e => { readFile(e.target.files?.[0]); e.target.value = '' }}
+        />
+      </div>
+      {error && <div style={{ fontSize: '11px', color: 'var(--danger)', marginTop: '4px' }}>{error}</div>}
+    </div>
+  )
+}
 export function CardHeader({ title, action, children }) {
   return (
     <div style={{

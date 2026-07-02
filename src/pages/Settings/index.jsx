@@ -899,6 +899,7 @@ function InvoiceDetail() {
         <DocumentAttachments
           sourceType='invoices'
           sourceId={inv.id}
+          entityId={inv.seller_entity_id}   // CHANGED: was missing, caused the upload guard to always fire
           entityName={inv.seller?.name || 'General'}
         />
       </div>

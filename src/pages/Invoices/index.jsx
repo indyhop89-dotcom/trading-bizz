@@ -3,7 +3,7 @@ import { Routes, Route, useNavigate, useParams, useSearchParams } from 'react-ro
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
@@ -225,11 +225,10 @@ function InvoiceList() {
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes</code><br /><br />
             Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice.
           </div>
-          <FormRow label='Upload or Paste CSV'>
-            <CsvFileDrop onText={setCsvText} />
-          </FormRow>
-          <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
+          <FormRow label='Paste CSV'>
+            <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
               style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
+          </FormRow>
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>{csvResult.created} invoices created.</strong>
@@ -898,6 +897,7 @@ function InvoiceDetail() {
         <DocumentAttachments
           sourceType='invoices'
           sourceId={inv.id}
+          entityId={inv.seller_entity_id}
           entityName={inv.seller?.name || 'General'}
         />
       </div>

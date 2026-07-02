@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
@@ -7,6 +7,21 @@ import {
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { formatINR, toNum, roundRupees } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
+import { useAuth } from '../../hooks/useAuth'
+
+// ─── TDS constants (mirrors Invoices module) ───────────────────────────────────
+const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
+const TDS_SECTION_LABELS = {
+  '194C': 'Payment to Contractors',
+  '194H': 'Commission or Brokerage',
+  '194I': 'Rent',
+  '194J': 'Professional/Technical Services',
+  '194Q': 'Purchase of Goods',
+  '206C': 'TCS on Sale of Goods',
+}
+const TDS_DEFAULT_RATES = {
+  '194C': 1, '194H': 5, '194I': 10, '194J': 10, '194Q': 0.1, '206C': 0.1,
+}
 
 // ─── constants ────────────────────────────────────────────────────────────────
 const CURRENCIES = ['INR', 'USD', 'AED', 'EUR', 'GBP', 'SGD', 'SAR']
@@ -37,20 +52,22 @@ function autoStatus(advance, balance, actualPaymentDate) {
   return 'Recorded'
 }
 
-function calcInvDaysLeft(dueDate, paid) {
-  if (paid) return 0
+function calcInvDaysLeft(dueDate) {
   if (!dueDate) return null
   return Math.ceil((new Date(dueDate) - new Date()) / (1000 * 60 * 60 * 24))
 }
 
-function invStatus(daysLeft, actualPaymentDate, advance, amount) {
-  if (actualPaymentDate) return 'paid'
-  const bal = toNum(amount) - toNum(advance)
-  if (bal <= 0) return 'paid'
+// Status for an INVOICE (aggregated across all its payment tranches), not a single row.
+function invStatus(daysLeft, pending) {
+  if (pending <= 0) return 'paid'
   if (daysLeft === null) return 'pending'
   if (daysLeft < 0)   return 'overdue'
   if (daysLeft <= 7)  return 'due_soon'
   return 'pending'
+}
+
+function computeTds(base, rate) {
+  return roundRupees((toNum(base) * toNum(rate)) / 100)
 }
 
 // ─── shared UI atoms ──────────────────────────────────────────────────────────
@@ -121,97 +138,224 @@ function BalancePreview({ amount, advance, adjustments, currency, usdRate }) {
 }
 
 // ─── Invoice Payment Tracker ──────────────────────────────────────────────────
+// Each row in `invoice_payments` is now ONE PAYMENT TRANCHE against an invoice
+// (not a snapshot of the whole invoice). The table below is invoice-centric:
+// it aggregates all tranches per invoice to show paid / TDS / pending.
 const EMPTY_INV = {
   invoice_id: '', entity_id: '', party_entity_id: '', party_name: '',
-  invoice_no: '', invoice_date: '', currency: 'INR', amount: '',
-  advance_amount: '', advance_date: '', adjustments: '0', adjustment_notes: '',
-  due_date: '', actual_payment_date: '', exchange_rate: '1', notes: '',
+  invoice_no: '', invoice_date: '', due_date: '',
+  currency: 'INR', exchange_rate: '1',
+  basis: '',                 // gross amount being settled by this tranche (defaults to pending)
+  apply_tds: false, tds_section: '', tds_rate: '',
+  adjustments: '0', adjustment_notes: '',
+  actual_payment_date: '', notes: '',
 }
 
 function InvoicePaymentTracker() {
-  const [rows, setRows]         = useState([])
-  const [entities, setEntities] = useState([])
+  const { profile } = useAuth()
   const [invoices, setInvoices] = useState([])
+  const [payments, setPayments] = useState([])
+  const [entities, setEntities] = useState([])
+  const [accessEntityIds, setAccessEntityIds] = useState(null) // null = unrestricted (master)
   const [loading, setLoading]   = useState(true)
   const [modalOpen, setModalOpen]   = useState(false)
-  const [detailOpen, setDetailOpen] = useState(null) // row for detail panel
-  const [editing, setEditing]   = useState(null)
+  const [detailOpen, setDetailOpen] = useState(null) // invoice row for tranche-history panel
+  const [editingPayment, setEditingPayment] = useState(null) // tranche row being edited
   const [form, setForm]         = useState(EMPTY_INV)
   const [saving, setSaving]     = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState(null)
-  const [confirmPaid, setConfirmPaid]     = useState(null)
+  const [confirmDelete, setConfirmDelete] = useState(null) // tranche row to delete
   const [statusFilter, setStatusFilter]   = useState('all')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
+  const [fromEntityFilter, setFromEntityFilter] = useState('') // seller
+  const [toEntityFilter, setToEntityFilter]     = useState('') // buyer
   const [toast, setToast]       = useState(null)
+
+  const isAdmin = profile?.role === 'master'
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: rs }, { data: es }, { data: invs }] = await Promise.all([
+    const [{ data: invs }, { data: pays }, { data: es }] = await Promise.all([
+      supabase.from('invoices')
+        .select('id,invoice_no,invoice_date,due_date,total_amount,status,seller_entity_id,buyer_entity_id,seller:seller_entity_id(name,short_name),buyer:buyer_entity_id(name,short_name)')
+        .eq('is_deleted', false).neq('status', 'cancelled').order('invoice_date', { ascending: false }),
       supabase.from('invoice_payments')
-        .select('*, entity:entity_id(name,short_name), party:party_entity_id(name,short_name), invoice:invoice_id(invoice_no,total_amount,invoice_date)')
-        .eq('is_deleted', false).order('created_at', { ascending: false }),
+        .select('*')
+        .eq('is_deleted', false).order('actual_payment_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('invoices').select('id,invoice_no,total_amount,invoice_date,seller:seller_entity_id(name,short_name)').eq('is_deleted', false).neq('status','cancelled').order('invoice_date', { ascending: false }),
     ])
-    setRows(rs || [])
-    setEntities(es || [])
     setInvoices(invs || [])
+    setPayments(pays || [])
+    setEntities(es || [])
     setLoading(false)
   }, [])
 
   useEffect(() => { load() }, [load])
 
+  // Role-based entity access — non-admin users only see invoices billed to entities they have access to.
+  useEffect(() => {
+    async function loadAccess() {
+      if (!profile) return
+      if (profile.role === 'master') { setAccessEntityIds(null); return }
+      const { data } = await supabase.from('user_entity_access').select('entity_id').eq('user_id', profile.id)
+      setAccessEntityIds((data || []).map(a => a.entity_id))
+    }
+    loadAccess()
+  }, [profile])
+
+  // Default "To Entity" filter for non-admins: locked if they have exactly one entity, else a scoped dropdown.
+  useEffect(() => {
+    if (!isAdmin && accessEntityIds && accessEntityIds.length > 0 && !toEntityFilter) {
+      setToEntityFilter(accessEntityIds[0])
+    }
+  }, [isAdmin, accessEntityIds]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toEntityLocked = !isAdmin && accessEntityIds && accessEntityIds.length === 1
+  const toEntityOptions = isAdmin ? entities : entities.filter(e => (accessEntityIds || []).includes(e.id))
+
+  // ── Aggregate tranches per invoice ──────────────────────────────────────────
+  const paymentsByInvoice = useMemo(() => {
+    const map = new Map()
+    for (const p of payments) {
+      if (!p.invoice_id) continue
+      if (!map.has(p.invoice_id)) map.set(p.invoice_id, [])
+      map.get(p.invoice_id).push(p)
+    }
+    return map
+  }, [payments])
+
+  const computed = useMemo(() => invoices.map(inv => {
+    const tranches = (paymentsByInvoice.get(inv.id) || []).slice().sort((a, b) => (a.actual_payment_date || '').localeCompare(b.actual_payment_date || ''))
+    const paidSum = tranches.reduce((s, t) => s + toNum(t.amount), 0)
+    const tdsSum  = tranches.reduce((s, t) => s + toNum(t.tds_amount), 0)
+    const adjSum  = tranches.reduce((s, t) => s + toNum(t.adjustments), 0)
+    const settled = paidSum + tdsSum + adjSum
+    const pending = Math.max(0, roundRupees(toNum(inv.total_amount) - settled))
+    const daysLeft = pending <= 0 ? 0 : calcInvDaysLeft(inv.due_date)
+    const status = invStatus(daysLeft, pending)
+    return { ...inv, _tranches: tranches, _paid: paidSum, _tds: tdsSum, _adj: adjSum, _pending: pending, _daysLeft: daysLeft, _status: status }
+  }), [invoices, paymentsByInvoice])
+
+  // ── Filters ──────────────────────────────────────────────────────────────────
+  const filtered = computed.filter(inv => {
+    if (statusFilter !== 'all' && inv._status !== statusFilter) return false
+    if (dateFrom && inv.invoice_date < dateFrom) return false
+    if (dateTo && inv.invoice_date > dateTo) return false
+    if (fromEntityFilter && inv.seller_entity_id !== fromEntityFilter) return false
+    if (toEntityFilter && inv.buyer_entity_id !== toEntityFilter) return false
+    // Hard restriction — non-admins never see invoices outside their entity access, filter or no filter.
+    if (!isAdmin && accessEntityIds && accessEntityIds.length > 0 && !accessEntityIds.includes(inv.buyer_entity_id)) return false
+    return true
+  })
+
+  const totalOutstanding = filtered.filter(r => r._status !== 'paid').reduce((s, r) => s + r._pending, 0)
+
+  // ── Add / Edit payment modal ────────────────────────────────────────────────
   function setF(k, v) {
     setForm(f => {
       const u = { ...f, [k]: v }
+      if (k === 'entity_id' || k === 'party_entity_id') u.invoice_id = ''
       if (k === 'invoice_id' && v) {
-        const inv = invoices.find(i => i.id === v)
-        if (inv) { u.invoice_no = inv.invoice_no || ''; u.invoice_date = inv.invoice_date || ''; u.amount = inv.total_amount != null ? String(inv.total_amount) : '' }
+        const inv = computed.find(i => i.id === v)
+        if (inv) {
+          u.invoice_no = inv.invoice_no || ''
+          u.invoice_date = inv.invoice_date || ''
+          u.due_date = inv.due_date || ''
+          u.entity_id = inv.buyer_entity_id || u.entity_id
+          u.party_entity_id = inv.seller_entity_id || u.party_entity_id
+          u.basis = String(inv._pending || 0)
+        }
       }
+      if (k === 'tds_section') u.tds_rate = TDS_DEFAULT_RATES[v] != null ? String(TDS_DEFAULT_RATES[v]) : u.tds_rate
       return u
     })
   }
 
-  function openNew()   { setEditing(null); setForm(EMPTY_INV); setModalOpen(true) }
-  function openEdit(r) {
-    setEditing(r)
-    setForm({ invoice_id: r.invoice_id||'', entity_id: r.entity_id||'', party_entity_id: r.party_entity_id||'', party_name: r.party_name||'', invoice_no: r.invoice_no||'', invoice_date: r.invoice_date||'', currency: r.currency||'INR', amount: r.amount!=null?String(r.amount):'', advance_amount: r.advance_amount!=null?String(r.advance_amount):'', advance_date: r.advance_date||'', adjustments: r.adjustments!=null?String(r.adjustments):'0', adjustment_notes: r.adjustment_notes||'', due_date: r.due_date||'', actual_payment_date: r.actual_payment_date||'', exchange_rate: r.exchange_rate!=null?String(r.exchange_rate):'1', notes: r.notes||'' })
+  // invoices available to link, scoped to chosen buyer/seller in the form
+  const invoiceOptions = computed.filter(inv => {
+    if (form.entity_id && inv.buyer_entity_id !== form.entity_id) return false
+    if (form.party_entity_id && inv.seller_entity_id !== form.party_entity_id) return false
+    return true
+  })
+
+  function openNew(invoiceRow) {
+    setEditingPayment(null)
+    if (invoiceRow) {
+      setForm({
+        ...EMPTY_INV,
+        invoice_id: invoiceRow.id, entity_id: invoiceRow.buyer_entity_id || '', party_entity_id: invoiceRow.seller_entity_id || '',
+        invoice_no: invoiceRow.invoice_no || '', invoice_date: invoiceRow.invoice_date || '', due_date: invoiceRow.due_date || '',
+        basis: String(invoiceRow._pending || 0), actual_payment_date: today(),
+      })
+    } else {
+      setForm({ ...EMPTY_INV, actual_payment_date: today() })
+    }
     setModalOpen(true)
   }
 
+  function openEditPayment(payment, invoiceRow) {
+    setEditingPayment(payment)
+    // Pending as if this tranche didn't exist yet — the ceiling this tranche can settle up to.
+    const otherSettled = (invoiceRow._paid + invoiceRow._tds + invoiceRow._adj) - (toNum(payment.amount) + toNum(payment.tds_amount) + toNum(payment.adjustments))
+    const ceiling = Math.max(0, roundRupees(toNum(invoiceRow.total_amount) - otherSettled))
+    setForm({
+      invoice_id: payment.invoice_id || invoiceRow.id,
+      entity_id: payment.entity_id || invoiceRow.buyer_entity_id || '',
+      party_entity_id: payment.party_entity_id || invoiceRow.seller_entity_id || '',
+      party_name: payment.party_name || '',
+      invoice_no: payment.invoice_no || invoiceRow.invoice_no || '',
+      invoice_date: payment.invoice_date || invoiceRow.invoice_date || '',
+      due_date: payment.due_date || invoiceRow.due_date || '',
+      currency: payment.currency || 'INR',
+      exchange_rate: payment.exchange_rate != null ? String(payment.exchange_rate) : '1',
+      basis: String(toNum(payment.amount) + toNum(payment.tds_amount)),
+      apply_tds: !!toNum(payment.tds_amount),
+      tds_section: payment.tds_section || '',
+      tds_rate: payment.tds_rate != null ? String(payment.tds_rate) : '',
+      adjustments: payment.adjustments != null ? String(payment.adjustments) : '0',
+      adjustment_notes: payment.adjustment_notes || '',
+      actual_payment_date: payment.actual_payment_date || today(),
+      notes: payment.notes || '',
+      _ceiling: ceiling,
+    })
+    setModalOpen(true)
+  }
+
+  const tdsAmount  = form.apply_tds ? computeTds(form.basis, form.tds_rate) : 0
+  const cashAmount = Math.max(0, roundRupees(toNum(form.basis) - tdsAmount))
+
   async function handleSave() {
-    if (!toNum(form.amount)) return setToast({ message: 'Amount is required', type: 'error' })
+    if (!form.invoice_id) return setToast({ message: 'Select an invoice', type: 'error' })
+    if (!toNum(form.basis)) return setToast({ message: 'Settlement amount is required', type: 'error' })
+    if (!form.actual_payment_date) return setToast({ message: 'Payment date is required', type: 'error' })
     setSaving(true)
-    const payload = { invoice_id: form.invoice_id||null, entity_id: form.entity_id||null, party_entity_id: form.party_entity_id||null, party_name: form.party_name||null, invoice_no: form.invoice_no||null, invoice_date: form.invoice_date||null, currency: form.currency, amount: toNum(form.amount), advance_amount: toNum(form.advance_amount), advance_date: form.advance_date||null, adjustments: toNum(form.adjustments), adjustment_notes: form.adjustment_notes||null, due_date: form.due_date||null, actual_payment_date: form.actual_payment_date||null, exchange_rate: toNum(form.exchange_rate)||1, notes: form.notes||null, updated_at: new Date() }
+    const payload = {
+      invoice_id: form.invoice_id, entity_id: form.entity_id || null, party_entity_id: form.party_entity_id || null,
+      party_name: form.party_name || null, invoice_no: form.invoice_no || null, invoice_date: form.invoice_date || null,
+      due_date: form.due_date || null, currency: form.currency, exchange_rate: toNum(form.exchange_rate) || 1,
+      amount: cashAmount,
+      tds_section: form.apply_tds ? (form.tds_section || null) : null,
+      tds_rate: form.apply_tds ? (toNum(form.tds_rate) || 0) : 0,
+      tds_base_amount: form.apply_tds ? toNum(form.basis) : 0,
+      tds_amount: tdsAmount,
+      adjustments: toNum(form.adjustments) || 0, adjustment_notes: form.adjustment_notes || null,
+      actual_payment_date: form.actual_payment_date, notes: form.notes || null,
+      updated_at: new Date(),
+    }
     let error
-    if (editing) { const r = await supabase.from('invoice_payments').update(payload).eq('id', editing.id); error = r.error }
-    else         { const r = await supabase.from('invoice_payments').insert(payload); error = r.error }
+    if (editingPayment) { const r = await supabase.from('invoice_payments').update(payload).eq('id', editingPayment.id); error = r.error }
+    else                { const r = await supabase.from('invoice_payments').insert(payload); error = r.error }
     setSaving(false)
     if (error) return setToast({ message: error.message, type: 'error' })
-    setToast({ message: editing ? 'Updated' : 'Added', type: 'success' })
+    setToast({ message: editingPayment ? 'Payment updated' : 'Payment recorded', type: 'success' })
     setModalOpen(false); load()
   }
 
-  async function markPaid(row) {
-    await supabase.from('invoice_payments').update({ actual_payment_date: today(), updated_at: new Date() }).eq('id', row.id)
-    setConfirmPaid(null)
-    setToast({ message: 'Marked as paid', type: 'success' })
-    load()
-  }
-
-  async function handleDelete() {
+  async function handleDeletePayment() {
     await supabase.from('invoice_payments').update({ is_deleted: true }).eq('id', confirmDelete.id)
     setConfirmDelete(null); load()
+    if (detailOpen) setDetailOpen(d => d) // keep panel open; load() will refresh underlying data on next render
   }
-
-  const computed = rows.map(r => {
-    const balance  = calcBalance(r.amount, r.advance_amount, r.adjustments)
-    const daysLeft = calcInvDaysLeft(r.due_date, r.actual_payment_date)
-    const status   = invStatus(daysLeft, r.actual_payment_date, r.advance_amount, r.amount)
-    return { ...r, _balance: balance, _daysLeft: daysLeft, _status: status }
-  })
-
-  const filtered = statusFilter === 'all' ? computed : computed.filter(r => r._status === statusFilter)
-  const totalOutstanding = computed.filter(r => r._status !== 'paid').reduce((s, r) => s + r._balance, 0)
 
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '10px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', whiteSpace: 'nowrap' }
   const td = { padding: '9px 12px', borderBottom: `1px solid #f0e8d8`, fontSize: '12px', verticalAlign: 'middle' }
@@ -220,58 +364,78 @@ function InvoicePaymentTracker() {
     <div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
         <StatCard label='Outstanding' value={formatINR(totalOutstanding)} color={totalOutstanding > 0 ? C.warning : C.success} />
-        <StatCard label='Overdue'     value={computed.filter(r => r._status === 'overdue').length} color={computed.filter(r => r._status === 'overdue').length > 0 ? C.danger : C.success} />
-        <StatCard label='Paid'        value={computed.filter(r => r._status === 'paid').length} color={C.success} />
-        <StatCard label='Total'       value={computed.length} />
+        <StatCard label='Overdue'     value={filtered.filter(r => r._status === 'overdue').length} color={filtered.filter(r => r._status === 'overdue').length > 0 ? C.danger : C.success} />
+        <StatCard label='Paid'        value={filtered.filter(r => r._status === 'paid').length} color={C.success} />
+        <StatCard label='Total'       value={filtered.length} />
       </div>
 
-      <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', alignItems: 'center', flexWrap: 'wrap' }}>
-        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All</option>
-          <option value='pending'>Pending</option>
-          <option value='due_soon'>Due Soon</option>
-          <option value='overdue'>Overdue</option>
-          <option value='paid'>Paid</option>
-        </select>
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+        <div style={{ width: '130px' }}><FormRow label='From Date'><Input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} /></FormRow></div>
+        <div style={{ width: '130px' }}><FormRow label='To Date'><Input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} /></FormRow></div>
+        <div style={{ width: '160px' }}>
+          <FormRow label='From Entity (seller)'>
+            <Select value={fromEntityFilter} onChange={e => setFromEntityFilter(e.target.value)}>
+              <option value=''>All</option>
+              {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+            </Select>
+          </FormRow>
+        </div>
+        <div style={{ width: '160px' }}>
+          <FormRow label='To Entity (buyer)'>
+            <Select value={toEntityFilter} onChange={e => setToEntityFilter(e.target.value)} disabled={toEntityLocked}>
+              {!isAdmin && !toEntityLocked && <option value=''>All accessible</option>}
+              {isAdmin && <option value=''>All</option>}
+              {toEntityOptions.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+            </Select>
+          </FormRow>
+        </div>
+        <div style={{ width: '140px' }}>
+          <FormRow label='Status'>
+            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
+              style={{ padding: '7px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit', width: '100%' }}>
+              <option value='all'>All</option>
+              <option value='pending'>Pending</option>
+              <option value='due_soon'>Due Soon</option>
+              <option value='overdue'>Overdue</option>
+              <option value='paid'>Paid</option>
+            </select>
+          </FormRow>
+        </div>
         <div style={{ flex: 1 }} />
-        <Btn onClick={openNew}>+ Add</Btn>
+        <Btn onClick={() => openNew()}>+ Add Payment</Btn>
       </div>
 
       <Card>
         {loading ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
-        : filtered.length === 0 ? <EmptyState icon='💳' title='No invoice payments' action={<Btn onClick={openNew}>+ Add</Btn>} />
+        : filtered.length === 0 ? <EmptyState icon='💳' title='No invoices found' action={<Btn onClick={() => openNew()}>+ Add Payment</Btn>} />
         : (
           <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '1100px' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '1150px' }}>
               <thead><tr>
-                {['#','Entity','Party','Invoice No','Date','CCY','Amount','Advance','Balance','Due','Days Left','Paid Date','Docs','Status',''].map((h,i) => (
-                  <th key={i} style={{ ...th, textAlign: i >= 6 && i <= 8 ? 'right' : 'left' }}>{h}</th>
+                {['#','Invoice No','Date','From','To','Invoice Amt','Paid','TDS','Pending','Due','Days Left','Status',''].map((h,i) => (
+                  <th key={i} style={{ ...th, textAlign: i >= 5 && i <= 8 ? 'right' : 'left' }}>{h}</th>
                 ))}
               </tr></thead>
               <tbody>
                 {filtered.map((r, i) => (
-                  <tr key={r.id} style={{ background: r._status === 'overdue' ? '#fff5f5' : r._status === 'due_soon' ? '#fffdf0' : i % 2 === 0 ? C.surface : '#faf6ed' }}>
+                  <tr key={r.id} style={{ background: r._status === 'overdue' ? '#fff5f5' : r._status === 'due_soon' ? '#fffdf0' : i % 2 === 0 ? C.surface : '#faf6ed', cursor: 'pointer' }}
+                    onClick={() => setDetailOpen(r)}>
                     <td style={{ ...td, color: C.textMuted }}>{i+1}</td>
-                    <td style={td}>{r.entity?.short_name || r.entity?.name || '—'}</td>
-                    <td style={td}>{r.party?.short_name || r.party?.name || r.party_name || '—'}</td>
                     <td style={{ ...td, fontFamily: 'monospace', fontSize: '11px' }}>{r.invoice_no || '—'}</td>
                     <td style={td}>{fmtDate(r.invoice_date)}</td>
-                    <td style={td}><CurrBadge currency={r.currency} /></td>
-                    <td style={{ ...td, textAlign: 'right', fontWeight: 600 }}><AmtCell amount={r.amount} currency={r.currency} /></td>
-                    <td style={{ ...td, textAlign: 'right' }}><AmtCell amount={r.advance_amount} currency={r.currency} /></td>
-                    <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: r._balance > 0 ? C.warning : C.success }}><AmtCell amount={r._balance} currency={r.currency} /></td>
+                    <td style={td}>{r.seller?.short_name || r.seller?.name || '—'}</td>
+                    <td style={td}>{r.buyer?.short_name || r.buyer?.name || '—'}</td>
+                    <td style={{ ...td, textAlign: 'right', fontWeight: 600 }}><AmtCell amount={r.total_amount} currency='INR' /></td>
+                    <td style={{ ...td, textAlign: 'right' }}><AmtCell amount={r._paid} currency='INR' /></td>
+                    <td style={{ ...td, textAlign: 'right', color: C.textSoft }}><AmtCell amount={r._tds} currency='INR' /></td>
+                    <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: r._pending > 0 ? C.warning : C.success }}><AmtCell amount={r._pending} currency='INR' /></td>
                     <td style={td}>{fmtDate(r.due_date)}</td>
-                    <td style={td}><DaysLeft days={r._daysLeft} paid={!!r.actual_payment_date} /></td>
-                    <td style={td}>{fmtDate(r.actual_payment_date)}</td>
-                    <td style={td}><DocumentAttachments sourceType='invoice_payments' sourceId={r.id} entityName={r.entity?.name || 'General'} compact /></td>
+                    <td style={td}><DaysLeft days={r._daysLeft} paid={r._status === 'paid'} /></td>
                     <td style={td}><StatusPill status={r._status} /></td>
-                    <td style={td}>
+                    <td style={td} onClick={e => e.stopPropagation()}>
                       <div style={{ display: 'flex', gap: '4px' }}>
-                        <Btn size='sm' variant='ghost' onClick={() => openEdit(r)}>Edit</Btn>
-                        {r._status !== 'paid' && <Btn size='sm' variant='success' onClick={() => setConfirmPaid(r)}>Mark Paid</Btn>}
-                        <Btn size='sm' variant='ghost' onClick={() => setDetailOpen(r)} style={{ color: C.info }}>Docs</Btn>
-                        <Btn size='sm' variant='ghost' onClick={() => setConfirmDelete(r)} style={{ color: C.danger }}>Del</Btn>
+                        {r._status !== 'paid' && <Btn size='sm' variant='success' onClick={() => openNew(r)}>+ Pay</Btn>}
+                        <Btn size='sm' variant='ghost' onClick={() => setDetailOpen(r)}>View</Btn>
                       </div>
                     </td>
                   </tr>
@@ -282,69 +446,151 @@ function InvoicePaymentTracker() {
         )}
       </Card>
 
-      {/* Detail / Documents panel */}
-      <Modal open={!!detailOpen} onClose={() => setDetailOpen(null)} title={`Documents — ${detailOpen?.invoice_no || 'Invoice Payment'}`} width={560}>
-        <DocumentAttachments sourceType='invoice_payments' sourceId={detailOpen?.id} entityName={detailOpen?.entity?.name || 'General'} />
+      {/* Invoice detail — tranche payment history */}
+      <Modal open={!!detailOpen} onClose={() => setDetailOpen(null)} title={`Payment History — ${detailOpen?.invoice_no || ''}`} width={780}>
+        {detailOpen && (() => {
+          const inv = computed.find(c => c.id === detailOpen.id) || detailOpen
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              <BalancePreview amount={inv.total_amount} advance={inv._paid + inv._tds} adjustments={inv._adj} currency='INR' />
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ fontSize: '13px', fontWeight: 700, color: C.text }}>Payment Tranches ({inv._tranches.length})</div>
+                {inv._pending > 0 && <Btn size='sm' onClick={() => { setDetailOpen(null); openNew(inv) }}>+ Add Payment</Btn>}
+              </div>
+              {inv._tranches.length === 0 ? (
+                <div style={{ fontSize: '12px', color: C.textMuted, padding: '12px 0' }}>No payments recorded yet against this invoice.</div>
+              ) : (
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead><tr>
+                      {['Date','Paid','TDS','Section','Adj.','Notes','Docs',''].map((h,i) => (
+                        <th key={i} style={{ ...th, textAlign: i === 1 || i === 2 || i === 4 ? 'right' : 'left' }}>{h}</th>
+                      ))}
+                    </tr></thead>
+                    <tbody>
+                      {inv._tranches.map(t => (
+                        <tr key={t.id}>
+                          <td style={td}>{fmtDate(t.actual_payment_date)}</td>
+                          <td style={{ ...td, textAlign: 'right', fontWeight: 600 }}><AmtCell amount={t.amount} currency='INR' /></td>
+                          <td style={{ ...td, textAlign: 'right' }}><AmtCell amount={t.tds_amount} currency='INR' /></td>
+                          <td style={td}>{t.tds_section || '—'}</td>
+                          <td style={{ ...td, textAlign: 'right' }}><AmtCell amount={t.adjustments} currency='INR' /></td>
+                          <td style={{ ...td, maxWidth: '160px' }}>{t.notes || '—'}</td>
+                          <td style={td}><DocumentAttachments sourceType='invoice_payments' sourceId={t.id} entityName={inv.buyer?.name || 'General'} compact /></td>
+                          <td style={td}>
+                            <div style={{ display: 'flex', gap: '4px' }}>
+                              <Btn size='xs' variant='ghost' onClick={() => { setDetailOpen(null); openEditPayment(t, inv) }}>Edit</Btn>
+                              <Btn size='xs' variant='ghost' onClick={() => setConfirmDelete(t)} style={{ color: C.danger }}>Del</Btn>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )
+        })()}
       </Modal>
 
-      {/* Add / Edit modal */}
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? 'Edit Invoice Payment' : 'Add Invoice Payment'} width={660}>
+      {/* Add / Edit payment modal */}
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingPayment ? 'Edit Payment' : 'Add Invoice Payment'} width={680}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          <SectionDivider label='Invoice' />
+          <SectionDivider label='Entities' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='Link Invoice'>
-              <Select value={form.invoice_id} onChange={e => setF('invoice_id', e.target.value)}>
-                <option value=''>No invoice linked</option>
-                {invoices.map(i => <option key={i.id} value={i.id}>{i.invoice_no || i.id.slice(0,8)}</option>)}
-              </Select>
-            </FormRow>
-            <FormRow label='Invoice No'><Input value={form.invoice_no} onChange={e => setF('invoice_no', e.target.value)} /></FormRow>
-            <FormRow label='Invoice Date'><Input type='date' value={form.invoice_date} onChange={e => setF('invoice_date', e.target.value)} /></FormRow>
-            <FormRow label='Our Entity'>
+            <FormRow label='To Entity (buyer — makes payment)'>
               <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)}>
                 <option value=''>Select</option>
                 {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
-            <FormRow label='Party (in system)'>
+            <FormRow label='From Entity (seller) — optional narrow'>
               <Select value={form.party_entity_id} onChange={e => setF('party_entity_id', e.target.value)}>
-                <option value=''>Select</option>
+                <option value=''>Any</option>
                 {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
-            <FormRow label='Party (external)'><Input value={form.party_name} onChange={e => setF('party_name', e.target.value)} disabled={!!form.party_entity_id} /></FormRow>
           </div>
-          <SectionDivider label='Amount' />
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' }}>
-            <FormRow label='Currency'><Select value={form.currency} onChange={e => setF('currency', e.target.value)}>{CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}</Select></FormRow>
-            <FormRow label='Amount' required><Input type='number' value={form.amount} onChange={e => setF('amount', e.target.value)} /></FormRow>
-            {form.currency !== 'INR' && <FormRow label='Rate (1 unit = ₹)'><Input type='number' value={form.exchange_rate} onChange={e => setF('exchange_rate', e.target.value)} /></FormRow>}
-          </div>
-          <SectionDivider label='Payments' />
+
+          <SectionDivider label='Invoice' />
+          <FormRow label='Link Invoice' hint={!form.entity_id ? 'Pick "To Entity" first to filter this list to invoices billed to them.' : undefined}>
+            <Select value={form.invoice_id} onChange={e => setF('invoice_id', e.target.value)}>
+              <option value=''>Select invoice</option>
+              {invoiceOptions.map(i => (
+                <option key={i.id} value={i.id}>
+                  {i.invoice_no || i.id.slice(0,8)} — pending {formatINR(i._pending)}{i.id === editingPayment?.invoice_id ? '' : ''}
+                </option>
+              ))}
+            </Select>
+          </FormRow>
+          {form.invoice_id && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '12px' }}>
+              <FormRow label='Invoice Date'><Input value={fmtDate(form.invoice_date)} disabled /></FormRow>
+              <FormRow label='Due Date'><Input value={fmtDate(form.due_date)} disabled /></FormRow>
+              <FormRow label='Currency'><Select value={form.currency} onChange={e => setF('currency', e.target.value)}>{CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}</Select></FormRow>
+            </div>
+          )}
+
+          <SectionDivider label='Settlement' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='Advance Paid'><Input type='number' value={form.advance_amount} onChange={e => setF('advance_amount', e.target.value)} placeholder='0' /></FormRow>
-            <FormRow label='Advance Date'><Input type='date' value={form.advance_date} onChange={e => setF('advance_date', e.target.value)} /></FormRow>
+            <FormRow label='Settle Amount (this payment)' required hint='Defaults to full pending — reduce for a partial tranche.'>
+              <Input type='number' value={form.basis} onChange={e => setF('basis', e.target.value)} />
+            </FormRow>
+            <FormRow label='Payment Date' required><Input type='date' value={form.actual_payment_date} onChange={e => setF('actual_payment_date', e.target.value)} /></FormRow>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input type='checkbox' id='apply_tds' checked={form.apply_tds} onChange={e => setF('apply_tds', e.target.checked)} style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+            <label htmlFor='apply_tds' style={{ fontSize: '13px', fontWeight: 600, color: C.text, cursor: 'pointer' }}>Deduct TDS from this payment</label>
+          </div>
+
+          {form.apply_tds && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px' }}>
+              <FormRow label='TDS Section'>
+                <Select value={form.tds_section} onChange={e => setF('tds_section', e.target.value)}>
+                  <option value=''>Select</option>
+                  {TDS_SECTIONS.map(s => <option key={s} value={s}>{s} — {TDS_SECTION_LABELS[s]}</option>)}
+                </Select>
+              </FormRow>
+              <FormRow label='TDS Rate %'><Input type='number' step='0.01' value={form.tds_rate} onChange={e => setF('tds_rate', e.target.value)} /></FormRow>
+            </div>
+          )}
+
+          {toNum(form.basis) > 0 && (
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px 14px', display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '8px', fontSize: '13px' }}>
+              <div>
+                <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Settling</div>
+                <strong>{formatINR(form.basis)}</strong>
+              </div>
+              <div>
+                <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>TDS Deducted</div>
+                <strong style={{ color: C.warning }}>− {formatINR(tdsAmount)}</strong>
+              </div>
+              <div>
+                <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Amount to be Paid</div>
+                <strong style={{ color: C.success }}>{formatINR(cashAmount)}</strong>
+              </div>
+            </div>
+          )}
+
+          <SectionDivider label='Adjustments (optional)' />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='Adjustments'><Input type='number' value={form.adjustments} onChange={e => setF('adjustments', e.target.value)} placeholder='0' /></FormRow>
             <FormRow label='Adj. Notes'><Input value={form.adjustment_notes} onChange={e => setF('adjustment_notes', e.target.value)} /></FormRow>
           </div>
-          <BalancePreview amount={form.amount} advance={form.advance_amount} adjustments={form.adjustments} currency={form.currency} />
-          <SectionDivider label='Dates' />
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='Due Date'><Input type='date' value={form.due_date} onChange={e => setF('due_date', e.target.value)} /></FormRow>
-            <FormRow label='Actual Payment Date'><Input type='date' value={form.actual_payment_date} onChange={e => setF('actual_payment_date', e.target.value)} /></FormRow>
-          </div>
+
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
+
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save Changes' : 'Add'}</Btn>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editingPayment ? 'Save Changes' : 'Record Payment'}</Btn>
           </div>
         </div>
       </Modal>
 
-      <ConfirmModal open={!!confirmPaid} onClose={() => setConfirmPaid(null)} onConfirm={() => markPaid(confirmPaid)}
-        title='Mark as Paid' message={`Mark this invoice payment as paid today (${today()})?`} />
-      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
-        title='Delete' message='Delete this payment entry?' danger />
+      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDeletePayment}
+        title='Delete Payment' message='Delete this payment tranche? This cannot be undone.' danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

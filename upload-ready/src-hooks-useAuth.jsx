@@ -4,9 +4,10 @@ import { supabase } from '../supabaseClient'
 const AuthContext = createContext({})
 
 export function AuthProvider({ children }) {
-  const [user, setUser]       = useState(null)
-  const [profile, setProfile] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [user, setUser]           = useState(null)
+  const [profile, setProfile]     = useState(null)
+  const [loading, setLoading]     = useState(true)
+  const [authError, setAuthError] = useState('')
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -30,12 +31,32 @@ export function AuthProvider({ children }) {
       .select('*')
       .eq('id', userId)
       .single()
+
+    if (data && data.is_active === false) {
+      await supabase.auth.signOut()
+      setProfile(null)
+      setUser(null)
+      setAuthError('Your account has been deactivated. Contact your administrator.')
+      setLoading(false)
+      return
+    }
+
     setProfile(data)
     setLoading(false)
   }
 
   async function signIn(email, password) {
+    setAuthError('')
     const { error } = await supabase.auth.signInWithPassword({ email, password })
+    return { error }
+  }
+
+  async function signInWithGoogle() {
+    setAuthError('')
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: window.location.origin },
+    })
     return { error }
   }
 
@@ -44,7 +65,7 @@ export function AuthProvider({ children }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, profile, loading, signIn, signOut }}>
+    <AuthContext.Provider value={{ user, profile, loading, authError, signIn, signInWithGoogle, signOut }}>
       {children}
     </AuthContext.Provider>
   )

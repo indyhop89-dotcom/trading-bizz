@@ -2,11 +2,11 @@ import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop,
 } from '../../components/UI/index'
 import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
-import { downloadTemplate, downloadCSV } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
 
 const UNITS = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
 const TABS  = ['Opening Stock', 'Stock Position', 'Products']
@@ -21,7 +21,7 @@ function shortfallBadge(planned) {
 // ─── Opening Stock Tab ────────────────────────────────────────────────────────
 const EMPTY_OPENING = {
   entity_id: '', product_id: '', financial_year_id: '',
-  qty: '', rate: '', hsn_code: '', gst_rate: '',
+  qty: '', unit: '', rate: '', hsn_code: '', gst_rate: '',
   as_of_date: today(), notes: '',
 }
 
@@ -43,6 +43,7 @@ function OpeningStock() {
   const [csvText, setCsvText]   = useState('')
   const [csvResult, setCsvResult] = useState(null)
   const [csvSaving, setCsvSaving] = useState(false)
+  const [csvProgress, setCsvProgress] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -68,7 +69,7 @@ function OpeningStock() {
       const u = { ...f, [k]: v }
       if (k === 'product_id' && v) {
         const p = products.find(p => p.id === v)
-        if (p) { u.hsn_code = p.hsn_code || ''; u.gst_rate = p.gst_rate != null ? String(p.gst_rate) : ''; u.rate = p.default_rate != null ? String(p.default_rate) : '' }
+        if (p) { u.hsn_code = p.hsn_code || ''; u.gst_rate = p.gst_rate != null ? String(p.gst_rate) : ''; u.rate = p.default_rate != null ? String(p.default_rate) : ''; u.unit = p.unit || '' }
       }
       return u
     })
@@ -77,7 +78,7 @@ function OpeningStock() {
   function openNew()   { setEditing(null); setForm(EMPTY_OPENING); setModalOpen(true) }
   function openEdit(r) {
     setEditing(r)
-    setForm({ entity_id: r.entity_id||'', product_id: r.product_id||'', financial_year_id: r.financial_year_id||'', qty: r.qty!=null?String(r.qty):'', rate: r.rate!=null?String(r.rate):'', hsn_code: r.hsn_code||'', gst_rate: r.gst_rate!=null?String(r.gst_rate):'', as_of_date: r.as_of_date||today(), notes: r.notes||'' })
+    setForm({ entity_id: r.entity_id||'', product_id: r.product_id||'', financial_year_id: r.financial_year_id||'', qty: r.qty!=null?String(r.qty):'', unit: r.unit||r.product?.unit||'', rate: r.rate!=null?String(r.rate):'', hsn_code: r.hsn_code||'', gst_rate: r.gst_rate!=null?String(r.gst_rate):'', as_of_date: r.as_of_date||today(), notes: r.notes||'' })
     setModalOpen(true)
   }
 
@@ -85,7 +86,7 @@ function OpeningStock() {
     if (!form.entity_id || !form.product_id || !form.financial_year_id)
       return setToast({ message: 'Entity, Product and FY are required', type: 'error' })
     setSaving(true)
-    const payload = { entity_id: form.entity_id, product_id: form.product_id, financial_year_id: form.financial_year_id, qty: toNum(form.qty), rate: toNum(form.rate), hsn_code: form.hsn_code||null, gst_rate: toNum(form.gst_rate)||null, as_of_date: form.as_of_date, notes: form.notes||null }
+    const payload = { entity_id: form.entity_id, product_id: form.product_id, financial_year_id: form.financial_year_id, qty: toNum(form.qty), unit: form.unit||null, rate: toNum(form.rate), hsn_code: form.hsn_code||null, gst_rate: toNum(form.gst_rate)||null, as_of_date: form.as_of_date, notes: form.notes||null }
     let error
     if (editing) {
       const res = await supabase.from('stock_opening_balance').update(payload).eq('id', editing.id)
@@ -105,43 +106,128 @@ function OpeningStock() {
     setConfirmDelete(null); load()
   }
 
-  // CSV: entity_short_name,product_name,fy_name,qty,rate,as_of_date
+  // CSV: entity,product,fy,qty,unit,rate,hsn_code,gst_rate,as_of_date
+  // Products not found by exact name are auto-created from the row's hsn_code/gst_rate/unit/rate.
+  // Rows matching an entity+product+fy that already exists are skipped (not re-added/updated) —
+  // re-running the same file only adds genuinely new rows.
+  // Runs in batches (not one row at a time) so large files (1000+ rows) don't take minutes,
+  // and every row is accounted for in the result: added, skipped (with reason), or errored (with reason).
   async function handleCSV() {
     setCsvSaving(true)
+    setCsvProgress('Parsing file…')
     const lines = csvText.trim().split('\n').filter(l => l.trim())
-    if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'CSV needs header + data rows', type: 'error' }) }
-    const header = lines[0].split(',').map(h => h.trim().toLowerCase())
-    let added = 0, errors = []
+    if (lines.length < 2) { setCsvSaving(false); setCsvProgress(''); return setToast({ message: 'CSV needs header + data rows', type: 'error' }) }
+    const delim = detectDelimiter(lines[0])
+    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    const norm = s => (s || '').trim().replace(/\s+/g, ' ')
+    const totalDataRows = lines.length - 1
+
+    // Phase 1 — parse + validate every row against entities/fys (no DB calls yet)
+    const parsed = []
+    const errors = []
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(',').map(c => c.trim())
+      const cols = lines[i].split(delim).map(c => c.trim())
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
+      const rowNum = i + 1
       const entity = entities.find(e => e.short_name?.toLowerCase() === row.entity?.toLowerCase() || e.name?.toLowerCase() === row.entity?.toLowerCase())
-      const product = products.find(p => p.name?.toLowerCase() === row.product?.toLowerCase())
-      const fy     = fys.find(f => f.name?.toLowerCase() === row.fy?.toLowerCase())
-      if (!entity)  { errors.push(`Row ${i+1}: entity "${row.entity}" not found`); continue }
-      if (!product) { errors.push(`Row ${i+1}: product "${row.product}" not found`); continue }
-      if (!fy)      { errors.push(`Row ${i+1}: FY "${row.fy}" not found`); continue }
-      const { error } = await supabase.from('stock_opening_balance').upsert({
-        entity_id: entity.id, product_id: product.id, financial_year_id: fy.id,
-        qty: toNum(row.qty), rate: toNum(row.rate),
-        as_of_date: row.as_of_date || today(),
-      }, { onConflict: 'entity_id,product_id,financial_year_id' })
-      if (error) errors.push(`Row ${i+1}: ${error.message}`)
-      else added++
+      const productName = norm(row.product)
+      const fy = fys.find(f => f.name?.toLowerCase() === row.fy?.toLowerCase())
+      if (!entity)      { errors.push(`Row ${rowNum}: entity "${row.entity}" not found`); continue }
+      if (!productName) { errors.push(`Row ${rowNum}: product name is required`); continue }
+      if (!fy)          { errors.push(`Row ${rowNum}: FY "${row.fy}" not found — fill in the fy column`); continue }
+      parsed.push({ rowNum, row, entity, productName, fy })
     }
+
+    // Phase 2 — bulk-create any missing products in one request
+    setCsvProgress('Checking products…')
+    const productList = [...products]
+    const findProduct = name => productList.find(p => norm(p.name).toLowerCase() === name.toLowerCase())
+    const missingNames = [...new Set(parsed.filter(p => !findProduct(p.productName)).map(p => p.productName))]
+    let productsCreated = 0
+    const createdProductNames = []
+    if (missingNames.length > 0) {
+      const payloads = missingNames.map(name => {
+        const src = parsed.find(p => p.productName === name).row
+        return { name, hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }
+      })
+      const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
+      if (pErr) {
+        errors.push(`Could not auto-create ${missingNames.length} new product(s) — ${pErr.message}`)
+      } else {
+        productList.push(...(newProducts || []))
+        productsCreated = (newProducts || []).length
+        createdProductNames.push(...(newProducts || []).map(p => p.name))
+      }
+    }
+
+    // Phase 3 — resolve each row's product, skip anything that already exists (in DB or earlier in this same file)
+    setCsvProgress('Checking for duplicates…')
+    const existingKeys = new Set(rows.map(r => `${r.entity_id}__${r.product_id}__${r.financial_year_id}`))
+    const toInsert = []
+    const skippedItems = []
+    for (const p of parsed) {
+      const product = findProduct(p.productName)
+      if (!product) { errors.push(`Row ${p.rowNum}: product "${p.productName}" could not be created`); continue }
+      const label = `${p.row.entity} — ${p.productName} — ${p.row.fy}`
+      const key = `${p.entity.id}__${product.id}__${p.fy.id}`
+      if (existingKeys.has(key)) { skippedItems.push(`${label} — already exists`); continue }
+      existingKeys.add(key)
+      toInsert.push({
+        entity_id: p.entity.id, product_id: product.id, financial_year_id: p.fy.id,
+        qty: toNum(p.row.qty), unit: p.row.unit || product.unit || null, rate: toNum(p.row.rate),
+        hsn_code: p.row.hsn_code || product.hsn_code || null,
+        gst_rate: p.row.gst_rate ? toNum(p.row.gst_rate) : (product.gst_rate != null ? product.gst_rate : null),
+        as_of_date: p.row.as_of_date || today(),
+        _label: label,
+      })
+    }
+
+    // Phase 4 — insert in batches; if a batch fails, retry that batch row-by-row so we
+    // can attribute the error to the specific row instead of losing the whole chunk.
+    let added = 0
+    const addedItems = []
+    const CHUNK = 200
+    for (let c = 0; c < toInsert.length; c += CHUNK) {
+      const chunk = toInsert.slice(c, c + CHUNK)
+      setCsvProgress(`Uploading rows ${c + 1}–${Math.min(c + CHUNK, toInsert.length)} of ${toInsert.length}…`)
+      const payload = chunk.map(({ _label, ...rest }) => rest)
+      const { error } = await supabase.from('stock_opening_balance').insert(payload)
+      if (!error) {
+        added += chunk.length
+        addedItems.push(...chunk.map(r => r._label))
+      } else {
+        for (const r of chunk) {
+          const { _label, ...rest } = r
+          const { error: rowErr } = await supabase.from('stock_opening_balance').insert(rest)
+          if (rowErr) errors.push(`${_label}: ${rowErr.message}`)
+          else { added++; addedItems.push(_label) }
+        }
+      }
+    }
+
+    setCsvResult({ totalDataRows, added, skipped: skippedItems.length, productsCreated, errors, addedItems, skippedItems, createdProductNames })
+    setCsvProgress('')
+    await load()
     setCsvSaving(false)
-    setCsvResult({ added, errors })
-    load()
   }
 
   const filtered = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
+
+  const totalValue = filtered.reduce((s, r) => s + toNum(r.qty) * toNum(r.rate), 0)
+  const qtyByUnit = filtered.reduce((m, r) => {
+    const u = r.unit || r.product?.unit || 'Nos'
+    m[u] = (m[u] || 0) + toNum(r.qty)
+    return m
+  }, {})
+  const qtySummary = Object.entries(qtyByUnit).map(([u, q]) => `${q.toLocaleString('en-IN')} ${u}`).join(' • ') || '0'
+  const distinctProducts = new Set(filtered.map(r => r.product_id)).size
 
   const columns = [
     { label: 'Entity',   render: r => <span style={{ fontWeight: 600 }}>{r.entity?.short_name || r.entity?.name}</span> },
     { label: 'Product',  render: r => <div><div style={{ fontWeight: 600 }}>{r.product?.name}</div><div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>{r.hsn_code || r.product?.hsn_code}</div></div> },
     { label: 'FY',       render: r => <span style={{ fontSize: '12px', color: C.textSoft }}>{r.fy?.name}</span> },
-    { label: 'Qty',      right: true, render: r => <span style={{ fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN')} {r.product?.unit}</span> },
+    { label: 'Qty',      right: true, render: r => <span style={{ fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN')} {r.unit || r.product?.unit}</span> },
     { label: 'Rate',     right: true, render: r => formatINR(r.rate) },
     { label: 'Value',    right: true, render: r => <span style={{ fontWeight: 600 }}>{formatINR(toNum(r.qty) * toNum(r.rate))}</span> },
     { label: 'As of',    render: r => fmtDate(r.as_of_date) },
@@ -155,6 +241,12 @@ function OpeningStock() {
 
   return (
     <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '16px' }}>
+        <StatCard label='Total Value' value={formatINR(totalValue)} color={C.accent} />
+        <StatCard label='Total Qty'   value={qtySummary} />
+        <StatCard label='Products'    value={distinctProducts} />
+        <StatCard label='Rows'        value={filtered.length} />
+      </div>
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center', flexWrap: 'wrap' }}>
         <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
           style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
@@ -203,6 +295,12 @@ function OpeningStock() {
             <FormRow label='Qty' required>
               <Input type='number' value={form.qty} onChange={e => setF('qty', e.target.value)} placeholder='0.000' />
             </FormRow>
+            <FormRow label='Unit'>
+              <Select value={form.unit} onChange={e => setF('unit', e.target.value)}>
+                <option value=''>Use product default</option>
+                {UNITS.map(u => <option key={u} value={u}>{u}</option>)}
+              </Select>
+            </FormRow>
             <FormRow label='Rate per Unit (₹)'>
               <Input type='number' value={form.rate} onChange={e => setF('rate', e.target.value)} placeholder='0' />
             </FormRow>
@@ -235,24 +333,69 @@ function OpeningStock() {
               <strong>CSV Format:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('opening_stock')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>entity,product,fy,qty,rate,as_of_date</code><br />
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>entity,product,fy,qty,unit,rate,hsn_code,gst_rate,as_of_date</code><br />
             <strong>Example:</strong><br />
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>Siddi,T-Shirt Basic,FY 2025-26,1000,250,2025-04-01</code><br />
-            Entity = short name or full name. FY = exact name from Settings.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>Siddi,T-Shirt Basic,FY 2025-26,1000,Nos,250,6109,12,2025-04-01</code><br />
+            Entity = short name or full name. FY = exact name from Settings (required — no default). If <code>product</code> doesn't match an existing product by exact name, a new product is auto-created using this row's unit / hsn_code / gst_rate / rate. unit / hsn_code / gst_rate are optional for existing products — blank falls back to the product's current defaults. Re-uploading the same file skips rows that already exist (same entity + product + FY) — only new rows are added; to change a value on an existing row, edit it directly in the table.
           </div>
-          <FormRow label='Paste CSV'>
-            <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={8}
-              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
+          <FormRow label='Upload or Paste CSV'>
+            <CsvFileDrop onText={setCsvText} />
           </FormRow>
+          <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={8}
+              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
+          {csvSaving && csvProgress && (
+            <div style={{ fontSize: '12px', color: C.textSoft, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ width: '12px', height: '12px', border: `2px solid ${C.border}`, borderTopColor: C.accent, borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+              {csvProgress}
+            </div>
+          )}
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
-              <strong>{csvResult.added} rows added.</strong>
-              {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+              <strong>
+                {csvResult.totalDataRows} rows in file — {csvResult.added} added,
+                {` `}{csvResult.skipped} skipped, {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}.
+                {csvResult.productsCreated > 0 ? ` ${csvResult.productsCreated} new product${csvResult.productsCreated === 1 ? '' : 's'} auto-created.` : ''}
+              </strong>
+              {csvResult.added + csvResult.skipped + csvResult.errors.length !== csvResult.totalDataRows && (
+                <div style={{ color: C.danger, marginTop: '4px' }}>⚠ {csvResult.totalDataRows - (csvResult.added + csvResult.skipped + csvResult.errors.length)} row(s) unaccounted for — please report this.</div>
+              )}
+              {csvResult.addedItems?.length > 0 && (
+                <details style={{ marginTop: '6px' }}>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.addedItems.length} added row{csvResult.addedItems.length === 1 ? '' : 's'}</summary>
+                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.addedItems.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
+                  </div>
+                </details>
+              )}
+              {csvResult.skippedItems?.length > 0 && (
+                <details style={{ marginTop: '6px' }}>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.skippedItems.length} skipped row{csvResult.skippedItems.length === 1 ? '' : 's'}</summary>
+                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.skippedItems.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
+                  </div>
+                </details>
+              )}
+              {csvResult.createdProductNames?.length > 0 && (
+                <details style={{ marginTop: '6px' }}>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.createdProductNames.length} auto-created product{csvResult.createdProductNames.length === 1 ? '' : 's'}</summary>
+                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.createdProductNames.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
+                  </div>
+                </details>
+              )}
+              {csvResult.errors.length > 0 && (
+                <details style={{ marginTop: '6px' }} open>
+                  <summary style={{ cursor: 'pointer', color: '#7a5000' }}>Show {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}</summary>
+                  <div style={{ maxHeight: '160px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+                  </div>
+                </details>
+              )}
             </div>
           )}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setCsvModal(false)}>Close</Btn>
-            <Btn onClick={handleCSV} disabled={csvSaving || !csvText.trim()}>{csvSaving ? 'Uploading…' : 'Upload'}</Btn>
+            <Btn onClick={handleCSV} disabled={csvSaving || !csvText.trim()}>{csvSaving ? (csvProgress || 'Uploading…') : 'Upload'}</Btn>
           </div>
         </div>
       </Modal>
@@ -469,10 +612,11 @@ function Products() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data', type: 'error' }) }
-    const header = lines[0].split(',').map(h => h.trim().toLowerCase())
+    const delim = detectDelimiter(lines[0])
+    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
     let added = 0, errors = []
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(',').map(c => c.trim())
+      const cols = lines[i].split(delim).map(c => c.trim())
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       if (!row.name || !row.hsn_code) { errors.push(`Row ${i+1}: name and hsn_code required`); continue }
@@ -484,9 +628,9 @@ function Products() {
       if (error) errors.push(`Row ${i+1}: ${error.message}`)
       else added++
     }
-    setCsvSaving(false)
     setCsvResult({ added, errors })
-    load()
+    await load()
+    setCsvSaving(false)
   }
 
   const filtered = products.filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()) || p.hsn_code.includes(search))
@@ -559,10 +703,11 @@ function Products() {
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>name,hsn_code,gst_rate,unit,default_rate,description</code><br />
             Upserts on <code>name</code> — existing products will be updated.
           </div>
-          <FormRow label='Paste CSV'>
-            <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={8}
-              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
+          <FormRow label='Upload or Paste CSV'>
+            <CsvFileDrop onText={setCsvText} />
           </FormRow>
+          <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={8}
+              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>{csvResult.added} products upserted.</strong>

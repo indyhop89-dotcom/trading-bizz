@@ -897,6 +897,7 @@ function InvoiceDetail() {
         <DocumentAttachments
           sourceType='invoices'
           sourceId={inv.id}
+          entityId={inv.seller_entity_id}
           entityName={inv.seller?.name || 'General'}
         />
       </div>
