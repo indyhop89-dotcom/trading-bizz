@@ -781,6 +781,7 @@ function BDList() {
             {loading?<div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>:(
               <Table
                 columns={[
+                  {label:'S.No.', render:(row,idx)=><span style={{color:C.textMuted}}>{idx+1}</span>},
                   {label:'Date',   render:e=><span style={{fontSize:'12px'}}>{fmtDate(e.discounting_date)}</span>},
                   {label:'Entity', render:e=><span style={{fontSize:'12px',fontWeight:600}}>{e.entity?.short_name||e.entity?.name}</span>},
                   {label:'Bank',   render:e=><span style={{fontSize:'12px'}}>{e.bank?.short_name||e.bank_name}</span>},
@@ -1021,6 +1022,7 @@ function BDDetail() {
           <div style={{fontWeight:700,fontSize:'14px',marginBottom:'10px'}}>Discounted Invoices ({bdInvs.length})</div>
           <Card>
             <Table columns={[
+              {label:'S.No.', render:(row,idx)=><span style={{color:C.textMuted}}>{idx+1}</span>},
               {label:'Invoice No',  render:r=><span style={{fontFamily:'monospace',fontWeight:600}}>{r.invoice?.invoice_no||'—'}</span>},
               {label:'Total Amt',   right:true,render:r=>formatINR(r.invoice?.total_amount)},
               {label:'Discounted',  right:true,render:r=><strong>{formatINR(r.invoice_amount)}</strong>},
@@ -1036,6 +1038,7 @@ function BDDetail() {
           {repays.length===0
             ? <EmptyState icon='💰' title='No repayments yet' action={!['repaid','recourse'].includes(event.status)?<Btn onClick={()=>setRepayM(true)}>+ Repayment</Btn>:undefined}/>
             : <Table columns={[
+                {label:'S.No.',     render:(row,idx)=><span style={{color:C.textMuted}}>{idx+1}</span>},
                 {label:'Date',      render:r=><span style={{fontSize:'12px'}}>{fmtDate(r.repayment_date)}</span>},
                 {label:'Principal', right:true,render:r=>formatINR(r.amount)},
                 {label:'Interest',  right:true,render:r=>formatINR(r.interest_amount||0)},

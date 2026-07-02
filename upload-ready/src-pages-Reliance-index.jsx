@@ -74,6 +74,7 @@ export default function Reliance() {
   })
 
   const columns = [
+    { label: 'S.No.', render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'Entity', render: e => (
       <div>
         <div style={{ fontSize: '13px', fontWeight: 600 }}>{e.short_name || e.name}</div>

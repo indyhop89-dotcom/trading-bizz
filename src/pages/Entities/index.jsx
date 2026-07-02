@@ -140,6 +140,7 @@ export default function Entities() {
   })
 
   const columns = [
+    { label: 'S.No.', render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     {
       label: 'Entity', key: 'name',
       render: e => (

@@ -193,6 +193,7 @@ function POList() {
   })
 
   const columns = [
+    { label: 'S.No.',   render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'PO No',   render: p => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{p.po_no || '—'}</span> },
     { label: 'Buyer',   render: p => <span style={{ fontSize: '12px' }}>{p.buyer?.short_name || p.buyer?.name}</span> },
     { label: 'Seller',  render: p => <span style={{ fontSize: '12px' }}>{p.seller?.short_name || p.seller?.name}</span> },

@@ -1,8 +1,20 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { supabase } from '../supabaseClient'
 import { C, Btn, ConfirmModal, Toast } from './UI/index'
-import { uploadFileToDrive, getDriveViewUrl, getDriveDownloadUrl, formatFileSize, fileIcon } from '../utils/drive'
+import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl, getDriveDownloadUrl, formatFileSize, fileIcon } from '../utils/drive'
 import { fmtDate } from '../utils/dates'
+
+// CHANGED: map sourceType to a clean B2 subfolder label, e.g. Siddi/PI/file.pdf
+const SOURCE_TYPE_FOLDER = {
+  proforma_invoices:      'PI',
+  purchase_orders:        'PO',
+  invoices:                'Invoice',
+  credit_debit_notes:      'Credit-Debit Notes',
+  bill_discounting_events: 'Bill Discounting',
+  expenses:                'Expenses',
+  invoice_payments:        'Payments',
+  expense_payments:        'Payments',
+}
 
 /**
  * DocumentAttachments — reusable document upload / view / download component.
@@ -61,7 +73,7 @@ export default function DocumentAttachments({
 
     setUploading(true)
     try {
-      const result = await uploadFileToDrive(file, entityName)
+      const result = await uploadFileToDrive(file, entityName, SOURCE_TYPE_FOLDER[sourceType] || '') // CHANGED: nest by doc type
 
       const payload = {
         entity_id:       entityId,  // CHANGED: guaranteed non-null by guard above
@@ -91,6 +103,13 @@ export default function DocumentAttachments({
   }
 
   async function handleDelete() {
+    try {
+      await deleteFileFromDrive(confirmDelete.drive_file_id)
+    } catch (err) {
+      // CHANGED: don't block DB cleanup if storage delete fails (e.g. already gone) — just log it
+      console.error('Storage delete error:', err)
+    }
+
     const { error } = await supabase
       .from('documents')
       .delete()
@@ -287,7 +306,7 @@ export default function DocumentAttachments({
         onClose={() => setConfirmDelete(null)}
         onConfirm={handleDelete}
         title='Remove Document'
-        message={`Remove "${confirmDelete?.file_name}"? The file will stay in Google Drive.`}
+        message={`Remove "${confirmDelete?.file_name}"? This deletes the file permanently.`}
         danger
       />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}

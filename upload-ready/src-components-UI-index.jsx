@@ -549,7 +549,7 @@ export function Table({ columns, rows, onRowClick, emptyState, sortKey, sortDir,
                   fontVariantNumeric: col.right ? 'tabular-nums' : 'normal',
                   maxWidth: col.maxWidth || undefined,
                 }}>
-                  {col.render ? col.render(row) : row[col.key]}
+                  {col.render ? col.render(row, ri) : row[col.key]}
                 </td>
               ))}
             </tr>

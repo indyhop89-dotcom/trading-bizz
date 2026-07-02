@@ -1,9 +1,10 @@
 import { supabase } from '../supabaseClient'
 
-export async function uploadFileToDrive(file, entityName = 'General') {
+export async function uploadFileToDrive(file, entityName = 'General', docFolder = '') {
   const formData = new FormData()
   formData.append('file', file)
   formData.append('folderName', entityName)
+  if (docFolder) formData.append('docFolder', docFolder) // CHANGED: optional document-type subfolder
 
   const { data: { session } } = await supabase.auth.getSession()
 
@@ -22,6 +23,20 @@ export async function uploadFileToDrive(file, entityName = 'General') {
     file_size_bytes: file.size,
     mime_type:       file.type || 'application/octet-stream',
   }
+}
+
+export async function deleteFileFromDrive(driveFileId) {
+  if (!driveFileId) return { deleted: false, reason: 'no_id' }
+
+  const { data: { session } } = await supabase.auth.getSession()
+
+  const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/b2-upload/file/${encodeURIComponent(driveFileId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${session?.access_token}` },
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || 'Delete failed')
+  return data
 }
 
 export function getDriveViewUrl(driveFileId, driveUrl) {

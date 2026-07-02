@@ -146,6 +146,7 @@ function InvoiceList() {
   const totalAmount      = filtered.reduce((s, i) => s + (i.total_amount || 0), 0)
 
   const columns = [
+    { label: 'S.No.',      render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'Invoice No', render: i => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{i.invoice_no || '—'}</span> },
     { label: 'Type',    render: i => <Badge status={i.invoice_type} label={i.invoice_type === 'sales' ? 'Sales' : 'Purchase'} /> },
     { label: 'Seller',  render: i => <span style={{ fontSize: '12px' }}>{i.seller?.short_name || i.seller?.name}</span> },
@@ -386,6 +387,42 @@ function NewInvoice() {
     // Mark PI as converted if applicable
     if (form.pi_id) {
       await supabase.from('proforma_invoices').update({ status: 'converted', converted_to_invoice_id: inv.id }).eq('id', form.pi_id)
+    }
+
+    // CHANGED: auto-create a draft purchase invoice for the buyer when this
+    // sales invoice is linked to a PO. Mirrors the same lines/totals so the
+    // buyer can review, edit (add/remove lines), and confirm it themselves —
+    // it does not post as final on its own. Applies to any entity pair with
+    // a linked PO, not just specific entities.
+    if (form.po_id) {
+      const { data: purchaseInv, error: purchaseErr } = await supabase.from('invoices').insert({
+        invoice_date: form.invoice_date,
+        due_date: form.due_date || null,
+        invoice_type: 'purchase',
+        status: 'draft',
+        seller_entity_id: form.seller_entity_id,
+        buyer_entity_id: form.buyer_entity_id,
+        source_invoice_id: inv.id,
+        pi_id: form.pi_id || null,
+        po_id: form.po_id || null,
+        is_interstate: form.is_interstate,
+        outstanding_amount: totals.total_amount,
+        paid_amount: 0,
+        notes: `Auto-created from ${inv.invoice_no || 'linked sales invoice'} — pending buyer confirmation`,
+        ...totals,
+      }).select().single()
+
+      if (purchaseErr) {
+        // Don't fail the whole save over this — the sales invoice is already
+        // committed. Surface it so it doesn't silently go missing.
+        setToast({ message: `Invoice created, but the auto purchase entry failed: ${purchaseErr.message}`, type: 'error' })
+      } else {
+        const purchaseLines = computedLines.map((l, i) => ({
+          ...l, invoice_id: purchaseInv.id, line_no: i + 1,
+          _id: undefined,
+        }))
+        await supabase.from('invoice_lines').insert(purchaseLines)
+      }
     }
 
     setSaving(false)

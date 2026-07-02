@@ -90,7 +90,7 @@ export async function generateNotifications(userId) {
 
   // 4. Bill discounting due within 7 days
   const { data: bdDue } = await supabase
-    .from('bill_discounting')
+    .from('bill_discounting_events')   // CHANGED: was 'bill_discounting', which doesn't exist as a live table
     .select('id, bank_name, outstanding_amount, maturity_date, entity_id')
     .eq('is_deleted', false)
     .eq('status', 'active')

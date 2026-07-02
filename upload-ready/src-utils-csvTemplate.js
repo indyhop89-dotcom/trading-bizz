@@ -52,21 +52,23 @@ export const TEMPLATES = {
 
   products: {
     filename: 'products_template.csv',
-    headers:  ['name', 'hsn_code', 'gst_rate', 'unit', 'default_rate', 'description'],
+    // CHANGED: category column added (optional)
+    headers:  ['name', 'hsn_code', 'gst_rate', 'unit', 'default_rate', 'description', 'category'],
     rows: [
-      { name: 'T-Shirt Basic Round Neck', hsn_code: '6109', gst_rate: 12, unit: 'Nos', default_rate: 250, description: 'Basic round neck t-shirt' },
-      { name: 'Cotton Woven Fabric', hsn_code: '5208', gst_rate: 5,  unit: 'Mtr', default_rate: 180, description: 'Cotton fabric 200gsm' },
-      { name: 'Polo T-Shirt', hsn_code: '6110', gst_rate: 12, unit: 'Nos', default_rate: 450, description: 'Polo collar t-shirt' },
+      { name: 'T-Shirt Basic Round Neck', hsn_code: '6109', gst_rate: 12, unit: 'Nos', default_rate: 250, description: 'Basic round neck t-shirt', category: 'Apparel' },
+      { name: 'Cotton Woven Fabric', hsn_code: '5208', gst_rate: 5,  unit: 'Mtr', default_rate: 180, description: 'Cotton fabric 200gsm', category: 'Fabric' },
+      { name: 'Polo T-Shirt', hsn_code: '6110', gst_rate: 12, unit: 'Nos', default_rate: 450, description: 'Polo collar t-shirt', category: 'Apparel' },
     ],
   },
 
   opening_stock: {
     filename: 'opening_stock_template.csv',
-    headers:  ['entity', 'product', 'fy', 'qty', 'unit', 'rate', 'hsn_code', 'gst_rate', 'as_of_date'],
+    // CHANGED: category column added (optional — only used if a product is auto-created by this upload)
+    headers:  ['entity', 'product', 'fy', 'qty', 'unit', 'rate', 'hsn_code', 'gst_rate', 'as_of_date', 'category'],
     rows: [
-      { entity: 'Siddi', product: 'T-Shirt Basic Round Neck', fy: 'FY 2025-26', qty: 1000, unit: 'Nos', rate: 250, hsn_code: '6109', gst_rate: 12, as_of_date: '2025-04-01' },
-      { entity: 'Retail', product: 'Cotton Woven Fabric',      fy: 'FY 2025-26', qty: 500,  unit: 'Mtr', rate: 180, hsn_code: '5208', gst_rate: 5,  as_of_date: '2025-04-01' },
-      { entity: 'MVL',    product: 'Polo T-Shirt',             fy: 'FY 2025-26', qty: 300,  unit: 'Nos', rate: 450, hsn_code: '6110', gst_rate: 12, as_of_date: '2025-04-01' },
+      { entity: 'Siddi', product: 'T-Shirt Basic Round Neck', fy: 'FY 2025-26', qty: 1000, unit: 'Nos', rate: 250, hsn_code: '6109', gst_rate: 12, as_of_date: '2025-04-01', category: 'Apparel' },
+      { entity: 'Retail', product: 'Cotton Woven Fabric',      fy: 'FY 2025-26', qty: 500,  unit: 'Mtr', rate: 180, hsn_code: '5208', gst_rate: 5,  as_of_date: '2025-04-01', category: 'Fabric' },
+      { entity: 'MVL',    product: 'Polo T-Shirt',             fy: 'FY 2025-26', qty: 300,  unit: 'Nos', rate: 450, hsn_code: '6110', gst_rate: 12, as_of_date: '2025-04-01', category: 'Apparel' },
     ],
     notes: [
       '# entity   = short name or full name exactly as in Entities module',

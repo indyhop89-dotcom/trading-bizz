@@ -31,6 +31,29 @@ async function sha1Hex(buffer: ArrayBuffer) {
   return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
+async function b2FindFileId(apiUrl: string, authToken: string, key: string) {
+  const res = await fetch(`${apiUrl}/b2api/v3/b2_list_file_names`, {
+    method: 'POST',
+    headers: { Authorization: authToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bucketId: B2_BUCKET_ID, startFileName: key, maxFileCount: 1 }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error('B2 list file names failed: ' + JSON.stringify(data))
+  const match = (data.files || []).find((f: { fileName: string }) => f.fileName === key)
+  return match ? (match.fileId as string) : null
+}
+
+async function b2DeleteFile(apiUrl: string, authToken: string, key: string, fileId: string) {
+  const res = await fetch(`${apiUrl}/b2api/v3/b2_delete_file_version`, {
+    method: 'POST',
+    headers: { Authorization: authToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName: key, fileId }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error('B2 delete failed: ' + JSON.stringify(data))
+  return data
+}
+
 function json(obj: unknown, status: number, headers: Record<string, string>) {
   return new Response(JSON.stringify(obj), { status, headers: { ...headers, 'Content-Type': 'application/json' } })
 }
@@ -39,6 +62,7 @@ Deno.serve(async (req) => {
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
   }
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
@@ -57,13 +81,20 @@ Deno.serve(async (req) => {
       const formData   = await req.formData()
       const file       = formData.get('file')
       const folderName = formData.get('folderName')?.toString() || 'General'
+      const docFolder  = formData.get('docFolder')?.toString() || '' // CHANGED: optional document-type subfolder
       if (!file || !(file instanceof File)) {
         return json({ error: 'No file provided' }, 400, corsHeaders)
       }
 
-      const safeFolder = folderName.replace(/[^a-zA-Z0-9-_]/g, '_')
-      const safeName   = file.name.replace(/[^a-zA-Z0-9.\-_]/g, '_')
-      const key = `${safeFolder}/${Date.now()}_${safeName}`
+      // CHANGED: sanitize each path segment independently so '/' between
+      // entity and doc-type folders survives instead of being stripped out
+      const sanitizeSegment = (s: string) => s.replace(/[^a-zA-Z0-9-_]/g, '_')
+      const safeFolder    = sanitizeSegment(folderName)
+      const safeDocFolder = docFolder ? sanitizeSegment(docFolder) : ''
+      const safeName      = file.name.replace(/[^a-zA-Z0-9.\-_]/g, '_')
+      const key = safeDocFolder
+        ? `${safeFolder}/${safeDocFolder}/${Date.now()}_${safeName}`
+        : `${safeFolder}/${Date.now()}_${safeName}`
 
       const auth      = await b2Authorize()
       const apiUrl     = auth.apiInfo.storageApi.apiUrl
@@ -112,6 +143,30 @@ Deno.serve(async (req) => {
       if (contentType) headers.set('Content-Type', contentType)
 
       return new Response(fileRes.body, { headers })
+    }
+
+    if (req.method === 'DELETE' && url.pathname.includes('/file/')) {
+      const token = (req.headers.get('Authorization') || '').replace('Bearer ', '')
+      if (!token) return json({ error: 'Missing auth token' }, 401, corsHeaders)
+
+      const verifyRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+        headers: { Authorization: `Bearer ${token}`, apikey: SUPABASE_ANON_KEY },
+      })
+      if (!verifyRes.ok) return json({ error: 'Invalid session' }, 401, corsHeaders)
+
+      const key = decodeURIComponent(url.pathname.split('/file/')[1])
+
+      const auth   = await b2Authorize()
+      const apiUrl = auth.apiInfo.storageApi.apiUrl
+
+      const fileId = await b2FindFileId(apiUrl, auth.authorizationToken, key)
+      if (!fileId) {
+        // Already gone (or never existed) — treat as success so the DB row can still be cleaned up.
+        return json({ deleted: false, reason: 'not_found' }, 200, corsHeaders)
+      }
+
+      await b2DeleteFile(apiUrl, auth.authorizationToken, key, fileId)
+      return json({ deleted: true }, 200, corsHeaders)
     }
 
     return new Response('Not found', { status: 404, headers: corsHeaders })

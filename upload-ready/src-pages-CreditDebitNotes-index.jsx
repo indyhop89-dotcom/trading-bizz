@@ -110,6 +110,7 @@ function NoteList() {
   })
 
   const columns = [
+    { label: 'S.No.',    render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'Note No',  render: n => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{n.note_no || '—'}</span> },
     { label: 'Type',     render: n => <Badge status={n.note_type === 'credit_note' ? 'receipt' : 'payment'} label={n.note_type === 'credit_note' ? 'Credit Note' : 'Debit Note'} /> },
     { label: 'Issuer',   render: n => <span style={{ fontSize: '12px' }}>{n.issuer?.short_name || n.issuer?.name}</span> },

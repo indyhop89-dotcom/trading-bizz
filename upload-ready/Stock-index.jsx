@@ -106,9 +106,7 @@ function OpeningStock() {
     setConfirmDelete(null); load()
   }
 
-  // CSV: entity,product,fy,qty,unit,rate,hsn_code,gst_rate,as_of_date,category
-  // CHANGED: category is optional — only used when auto-creating a new product;
-  // it does not update the category of a product that already exists.
+  // CSV: entity,product,fy,qty,unit,rate,hsn_code,gst_rate,as_of_date
   // Products not found by exact name are auto-created from the row's hsn_code/gst_rate/unit/rate.
   // Rows matching an entity+product+fy that already exists are skipped (not re-added/updated) —
   // re-running the same file only adds genuinely new rows.
@@ -151,7 +149,7 @@ function OpeningStock() {
     if (missingNames.length > 0) {
       const payloads = missingNames.map(name => {
         const src = parsed.find(p => p.productName === name).row
-        return { name, hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, category: src.category || null, is_active: true }
+        return { name, hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }
       })
       const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
       if (pErr) {
@@ -226,7 +224,6 @@ function OpeningStock() {
   const distinctProducts = new Set(filtered.map(r => r.product_id)).size
 
   const columns = [
-    { label: 'S.No.',    render: (r, i) => <span style={{ color: C.textMuted }}>{i + 1}</span> },
     { label: 'Entity',   render: r => <span style={{ fontWeight: 600 }}>{r.entity?.short_name || r.entity?.name}</span> },
     { label: 'Product',  render: r => <div><div style={{ fontWeight: 600 }}>{r.product?.name}</div><div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>{r.hsn_code || r.product?.hsn_code}</div></div> },
     { label: 'FY',       render: r => <span style={{ fontSize: '12px', color: C.textSoft }}>{r.fy?.name}</span> },
@@ -336,7 +333,7 @@ function OpeningStock() {
               <strong>CSV Format:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('opening_stock')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>entity,product,fy,qty,unit,rate,hsn_code,gst_rate,as_of_date,category</code><br />
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>entity,product,fy,qty,unit,rate,hsn_code,gst_rate,as_of_date</code><br />
             <strong>Example:</strong><br />
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>Siddi,T-Shirt Basic,FY 2025-26,1000,Nos,250,6109,12,2025-04-01</code><br />
             Entity = short name or full name. FY = exact name from Settings (required — no default). If <code>product</code> doesn't match an existing product by exact name, a new product is auto-created using this row's unit / hsn_code / gst_rate / rate. unit / hsn_code / gst_rate are optional for existing products — blank falls back to the product's current defaults. Re-uploading the same file skips rows that already exist (same entity + product + FY) — only new rows are added; to change a value on an existing row, edit it directly in the table.
@@ -418,9 +415,6 @@ function StockPosition() {
   const [entityFilter, setEntityFilter] = useState('')
   const [fyFilter, setFyFilter]         = useState('')
   const [loading, setLoading]   = useState(false)
-  // CHANGED: category filter + group-by-category summary toggle
-  const [categoryFilter, setCategoryFilter] = useState('')
-  const [groupByCategory, setGroupByCategory] = useState(false)
 
   useEffect(() => {
     Promise.all([
@@ -439,7 +433,7 @@ function StockPosition() {
 
     // Get opening stock
     let q = supabase.from('stock_opening_balance')
-      .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit,category)')
+      .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit)')
       .eq('financial_year_id', fyFilter)
     if (entityFilter) q = q.eq('entity_id', entityFilter)
     const { data: opening } = await q
@@ -492,29 +486,11 @@ function StockPosition() {
 
   useEffect(() => { loadPosition() }, [loadPosition])
 
-  // CHANGED: category filter applied client-side (product.category comes
-  // through the join, not filterable server-side without a second query)
-  const categories = [...new Set(position.map(r => r.product?.category).filter(Boolean))].sort()
-  const filteredPosition = (categoryFilter
-    ? position.filter(r => r.product?.category === categoryFilter)
-    : position
-  ).map((r, i) => ({ ...r, sno: i + 1 }))
-
-  // CHANGED: category → total planned qty, for the group-by-category summary
-  const categoryTotals = {}
-  for (const r of filteredPosition) {
-    const cat = r.product?.category || 'Uncategorised'
-    categoryTotals[cat] = (categoryTotals[cat] || 0) + toNum(r.planned_qty)
-  }
-
-  const shortfallCount = filteredPosition.filter(r => r.planned_qty < 0).length
-  const totalValue     = filteredPosition.reduce((s, r) => s + toNum(r.opening_qty) * toNum(r.rate), 0)
+  const shortfallCount = position.filter(r => r.planned_qty < 0).length
+  const totalValue     = position.reduce((s, r) => s + toNum(r.opening_qty) * toNum(r.rate), 0)
 
   const columns = [
-    // CHANGED: running row number for reference while editing/cross-checking
-    { label: 'S.No.',    render: r => <span style={{ color: C.textMuted }}>{r.sno}</span> },
     { label: 'Entity',   render: r => <span style={{ fontWeight: 600 }}>{r.entity?.short_name || r.entity?.name}</span> },
-    { label: 'Category', render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{r.product?.category || '—'}</span> },
     { label: 'Product',  render: r => <div><div style={{ fontWeight: 600 }}>{r.product?.name}</div><div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>{r.product?.hsn_code}</div></div> },
     { label: 'Unit',     render: r => <span style={{ fontSize: '12px' }}>{r.product?.unit}</span> },
     { label: 'Opening',  right: true, render: r => <span>{Number(r.opening_qty).toLocaleString('en-IN')}</span> },
@@ -529,11 +505,9 @@ function StockPosition() {
   ]
 
   function handleExportCSV() {
-    // CHANGED: export the currently filtered rows (respects entity/category
-    // filters already applied on screen), category column added.
     downloadCSV(`stock_position_${new Date().toISOString().split('T')[0]}.csv`,
-      ['sno','entity','category','product','hsn_code','unit','opening_qty','incoming_pi_qty','outgoing_pi_qty','planned_qty','status'],
-      filteredPosition.map(r=>({sno:r.sno,entity:r.entity?.name||'',category:r.product?.category||'',product:r.product?.name||'',hsn_code:r.product?.hsn_code||'',unit:r.product?.unit||'',opening_qty:r.opening_qty||0,incoming_pi_qty:r.incoming||0,outgoing_pi_qty:r.outgoing||0,planned_qty:r.planned_qty||0,status:r.planned_qty<0?'Shortfall':r.planned_qty===0?'Zero':'OK'}))
+      ['entity','product','hsn_code','unit','opening_qty','incoming_pi_qty','outgoing_pi_qty','planned_qty','status'],
+      position.map(r=>({entity:r.entity?.name||'',product:r.product?.name||'',hsn_code:r.product?.hsn_code||'',unit:r.product?.unit||'',opening_qty:r.opening_qty||0,incoming_pi_qty:r.incoming||0,outgoing_pi_qty:r.outgoing||0,planned_qty:r.planned_qty||0,status:r.planned_qty<0?'Shortfall':r.planned_qty===0?'Zero':'OK'}))
     )
   }
 
@@ -541,7 +515,7 @@ function StockPosition() {
     <div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
         <StatCard label='Shortfalls'    value={shortfallCount} color={shortfallCount > 0 ? C.danger : C.success} />
-        <StatCard label='Products'      value={filteredPosition.length} />
+        <StatCard label='Products'      value={position.length} />
         <StatCard label='Opening Value' value={formatINR(totalValue)} />
       </div>
 
@@ -555,37 +529,12 @@ function StockPosition() {
           <option value=''>All entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
-        {/* CHANGED: category filter */}
-        <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All categories</option>
-          {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
-        </select>
-        {/* CHANGED: group-by-category summary toggle */}
-        <Btn size='sm' variant={groupByCategory ? 'primary' : 'ghost'} onClick={() => setGroupByCategory(g => !g)}>
-          {groupByCategory ? '✓ ' : ''}Group by category
-        </Btn>
-        <Btn size='sm' variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
       </div>
-
-      {/* CHANGED: category totals summary, shown when grouping is on */}
-      {groupByCategory && (
-        <Card style={{ marginBottom: '16px' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: '1px', background: C.border }}>
-            {Object.entries(categoryTotals).sort((a, b) => b[1] - a[1]).map(([cat, qty]) => (
-              <div key={cat} style={{ background: C.surface, padding: '10px 14px' }}>
-                <div style={{ fontSize: '11px', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{cat}</div>
-                <div style={{ fontSize: '16px', fontWeight: 700 }}>{qty.toLocaleString('en-IN')}</div>
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
 
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Calculating stock position…</div>
-          : <Table columns={columns} rows={filteredPosition}
+          : <Table columns={columns} rows={position}
               emptyState={<EmptyState icon='📦' title='No stock data' message='Add opening stock first, then create PIs to see planned position.' />}
             />
         }
@@ -598,7 +547,6 @@ function StockPosition() {
 const EMPTY_PRODUCT = {
   name: '', description: '', hsn_code: '', gst_rate: '18',
   unit: 'Nos', default_rate: '', is_active: true,
-  category: '', // CHANGED: product category
 }
 
 function Products() {
@@ -631,7 +579,7 @@ function Products() {
   function openNew()   { setEditing(null); setForm(EMPTY_PRODUCT); setModalOpen(true) }
   function openEdit(r) {
     setEditing(r)
-    setForm({ name: r.name||'', description: r.description||'', hsn_code: r.hsn_code||'', gst_rate: r.gst_rate!=null?String(r.gst_rate):'18', unit: r.unit||'Nos', default_rate: r.default_rate!=null?String(r.default_rate):'', is_active: r.is_active!==false, category: r.category||'' })
+    setForm({ name: r.name||'', description: r.description||'', hsn_code: r.hsn_code||'', gst_rate: r.gst_rate!=null?String(r.gst_rate):'18', unit: r.unit||'Nos', default_rate: r.default_rate!=null?String(r.default_rate):'', is_active: r.is_active!==false })
     setModalOpen(true)
   }
 
@@ -639,7 +587,7 @@ function Products() {
     if (!form.name.trim() || !form.hsn_code.trim())
       return setToast({ message: 'Name and HSN Code are required', type: 'error' })
     setSaving(true)
-    const payload = { name: form.name.trim(), description: form.description||null, hsn_code: form.hsn_code.trim(), gst_rate: toNum(form.gst_rate), unit: form.unit, default_rate: toNum(form.default_rate)||null, is_active: form.is_active, category: form.category||null, updated_at: new Date() }
+    const payload = { name: form.name.trim(), description: form.description||null, hsn_code: form.hsn_code.trim(), gst_rate: toNum(form.gst_rate), unit: form.unit, default_rate: toNum(form.default_rate)||null, is_active: form.is_active, updated_at: new Date() }
     let error
     if (editing) {
       const res = await supabase.from('products').update(payload).eq('id', editing.id)
@@ -659,8 +607,7 @@ function Products() {
     setConfirmDelete(null); load()
   }
 
-  // CSV: name,hsn_code,gst_rate,unit,default_rate,description,category
-  // CHANGED: category column added (optional — blank is fine)
+  // CSV: name,hsn_code,gst_rate,unit,default_rate,description
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -676,7 +623,7 @@ function Products() {
       const { error } = await supabase.from('products').upsert({
         name: row.name, hsn_code: row.hsn_code, gst_rate: toNum(row.gst_rate)||18,
         unit: row.unit||'Nos', default_rate: toNum(row.default_rate)||null,
-        description: row.description||null, category: row.category||null, is_active: true, updated_at: new Date(),
+        description: row.description||null, is_active: true, updated_at: new Date(),
       }, { onConflict: 'name' })
       if (error) errors.push(`Row ${i+1}: ${error.message}`)
       else added++
@@ -689,9 +636,7 @@ function Products() {
   const filtered = products.filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()) || p.hsn_code.includes(search))
 
   const columns = [
-    { label: 'S.No.',     render: (p, i) => <span style={{ color: C.textMuted }}>{i + 1}</span> },
     { label: 'Name',      render: p => <div><div style={{ fontWeight: 600 }}>{p.name}</div>{p.description && <div style={{ fontSize: '11px', color: C.textMuted }}>{p.description}</div>}</div> },
-    { label: 'Category',  render: p => <span style={{ fontSize: '12px', color: C.textMid }}>{p.category || '—'}</span> },
     { label: 'HSN',       render: p => <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{p.hsn_code}</span> },
     { label: 'GST %',     render: p => <span style={{ fontSize: '12px' }}>{p.gst_rate}%</span> },
     { label: 'Unit',      render: p => <span style={{ fontSize: '12px' }}>{p.unit}</span> },
@@ -727,7 +672,6 @@ function Products() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <FormRow label='Name' required><Input value={form.name} onChange={e => setF('name', e.target.value)} /></FormRow>
           <FormRow label='Description'><Textarea value={form.description} onChange={e => setF('description', e.target.value)} rows={2} /></FormRow>
-          <FormRow label='Category'><Input value={form.category} onChange={e => setF('category', e.target.value)} placeholder='e.g. Home Textiles, Cushions' /></FormRow>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='HSN Code' required><Input value={form.hsn_code} onChange={e => setF('hsn_code', e.target.value)} style={{ fontFamily: 'monospace' }} /></FormRow>
             <FormRow label='GST Rate %'><Input type='number' value={form.gst_rate} onChange={e => setF('gst_rate', e.target.value)} /></FormRow>
@@ -756,7 +700,7 @@ function Products() {
               <strong>CSV Format:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('products')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>name,hsn_code,gst_rate,unit,default_rate,description,category</code><br />
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>name,hsn_code,gst_rate,unit,default_rate,description</code><br />
             Upserts on <code>name</code> — existing products will be updated.
           </div>
           <FormRow label='Upload or Paste CSV'>
