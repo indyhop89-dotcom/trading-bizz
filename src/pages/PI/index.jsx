@@ -21,6 +21,7 @@ const EMPTY_FORM = {
   order_id: '', order_leg_id: '',
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
+  pi_no: '', // CHANGED: optional manual PI number — blank auto-generates via next_pi_no()
 }
 
 
@@ -124,8 +125,17 @@ function PIList() {
     setSaving(true)
     const fy = await resolveFY()
     if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
-    const { data: piNo, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: form.from_entity_id, fy_id: fy.id })
-    if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PI number: '+noErr.message, type: 'error' }) }
+    // CHANGED: use the manually-entered PI number if the user supplied one,
+    // otherwise fall back to auto-generation via next_pi_no() (unchanged).
+    let piNo = (form.pi_no || '').trim()
+    if (piNo) {
+      const dup = pis.find(p => p.pi_no?.toLowerCase() === piNo.toLowerCase())
+      if (dup) { setSaving(false); return setToast({ message: `PI number "${piNo}" is already in use`, type: 'error' }) }
+    } else {
+      const { data: generated, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: form.from_entity_id, fy_id: fy.id })
+      if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PI number: '+noErr.message, type: 'error' }) }
+      piNo = generated
+    }
     const payload = { ...form, ...totals, pi_no: piNo, financial_year_id: fy.id }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
@@ -187,8 +197,11 @@ function PIList() {
   })
 
   // ── CSV bulk upload ──────────────────────────────────────────────────────────
-  // Format: pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes
-  // Multiple rows with same pi_date+from+to = grouped into one PI
+  // Format: pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no
+  // Multiple rows with same pi_date+from+to = grouped into one PI.
+  // CHANGED: pi_no is optional — blank = auto-generated via next_pi_no() (unchanged
+  // behaviour). If supplied, that exact number is used instead, after checking it
+  // isn't already used by an existing PI or another row/group in this same file.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -196,6 +209,9 @@ function PIList() {
     const delim = detectDelimiter(lines[0])
     const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
+    // CHANGED: dedupe pool for manually-supplied pi_no values — seeded with
+    // every PI number already in the DB, then grown as this file assigns more.
+    const usedPiNos = new Set(pis.map(p => p.pi_no?.toLowerCase()).filter(Boolean))
 
     // Group rows by pi_date+from_entity+to_entity
     const groups = {}
@@ -224,13 +240,22 @@ function PIList() {
       if (meta.valid_upto && !validUpto) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: valid_upto "${meta.valid_upto}" is not a valid date`); continue }
 
       // CHANGED: pi_no and financial_year_id are NOT NULL columns with no DB
-      // default — they were previously omitted here, so every CSV-created PI
-      // would have failed on that constraint right after the date fix. This
-      // mirrors the single-PI create flow: resolve FY, then call next_pi_no().
+      // default — previously omitted here entirely, so every CSV-created PI
+      // would have failed on that constraint. financial_year_id is always
+      // required; pi_no is now either taken from the CSV (if supplied) or
+      // generated via next_pi_no(), same as the manual single-PI create flow.
       const fy = await resolveFY()
       if (!fy) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: no financial year found`); continue }
-      const { data: piNo, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: fromE.id, fy_id: fy.id })
-      if (noErr) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: could not generate PI number — ${noErr.message}`); continue }
+
+      let piNo = (meta.pi_no || '').trim()
+      if (piNo) {
+        if (usedPiNos.has(piNo.toLowerCase())) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: PI number "${piNo}" is already in use`); continue }
+      } else {
+        const { data: generated, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: fromE.id, fy_id: fy.id })
+        if (noErr) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: could not generate PI number — ${noErr.message}`); continue }
+        piNo = generated
+      }
+      usedPiNos.add(piNo.toLowerCase())
 
       const interstate = meta.is_interstate === 'true' || (fromE.state_code && toE.state_code && fromE.state_code !== toE.state_code)
 
@@ -348,8 +373,8 @@ function PIList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('pi')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes</code><br /><br />
-            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no</code><br /><br />
+            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -402,6 +427,9 @@ function PIList() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
             <FormRow label='PI Date' required>
               <Input type='date' value={form.pi_date} onChange={e => setF('pi_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='PI Number' hint='Leave blank to auto-generate'>
+              <Input value={form.pi_no} onChange={e => setF('pi_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Valid Upto'>
               <Input type='date' value={form.valid_upto} onChange={e => setF('valid_upto', e.target.value)} />
@@ -508,16 +536,24 @@ function PIDetail() {
   useEffect(() => { load() }, [load])
 
   function startEdit() {
-    setEditForm({pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||''})
+    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||''})
     setEditLines(lines.map(l=>({...l,_id:l.id,_hsn_resolved_rate:null,_hsn_override:false,_hsn_manually_set:false,_cost_rate:null,_margin_pct:''})))
     setEditing(true)
   }
 
   async function handleSaveEdit() {
+    // CHANGED: PI number is now editable — required, and checked for
+    // duplicates against every other PI (excluding this one) before saving.
+    const piNo = (editForm.pi_no || '').trim()
+    if (!piNo) return setToast({message:'PI number cannot be blank',type:'error'})
     setSaving(true)
+    if (piNo.toLowerCase() !== (pi.pi_no||'').toLowerCase()) {
+      const { data: dup } = await supabase.from('proforma_invoices').select('id').ilike('pi_no', piNo).neq('id', id).limit(1)
+      if (dup?.length) { setSaving(false); return setToast({message:`PI number "${piNo}" is already in use`,type:'error'}) }
+    }
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
     const totals = computeTotals(computedLines)
-    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,...totals,updated_at:new Date()}).eq('id',id)
+    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,...totals,updated_at:new Date()}).eq('id',id)
     if (piErr) { setSaving(false); return setToast({message:piErr.message,type:'error'}) }
     await supabase.from('proforma_invoice_lines').delete().eq('pi_id',id)
     const linesPayload = computedLines.map((l,i)=>{
@@ -598,6 +634,7 @@ function PIDetail() {
           <SectionDivider label='Edit Details'/>
           <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'12px',marginTop:'12px'}}>
             <FormRow label='PI Date' required><Input type='date' value={editForm.pi_date} onChange={e=>setEditForm(f=>({...f,pi_date:e.target.value}))}/></FormRow>
+            <FormRow label='PI Number' required><Input value={editForm.pi_no} onChange={e=>setEditForm(f=>({...f,pi_no:e.target.value}))}/></FormRow>
             <FormRow label='Valid Upto'><Input type='date' value={editForm.valid_upto} onChange={e=>setEditForm(f=>({...f,valid_upto:e.target.value}))}/></FormRow>
             <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{PI_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
             <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
