@@ -56,6 +56,19 @@ export function currentFYCode() {
   return `${String(start).slice(2)}${String(start + 1).slice(2)}`
 }
 
+/**
+ * CHANGED: FY code for a specific date (e.g. a PI/PO/Invoice's own date),
+ * not always "today" — a backdated document should get the FY it actually
+ * falls in. Accepts 'YYYY-MM-DD' or a Date. Indian FY: Apr 1 – Mar 31.
+ */
+export function fyCodeForDate(dateInput) {
+  const d = dateInput instanceof Date ? dateInput : new Date(dateInput)
+  const m = d.getMonth() // 0-indexed; 3 = April
+  const y = d.getFullYear()
+  const start = m >= 3 ? y : y - 1
+  return `${String(start).slice(2)}${String(start + 1).slice(2)}`
+}
+
 /** List of FY options for selects */
 export function fyOptions(count = 3) {
   const now = new Date()

@@ -7,7 +7,8 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
+import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV } from '../../utils/csvTemplate'
@@ -34,15 +35,7 @@ const EMPTY_FORM = {
   einvoice_irn: '', einvoice_ack_no: '', einvoice_ack_date: '',
   tds_amount: 0, tcs_amount: 0,
   notes: '',
-  invoice_no: '', // CHANGED: optional manual invoice number — blank auto-generates via next_inv_no()
-}
-
-
-// Resolve current FY — next_inv_no takes (ent_id, fy_id)
-async function resolveFY() {
-  const label = currentFYLabel()
-  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
-  return (data||[]).find(f=>f.name===label)||data?.[0]
+  invoice_no: '', // CHANGED: optional manual invoice number — blank suggests one via suggestNextNo()
 }
 
 async function writeStockMovements(invoice, lines) {
@@ -102,11 +95,11 @@ function InvoiceList() {
   // all — not a hard insert failure (invoice_no is nullable on the live
   // schema, confirmed via information_schema), but every CSV-created invoice
   // was silently getting no invoice number whatsoever. This now generates
-  // one via next_inv_no() or uses a supplied value, same as PI/PO.
+  // one via suggestNextNo() or uses a supplied value, same as PI/PO.
   // NOTE: financial_year_id does NOT exist on the live invoices table either
   // (confirmed) — fy.id is only used as the RPC's fy_id parameter, never stored.
   // DB default, so every CSV upload here would have failed outright. This adds the
-  // same FY-resolve + next_inv_no() generation the other modules use, plus lets you
+  // same FY-resolve + suggestNextNo() generation the other modules use, plus lets you
   // supply your own invoice_no per row (optional — blank auto-generates).
   async function handleCSV() {
     setCsvSaving(true)
@@ -139,19 +132,16 @@ function InvoiceList() {
       const dueDate = meta.due_date ? parseFlexibleDate(meta.due_date) : null
       if (meta.due_date && !dueDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: due_date "${meta.due_date}" is not a valid date`); continue }
 
-      // CHANGED: invoice_no taken from the CSV if supplied, else generated
-      // via next_inv_no() keyed to the seller (the entity issuing the
-      // invoice — mirrors PI's use of from_entity). fy.id is only used as
-      // the RPC's fy_id param — financial_year_id is not a real column.
-      const fy = await resolveFY()
-      if (!fy) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: no financial year found`); continue }
+      // CHANGED: invoice_no taken from the CSV if supplied, else suggested
+      // via suggestNextNo() keyed to the seller (the entity issuing the
+      // invoice — mirrors PI's use of from_entity). FY code computed
+      // directly from this row's own invoiceDate — no financial_years lookup.
+      const fyCode = fyCodeForDate(invoiceDate)
       let invoiceNo = (meta.invoice_no || '').trim()
       if (invoiceNo) {
         if (usedInvoiceNos.has(invoiceNo.toLowerCase())) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: invoice number "${invoiceNo}" is already in use`); continue }
       } else {
-        const { data: generated, error: noErr } = await supabase.rpc('next_inv_no', { ent_id: sellerE.id, fy_id: fy.id })
-        if (noErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: could not generate invoice number — ${noErr.message}`); continue }
-        invoiceNo = generated
+        invoiceNo = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerE.short_name || sellerE.name, fyCode, excludeSet: usedInvoiceNos })
       }
       usedInvoiceNos.add(invoiceNo.toLowerCase())
 
@@ -422,19 +412,17 @@ function NewInvoice() {
     // CHANGED: invoice_no was previously never set here at all (not a hard
     // constraint failure — invoice_no is nullable on the live schema — but
     // every manually-created invoice was getting no invoice number). This
-    // mirrors PI/PO: resolve FY (needed as the RPC param only), then use the
-    // typed invoice_no or generate one. financial_year_id is not a real
-    // column on invoices (confirmed via information_schema) — not stored.
-    const fy = await resolveFY()
-    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
+    // mirrors PI/PO: use the typed invoice_no, or suggest one via
+    // suggestNextNo(). FY code computed directly from the invoice's own date
+    // (Indian FY: Apr–Mar) — no financial_years lookup needed.
+    const fyCode = fyCodeForDate(form.invoice_date)
     let invoiceNo = (form.invoice_no || '').trim()
     if (invoiceNo) {
       const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).limit(1)
       if (dup?.length) { setSaving(false); return setToast({ message: `Invoice number "${invoiceNo}" is already in use`, type: 'error' }) }
     } else {
-      const { data: generated, error: noErr } = await supabase.rpc('next_inv_no', { ent_id: form.seller_entity_id, fy_id: fy.id })
-      if (noErr) { setSaving(false); return setToast({ message: 'Could not generate invoice number: '+noErr.message, type: 'error' }) }
-      invoiceNo = generated
+      const sellerEntity = entities.find(e => e.id === form.seller_entity_id)
+      invoiceNo = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerEntity?.short_name || sellerEntity?.name, fyCode })
     }
 
     const payload = {

@@ -7,7 +7,8 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/dates'
+import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
+import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
@@ -22,15 +23,7 @@ const EMPTY_FORM = {
   order_id: '', order_leg_id: '',
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
-  pi_no: '', // CHANGED: optional manual PI number — blank auto-generates via next_pi_no()
-}
-
-
-// Resolve current FY from DB
-async function resolveFY() {
-  const label = currentFYLabel()
-  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
-  return (data||[]).find(f=>f.name===label)||data?.[0]
+  pi_no: '', // CHANGED: optional manual PI number — blank suggests one via suggestNextNo()
 }
 
 // Write planned stock movements on PI create
@@ -133,23 +126,23 @@ function PIList() {
     if (!form.from_entity_id || !form.to_entity_id) return setToast({ message: 'From and To entity are required', type: 'error' })
     const totals = computeTotals(piLines.map(l => computeLine(l, form.is_interstate)))
     setSaving(true)
-    const fy = await resolveFY()
-    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
     // CHANGED: use the manually-entered PI number if the user supplied one,
-    // otherwise fall back to auto-generation via next_pi_no() (unchanged).
+    // otherwise suggest one via suggestNextNo(). FY code is now computed
+    // directly from the PI's own date (Indian FY: Apr–Mar) instead of a
+    // financial_years table lookup — the DB round-trip only ever existed to
+    // fetch this one string, and this removes a "no financial year found"
+    // failure path that no longer served any purpose.
+    const fyCode = fyCodeForDate(form.pi_date)
     let piNo = (form.pi_no || '').trim()
     if (piNo) {
       const dup = pis.find(p => p.pi_no?.toLowerCase() === piNo.toLowerCase())
       if (dup) { setSaving(false); return setToast({ message: `PI number "${piNo}" is already in use`, type: 'error' }) }
     } else {
-      const { data: generated, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: form.from_entity_id, fy_id: fy.id })
-      if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PI number: '+noErr.message, type: 'error' }) }
-      piNo = generated
+      const fromEntity = entities.find(e => e.id === form.from_entity_id)
+      piNo = await suggestNextNo({ table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromEntity?.short_name || fromEntity?.name, fyCode })
     }
     // CHANGED: financial_year_id does NOT exist on the live proforma_invoices
-    // table (confirmed via information_schema — only pi_no, no FK column at
-    // all). fy.id is still needed as the fy_id param for next_pi_no(), just
-    // not stored on the row.
+    // table (confirmed via information_schema — only pi_no, no FK column at all).
     const payload = { ...form, ...totals, pi_no: piNo }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
@@ -213,7 +206,7 @@ function PIList() {
   // ── CSV bulk upload ──────────────────────────────────────────────────────────
   // Format: pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no
   // Multiple rows with same pi_date+from+to = grouped into one PI.
-  // CHANGED: pi_no is optional — blank = auto-generated via next_pi_no() (unchanged
+  // CHANGED: pi_no is optional — blank = suggested via suggestNextNo() (see numbering.js
   // behaviour). If supplied, that exact number is used instead, after checking it
   // isn't already used by an existing PI or another row/group in this same file.
   async function handleCSV() {
@@ -253,20 +246,16 @@ function PIList() {
       const validUpto = meta.valid_upto ? parseFlexibleDate(meta.valid_upto) : null
       if (meta.valid_upto && !validUpto) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: valid_upto "${meta.valid_upto}" is not a valid date`); continue }
 
-      // CHANGED: pi_no is used from the CSV if supplied, else generated via
-      // next_pi_no(). fy.id is passed as the RPC's fy_id param only — it is
-      // NOT stored on the row: financial_year_id does not exist as a column
-      // on the live proforma_invoices table (confirmed via information_schema).
-      const fy = await resolveFY()
-      if (!fy) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: no financial year found`); continue }
+      // CHANGED: pi_no is used from the CSV if supplied, else suggested via
+      // suggestNextNo(). FY code computed directly from this row's own
+      // piDate (Indian FY: Apr–Mar) instead of a financial_years lookup.
+      const fyCode = fyCodeForDate(piDate)
 
       let piNo = (meta.pi_no || '').trim()
       if (piNo) {
         if (usedPiNos.has(piNo.toLowerCase())) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: PI number "${piNo}" is already in use`); continue }
       } else {
-        const { data: generated, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: fromE.id, fy_id: fy.id })
-        if (noErr) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: could not generate PI number — ${noErr.message}`); continue }
-        piNo = generated
+        piNo = await suggestNextNo({ table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromE.short_name || fromE.name, fyCode, excludeSet: usedPiNos })
       }
       usedPiNos.add(piNo.toLowerCase())
 

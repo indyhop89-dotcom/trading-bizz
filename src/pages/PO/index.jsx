@@ -7,7 +7,8 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
+import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
@@ -21,15 +22,7 @@ const EMPTY_FORM = {
   order_id: '', order_leg_id: '', pi_id: '',
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
-  po_no: '', // CHANGED: optional manual PO number — blank auto-generates via next_po_no()
-}
-
-
-// Resolve current FY — next_po_no takes (ent_id, fy_id)
-async function resolveFY() {
-  const label = currentFYLabel()
-  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
-  return (data||[]).find(f=>f.name===label)||data?.[0]
+  po_no: '', // CHANGED: optional manual PO number — blank suggests one via suggestNextNo()
 }
 
 // ─── PO List ──────────────────────────────────────────────────────────────────
@@ -117,21 +110,20 @@ function POList() {
     if (!form.buyer_entity_id || !form.seller_entity_id) return setToast({ message: 'Buyer and Seller are required', type: 'error' })
     const totals = computeTotals(poLines.map(l => computeLine(l, form.is_interstate)))
     setSaving(true)
-    const fy = await resolveFY()
-    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
-    // CHANGED: use the manually-entered PO number if supplied, else auto-generate.
+    // CHANGED: use the manually-entered PO number if supplied, else suggest
+    // one via suggestNextNo(). FY code computed directly from the PO's own
+    // date (Indian FY: Apr–Mar) — no financial_years lookup needed.
+    const fyCode = fyCodeForDate(form.po_date)
     let poNo = (form.po_no || '').trim()
     if (poNo) {
       const dup = pos.find(p => p.po_no?.toLowerCase() === poNo.toLowerCase())
       if (dup) { setSaving(false); return setToast({ message: `PO number "${poNo}" is already in use`, type: 'error' }) }
     } else {
-      const { data: generated, error: noErr } = await supabase.rpc('next_po_no', { ent_id: form.buyer_entity_id, fy_id: fy.id })
-      if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PO number: '+noErr.message, type: 'error' }) }
-      poNo = generated
+      const buyerEntity = entities.find(e => e.id === form.buyer_entity_id)
+      poNo = await suggestNextNo({ table: 'purchase_orders', noCol: 'po_no', entityShort: buyerEntity?.short_name || buyerEntity?.name, fyCode })
     }
     // CHANGED: financial_year_id does NOT exist on the live purchase_orders
-    // table (confirmed via information_schema). fy.id is only needed as the
-    // fy_id param for next_po_no(), not stored on the row.
+    // table (confirmed via information_schema).
     const payload = { ...form, ...totals, po_no: poNo }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
@@ -159,7 +151,7 @@ function POList() {
 
   // ── CSV handler ───────────────────────────────────────────────────────────────
   // Format: po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no
-  // CHANGED: po_no is optional — blank = auto-generated via next_po_no(); if
+  // CHANGED: po_no is optional — blank = suggested via suggestNextNo(); if
   // supplied, used as-is after a duplicate check (existing POs + this file).
   async function handleCSV() {
     setCsvSaving(true)
@@ -193,19 +185,15 @@ function POList() {
       const deliveryDate = meta.delivery_date ? parseFlexibleDate(meta.delivery_date) : null
       if (meta.delivery_date && !deliveryDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: delivery_date "${meta.delivery_date}" is not a valid date`); continue }
 
-      // CHANGED: po_no taken from the CSV if supplied, else generated via
-      // next_po_no(). fy.id is only used as the RPC's fy_id param —
-      // financial_year_id is not a real column on purchase_orders (confirmed
-      // via information_schema).
-      const fy = await resolveFY()
-      if (!fy) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: no financial year found`); continue }
+      // CHANGED: po_no taken from the CSV if supplied, else suggested via
+      // suggestNextNo(). FY code computed directly from this row's own
+      // poDate (Indian FY: Apr–Mar) instead of a financial_years lookup.
+      const fyCode = fyCodeForDate(poDate)
       let poNo = (meta.po_no || '').trim()
       if (poNo) {
         if (usedPoNos.has(poNo.toLowerCase())) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: PO number "${poNo}" is already in use`); continue }
       } else {
-        const { data: generated, error: noErr } = await supabase.rpc('next_po_no', { ent_id: buyerE.id, fy_id: fy.id })
-        if (noErr) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: could not generate PO number — ${noErr.message}`); continue }
-        poNo = generated
+        poNo = await suggestNextNo({ table: 'purchase_orders', noCol: 'po_no', entityShort: buyerE.short_name || buyerE.name, fyCode, excludeSet: usedPoNos })
       }
       usedPoNos.add(poNo.toLowerCase())
 
