@@ -139,6 +139,9 @@ function POList() {
   }
 
   // ── CSV handler ───────────────────────────────────────────────────────────────
+  // Format: po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no
+  // CHANGED: po_no is optional — blank = auto-generated via next_po_no(); if
+  // supplied, used as-is after a duplicate check (existing POs + this file).
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -146,6 +149,7 @@ function POList() {
     const delim = detectDelimiter(lines[0])
     const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
+    const usedPoNos = new Set(pos.map(p => p.po_no?.toLowerCase()).filter(Boolean))
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
       const cols = lines[i].split(delim).map(c => c.trim())
@@ -162,21 +166,28 @@ function POList() {
       if (!buyerE)  { errors.push(`Buyer "${meta.buyer_entity}" not found`); continue }
       if (!sellerE) { errors.push(`Seller "${meta.seller_entity}" not found`); continue }
 
-      // CHANGED: same fix as PI — accept YYYY-MM-DD or DD-MM-YYYY, normalize to ISO,
-      // otherwise Postgres throws "date/time field value out of range" on any
-      // DD-MM-YYYY value where the day exceeds 12.
+      // CHANGED: normalize date (accepts YYYY-MM-DD or DD-MM-YYYY) — a raw
+      // DD-MM-YYYY string sent straight to Postgres fails with "date/time
+      // field value out of range" once the day exceeds 12.
       const poDate = parseFlexibleDate(meta.po_date)
       if (!poDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: po_date "${meta.po_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
       const deliveryDate = meta.delivery_date ? parseFlexibleDate(meta.delivery_date) : null
       if (meta.delivery_date && !deliveryDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: delivery_date "${meta.delivery_date}" is not a valid date`); continue }
 
       // CHANGED: po_no and financial_year_id are NOT NULL with no DB default —
-      // previously omitted here, so this insert would have failed on that
-      // constraint right after the date fix. Mirrors the single-PO create flow.
+      // financial_year_id is always resolved; po_no is taken from the CSV if
+      // supplied, otherwise generated via next_po_no() (same as manual create).
       const fy = await resolveFY()
       if (!fy) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: no financial year found`); continue }
-      const { data: poNo, error: noErr } = await supabase.rpc('next_po_no', { ent_id: buyerE.id, fy_id: fy.id })
-      if (noErr) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: could not generate PO number — ${noErr.message}`); continue }
+      let poNo = (meta.po_no || '').trim()
+      if (poNo) {
+        if (usedPoNos.has(poNo.toLowerCase())) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: PO number "${poNo}" is already in use`); continue }
+      } else {
+        const { data: generated, error: noErr } = await supabase.rpc('next_po_no', { ent_id: buyerE.id, fy_id: fy.id })
+        if (noErr) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: could not generate PO number — ${noErr.message}`); continue }
+        poNo = generated
+      }
+      usedPoNos.add(poNo.toLowerCase())
 
       const interstate = meta.is_interstate === 'true' || (buyerE.state_code && sellerE.state_code && buyerE.state_code !== sellerE.state_code)
       const poLines = gLines.map((r, i) => {
@@ -263,8 +274,8 @@ function POList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('po')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes</code><br /><br />
-            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no</code><br /><br />
+            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO. <code>po_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing POs and other rows in this file).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />

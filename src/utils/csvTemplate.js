@@ -101,50 +101,53 @@ export const TEMPLATES = {
 
   pi: {
     filename: 'pi_template.csv',
-    headers:  ['pi_date', 'from_entity', 'to_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'valid_upto', 'notes'],
+    headers:  ['pi_date', 'from_entity', 'to_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'valid_upto', 'notes', 'pi_no'],
     rows: [
-      { pi_date: '2025-04-15', from_entity: 'Siddi', to_entity: 'Retail', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, valid_upto: '2025-05-15', notes: '' },
-      { pi_date: '2025-04-15', from_entity: 'Siddi', to_entity: 'Retail', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, valid_upto: '2025-05-15', notes: '' },
-      { pi_date: '2025-04-20', from_entity: 'Retail', to_entity: 'MVL',   is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, valid_upto: '2025-05-20', notes: 'Export order' },
+      { pi_date: '2025-04-15', from_entity: 'Siddi', to_entity: 'Retail', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, valid_upto: '2025-05-15', notes: '', pi_no: '' },
+      { pi_date: '2025-04-15', from_entity: 'Siddi', to_entity: 'Retail', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, valid_upto: '2025-05-15', notes: '', pi_no: '' },
+      { pi_date: '2025-04-20', from_entity: 'Retail', to_entity: 'MVL',   is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, valid_upto: '2025-05-20', notes: 'Export order', pi_no: '' },
     ],
     notes: [
       '# Each row = one LINE ITEM. Multiple rows with same pi_date+from+to = same PI.',
       '# from_entity / to_entity = short name or full name exactly as in Entities',
       '# is_interstate = true or false',
       '# rate = rate per unit in rupees (no symbols)',
+      '# pi_no = optional — leave blank to auto-generate, or supply your own PI number',
       '# gst_rate = GST % number only e.g. 12 or 18',
     ],
   },
 
   po: {
     filename: 'po_template.csv',
-    headers:  ['po_date', 'buyer_entity', 'seller_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'delivery_date', 'notes'],
+    headers:  ['po_date', 'buyer_entity', 'seller_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'delivery_date', 'notes', 'po_no'],
     rows: [
-      { po_date: '2025-04-16', buyer_entity: 'Retail', seller_entity: 'Siddi', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, delivery_date: '2025-05-01', notes: '' },
-      { po_date: '2025-04-16', buyer_entity: 'Retail', seller_entity: 'Siddi', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, delivery_date: '2025-05-01', notes: '' },
-      { po_date: '2025-04-21', buyer_entity: 'MVL',   seller_entity: 'Retail', is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, delivery_date: '2025-05-10', notes: '' },
+      { po_date: '2025-04-16', buyer_entity: 'Retail', seller_entity: 'Siddi', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, delivery_date: '2025-05-01', notes: '', po_no: '' },
+      { po_date: '2025-04-16', buyer_entity: 'Retail', seller_entity: 'Siddi', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, delivery_date: '2025-05-01', notes: '', po_no: '' },
+      { po_date: '2025-04-21', buyer_entity: 'MVL',   seller_entity: 'Retail', is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, delivery_date: '2025-05-10', notes: '', po_no: '' },
     ],
     notes: [
       '# Each row = one LINE ITEM. Multiple rows with same po_date+buyer+seller = same PO.',
       '# buyer_entity / seller_entity = short name or full name exactly as in Entities',
       '# is_interstate = true or false',
       '# rate = rate per unit in rupees',
+      '# po_no = optional — leave blank to auto-generate, or supply your own PO number',
     ],
   },
 
   invoices: {
     filename: 'invoices_template.csv',
-    headers:  ['invoice_date', 'invoice_type', 'seller_entity', 'buyer_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'due_date', 'notes'],
+    headers:  ['invoice_date', 'invoice_type', 'seller_entity', 'buyer_entity', 'is_interstate', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'due_date', 'notes', 'invoice_no'],
     rows: [
-      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, due_date: '2025-05-30', notes: '' },
-      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, due_date: '2025-05-30', notes: '' },
-      { invoice_date: '2025-05-05', invoice_type: 'sales', seller_entity: 'Retail', buyer_entity: 'MVL',  is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, due_date: '2025-06-05', notes: 'Export invoice' },
+      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, due_date: '2025-05-30', notes: '', invoice_no: '' },
+      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, due_date: '2025-05-30', notes: '', invoice_no: '' },
+      { invoice_date: '2025-05-05', invoice_type: 'sales', seller_entity: 'Retail', buyer_entity: 'MVL',  is_interstate: 'true',  description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, due_date: '2025-06-05', notes: 'Export invoice', invoice_no: '' },
     ],
     notes: [
       '# Each row = one LINE ITEM. Multiple rows with same invoice_date+seller+buyer = same Invoice.',
       '# invoice_type = sales or purchase',
       '# seller_entity / buyer_entity = short name or full name exactly as in Entities',
       '# is_interstate = true or false',
+      '# invoice_no = optional — leave blank to auto-generate, or supply your own invoice number',
       '# rate = rate per unit in rupees',
     ],
   },

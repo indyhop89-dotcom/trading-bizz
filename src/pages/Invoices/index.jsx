@@ -7,7 +7,7 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/dates'
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV } from '../../utils/csvTemplate'
@@ -89,12 +89,19 @@ function InvoiceList() {
 
   useEffect(() => { load() }, [load])
 
+  // Format: invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no
+  // CHANGED: invoice_no and financial_year_id were previously never set on CSV-created
+  // invoices at all — invoices.invoice_no and financial_year_id are NOT NULL with no
+  // DB default, so every CSV upload here would have failed outright. This adds the
+  // same FY-resolve + next_inv_no() generation the other modules use, plus lets you
+  // supply your own invoice_no per row (optional — blank auto-generates).
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
     const header = lines[0].split(',').map(h => h.trim().toLowerCase())
     let created = 0, errors = []
+    const usedInvoiceNos = new Set(invoices.map(i => i.invoice_no?.toLowerCase()).filter(Boolean))
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
       const cols = lines[i].split(',').map(c => c.trim())
@@ -110,6 +117,30 @@ function InvoiceList() {
       const buyerE  = entities.find(e => e.short_name?.toLowerCase() === meta.buyer_entity?.toLowerCase()  || e.name?.toLowerCase() === meta.buyer_entity?.toLowerCase())
       if (!sellerE) { errors.push(`Seller "${meta.seller_entity}" not found`); continue }
       if (!buyerE)  { errors.push(`Buyer "${meta.buyer_entity}" not found`); continue }
+
+      // CHANGED: normalize date (YYYY-MM-DD or DD-MM-YYYY) — same fix as PI/PO,
+      // a raw DD-MM-YYYY value fails Postgres with "date/time field value out
+      // of range" once the day exceeds 12.
+      const invoiceDate = parseFlexibleDate(meta.invoice_date)
+      if (!invoiceDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: invoice_date "${meta.invoice_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
+      const dueDate = meta.due_date ? parseFlexibleDate(meta.due_date) : null
+      if (meta.due_date && !dueDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: due_date "${meta.due_date}" is not a valid date`); continue }
+
+      // CHANGED: financial_year_id always resolved; invoice_no taken from the
+      // CSV if supplied, else generated via next_inv_no() keyed to the seller
+      // (the entity issuing the invoice — mirrors PI's use of from_entity).
+      const fy = await resolveFY()
+      if (!fy) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: no financial year found`); continue }
+      let invoiceNo = (meta.invoice_no || '').trim()
+      if (invoiceNo) {
+        if (usedInvoiceNos.has(invoiceNo.toLowerCase())) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: invoice number "${invoiceNo}" is already in use`); continue }
+      } else {
+        const { data: generated, error: noErr } = await supabase.rpc('next_inv_no', { ent_id: sellerE.id, fy_id: fy.id })
+        if (noErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: could not generate invoice number — ${noErr.message}`); continue }
+        invoiceNo = generated
+      }
+      usedInvoiceNos.add(invoiceNo.toLowerCase())
+
       const interstate = meta.is_interstate === 'true' || (sellerE.state_code && buyerE.state_code && sellerE.state_code !== buyerE.state_code)
       const invLines = gLines.map((r, i) => {
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
@@ -119,8 +150,8 @@ function InvoiceList() {
         return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
       const totals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
-      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_date: meta.invoice_date, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: meta.due_date||null, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
-      if (invErr) { errors.push(`Invoice ${meta.invoice_date}: ${invErr.message}`); continue }
+      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, financial_year_id: fy.id, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
+      if (invErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: ${invErr.message}`); continue }
       await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
       created++
     }
@@ -223,8 +254,8 @@ function InvoiceList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('invoices')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes</code><br /><br />
-            Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no</code><br /><br />
+            Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice. <code>invoice_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing invoices and other rows in this file).
           </div>
           <FormRow label='Paste CSV'>
             <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
