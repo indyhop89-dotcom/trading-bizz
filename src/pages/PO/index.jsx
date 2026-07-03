@@ -417,6 +417,10 @@ function POList() {
 function PODetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [po, setPO]     = useState(null)
   const [lines, setLines] = useState([])
   const [loading, setLoading] = useState(true)
@@ -444,6 +448,14 @@ function PODetail() {
     load()
   }
 
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('purchase_orders').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/po')
+  }
+
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!po)     return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>PO not found.</div>
 
@@ -457,6 +469,7 @@ function PODetail() {
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             {po.status === 'open' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('completed')}>Mark Completed</Btn>}
             {!['cancelled','completed'].includes(po.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={po.status} />
           </div>
         }
@@ -498,6 +511,8 @@ function PODetail() {
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
         title='Cancel PO' message='Cancel this purchase order?' danger />
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
+        title='Delete PO' message={`Delete ${po.po_no || 'this PO'}? This cannot be undone.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

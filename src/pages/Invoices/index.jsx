@@ -691,6 +691,10 @@ function NewInvoice() {
 function InvoiceDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [inv, setInv]     = useState(null)
   const [lines, setLines] = useState([])
   const [tdsRows, setTdsRows] = useState([])  // CHANGED: TDS/TCS entries
@@ -725,6 +729,14 @@ function InvoiceDetail() {
     await supabase.from('invoices').update({ status, updated_at: new Date() }).eq('id', id)
     setToast({ message: `Invoice ${status}`, type: 'success' })
     load()
+  }
+
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('invoices').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/invoices')
   }
 
   // CHANGED: save EWB + Challan fields
@@ -795,6 +807,7 @@ function InvoiceDetail() {
             {inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
             {!['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={inv.invoice_type} label={inv.invoice_type === 'sales' ? 'Sales Invoice' : 'Purchase Invoice'} />
             <Badge status={inv.status} />
           </div>
@@ -1038,6 +1051,8 @@ function InvoiceDetail() {
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
         title='Cancel Invoice' message='Cancel this invoice? All GL entries will be reversed.' danger />
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
+        title='Delete Invoice' message={`Delete ${inv.invoice_no || 'this invoice'}? This cannot be undone.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

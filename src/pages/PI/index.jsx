@@ -558,6 +558,10 @@ function PIList() {
 function PIDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [pi, setPI]         = useState(null)
   const [lines, setLines]   = useState([])
   const [editLines, setEditLines] = useState([])
@@ -624,6 +628,14 @@ function PIDetail() {
     setToast({message:`PI marked as ${status}`,type:'success'}); load()
   }
 
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('proforma_invoices').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/pi')
+  }
+
   if (loading) return <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
   if (!pi)     return <div style={{padding:'48px',textAlign:'center',color:C.danger}}>PI not found.</div>
 
@@ -647,6 +659,7 @@ function PIDetail() {
             {!editing&&pi.status==='sent'&&<Btn size='sm' variant='ghost' onClick={()=>updateStatus('accepted')}>Mark Accepted</Btn>}
             {canConvert&&<Btn size='sm' onClick={()=>navigate(`/invoices/new?from_pi=${id}`)}>Convert to Invoice</Btn>}
             {!editing&&!isLocked&&<Btn size='sm' variant='ghost' onClick={()=>setConfirmCancel(true)} style={{color:C.danger}}>Cancel PI</Btn>}
+            {!editing&&canDelete&&<Btn size='sm' variant='danger' onClick={()=>setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={pi.status}/>
           </div>
         }
@@ -719,6 +732,8 @@ function PIDetail() {
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
         title='Cancel PI' message='Cancel this proforma invoice? This action cannot be undone.' danger />
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
+        title='Delete PI' message={`Delete ${pi.pi_no || 'this PI'}? This cannot be undone.`} danger />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
