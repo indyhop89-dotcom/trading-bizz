@@ -7,10 +7,12 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
+import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV } from '../../utils/csvTemplate'
+import { useAuth } from '../../hooks/useAuth'
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
 const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
@@ -33,14 +35,7 @@ const EMPTY_FORM = {
   einvoice_irn: '', einvoice_ack_no: '', einvoice_ack_date: '',
   tds_amount: 0, tcs_amount: 0,
   notes: '',
-}
-
-
-// Resolve current FY — next_inv_no takes (ent_id, fy_id)
-async function resolveFY() {
-  const label = currentFYLabel()
-  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
-  return (data||[]).find(f=>f.name===label)||data?.[0]
+  invoice_no: '', // CHANGED: optional manual invoice number — blank suggests one via suggestNextNo()
 }
 
 async function writeStockMovements(invoice, lines) {
@@ -58,6 +53,12 @@ async function writeStockMovements(invoice, lines) {
 // ─── Invoice List ─────────────────────────────────────────────────────────────
 function InvoiceList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [invoices, setInvoices] = useState([])
   const [entities, setEntities] = useState([])
   const [loading, setLoading]   = useState(true)
@@ -89,12 +90,24 @@ function InvoiceList() {
 
   useEffect(() => { load() }, [load])
 
+  // Format: invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no
+  // CHANGED: invoice_no was previously never set on CSV-created invoices at
+  // all — not a hard insert failure (invoice_no is nullable on the live
+  // schema, confirmed via information_schema), but every CSV-created invoice
+  // was silently getting no invoice number whatsoever. This now generates
+  // one via suggestNextNo() or uses a supplied value, same as PI/PO.
+  // NOTE: financial_year_id does NOT exist on the live invoices table either
+  // (confirmed) — fy.id is only used as the RPC's fy_id parameter, never stored.
+  // DB default, so every CSV upload here would have failed outright. This adds the
+  // same FY-resolve + suggestNextNo() generation the other modules use, plus lets you
+  // supply your own invoice_no per row (optional — blank auto-generates).
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
     const header = lines[0].split(',').map(h => h.trim().toLowerCase())
     let created = 0, errors = []
+    const usedInvoiceNos = new Set(invoices.map(i => i.invoice_no?.toLowerCase()).filter(Boolean))
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
       const cols = lines[i].split(',').map(c => c.trim())
@@ -110,6 +123,28 @@ function InvoiceList() {
       const buyerE  = entities.find(e => e.short_name?.toLowerCase() === meta.buyer_entity?.toLowerCase()  || e.name?.toLowerCase() === meta.buyer_entity?.toLowerCase())
       if (!sellerE) { errors.push(`Seller "${meta.seller_entity}" not found`); continue }
       if (!buyerE)  { errors.push(`Buyer "${meta.buyer_entity}" not found`); continue }
+
+      // CHANGED: normalize date (YYYY-MM-DD or DD-MM-YYYY) — same fix as PI/PO,
+      // a raw DD-MM-YYYY value fails Postgres with "date/time field value out
+      // of range" once the day exceeds 12.
+      const invoiceDate = parseFlexibleDate(meta.invoice_date)
+      if (!invoiceDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: invoice_date "${meta.invoice_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
+      const dueDate = meta.due_date ? parseFlexibleDate(meta.due_date) : null
+      if (meta.due_date && !dueDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: due_date "${meta.due_date}" is not a valid date`); continue }
+
+      // CHANGED: invoice_no taken from the CSV if supplied, else suggested
+      // via suggestNextNo() keyed to the seller (the entity issuing the
+      // invoice — mirrors PI's use of from_entity). FY code computed
+      // directly from this row's own invoiceDate — no financial_years lookup.
+      const fyCode = fyCodeForDate(invoiceDate)
+      let invoiceNo = (meta.invoice_no || '').trim()
+      if (invoiceNo) {
+        if (usedInvoiceNos.has(invoiceNo.toLowerCase())) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: invoice number "${invoiceNo}" is already in use`); continue }
+      } else {
+        invoiceNo = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerE.short_name || sellerE.name, fyCode, excludeSet: usedInvoiceNos })
+      }
+      usedInvoiceNos.add(invoiceNo.toLowerCase())
+
       const interstate = meta.is_interstate === 'true' || (sellerE.state_code && buyerE.state_code && sellerE.state_code !== buyerE.state_code)
       const invLines = gLines.map((r, i) => {
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
@@ -119,8 +154,8 @@ function InvoiceList() {
         return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
       const totals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
-      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_date: meta.invoice_date, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: meta.due_date||null, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
-      if (invErr) { errors.push(`Invoice ${meta.invoice_date}: ${invErr.message}`); continue }
+      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
+      if (invErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: ${invErr.message}`); continue }
       await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
       created++
     }
@@ -145,7 +180,30 @@ function InvoiceList() {
   const totalOutstanding = filtered.reduce((s, i) => s + (i.outstanding_amount || 0), 0)
   const totalAmount      = filtered.reduce((s, i) => s + (i.total_amount || 0), 0)
 
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(i => i.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('invoices').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} invoice(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   const columns = [
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: i => <input type='checkbox' checked={selected.has(i.id)}
+        onChange={() => toggleSelect(i.id)} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.',      render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'Invoice No', render: i => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{i.invoice_no || '—'}</span> },
     { label: 'Type',    render: i => <Badge status={i.invoice_type} label={i.invoice_type === 'sales' ? 'Sales' : 'Purchase'} /> },
@@ -207,6 +265,16 @@ function InvoiceList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
       </div>
 
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fdeeee', border: '1px solid #f0c4c4', borderRadius: '6px', padding: '10px 14px', marginBottom: '14px' }}>
+          <span style={{ fontSize: '13px', color: '#8a2f2f' }}>{selected.size} invoice{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -214,6 +282,10 @@ function InvoiceList() {
               emptyState={<EmptyState icon='🧾' title='No invoices' action={<Btn onClick={() => navigate('/invoices/new')}>+ New Invoice</Btn>} />} />
         }
       </Card>
+
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Invoices' message={`Delete ${selected.size} selected invoice(s)? This cannot be undone.`} danger />
+
 
       {/* CSV Upload Modal */}
       <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Invoices' width={680}>
@@ -223,8 +295,8 @@ function InvoiceList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('invoices')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes</code><br /><br />
-            Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no</code><br /><br />
+            Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice. <code>invoice_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing invoices and other rows in this file).
           </div>
           <FormRow label='Paste CSV'>
             <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
@@ -337,9 +409,26 @@ function NewInvoice() {
     const totals = computeTotals(computedLines)
     setSaving(true)
 
+    // CHANGED: invoice_no was previously never set here at all (not a hard
+    // constraint failure — invoice_no is nullable on the live schema — but
+    // every manually-created invoice was getting no invoice number). This
+    // mirrors PI/PO: use the typed invoice_no, or suggest one via
+    // suggestNextNo(). FY code computed directly from the invoice's own date
+    // (Indian FY: Apr–Mar) — no financial_years lookup needed.
+    const fyCode = fyCodeForDate(form.invoice_date)
+    let invoiceNo = (form.invoice_no || '').trim()
+    if (invoiceNo) {
+      const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).limit(1)
+      if (dup?.length) { setSaving(false); return setToast({ message: `Invoice number "${invoiceNo}" is already in use`, type: 'error' }) }
+    } else {
+      const sellerEntity = entities.find(e => e.id === form.seller_entity_id)
+      invoiceNo = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerEntity?.short_name || sellerEntity?.name, fyCode })
+    }
+
     const payload = {
       ...form,
       ...totals,
+      invoice_no: invoiceNo,
       outstanding_amount: totals.total_amount,
       paid_amount: 0,
     }
@@ -441,6 +530,9 @@ function NewInvoice() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginTop: '12px' }}>
             <FormRow label='Invoice Date' required>
               <Input type='date' value={form.invoice_date} onChange={e => setF('invoice_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='Invoice Number' hint='Leave blank to auto-generate'>
+              <Input value={form.invoice_no} onChange={e => setF('invoice_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Due Date'>
               <Input type='date' value={form.due_date} onChange={e => setF('due_date', e.target.value)} />
@@ -594,6 +686,10 @@ function NewInvoice() {
 function InvoiceDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [inv, setInv]     = useState(null)
   const [lines, setLines] = useState([])
   const [tdsRows, setTdsRows] = useState([])  // CHANGED: TDS/TCS entries
@@ -628,6 +724,14 @@ function InvoiceDetail() {
     await supabase.from('invoices').update({ status, updated_at: new Date() }).eq('id', id)
     setToast({ message: `Invoice ${status}`, type: 'success' })
     load()
+  }
+
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('invoices').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/invoices')
   }
 
   // CHANGED: save EWB + Challan fields
@@ -698,6 +802,7 @@ function InvoiceDetail() {
             {inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
             {!['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={inv.invoice_type} label={inv.invoice_type === 'sales' ? 'Sales Invoice' : 'Purchase Invoice'} />
             <Badge status={inv.status} />
           </div>
@@ -941,6 +1046,8 @@ function InvoiceDetail() {
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
         title='Cancel Invoice' message='Cancel this invoice? All GL entries will be reversed.' danger />
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
+        title='Delete Invoice' message={`Delete ${inv.invoice_no || 'this invoice'}? This cannot be undone.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

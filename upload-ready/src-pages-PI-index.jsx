@@ -7,11 +7,13 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
+import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { useAuth } from '../../hooks/useAuth'
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 
@@ -21,14 +23,7 @@ const EMPTY_FORM = {
   order_id: '', order_leg_id: '',
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
-}
-
-
-// Resolve current FY from DB
-async function resolveFY() {
-  const label = currentFYLabel()
-  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
-  return (data||[]).find(f=>f.name===label)||data?.[0]
+  pi_no: '', // CHANGED: optional manual PI number — blank suggests one via suggestNextNo()
 }
 
 // Write planned stock movements on PI create
@@ -47,6 +42,15 @@ async function writeStockMovementsForPI(pi, lines) {
 // ─── PI List ──────────────────────────────────────────────────────────────────
 function PIList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to the 'master' role, which is the only
+  // elevated/full-access role in this app's schema (ROLES = master, entity_user,
+  // viewer — see Settings). This matches the existing `isAdmin` convention used
+  // in Payments (`profile?.role === 'master'`).
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [pis, setPIs]           = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
@@ -122,11 +126,24 @@ function PIList() {
     if (!form.from_entity_id || !form.to_entity_id) return setToast({ message: 'From and To entity are required', type: 'error' })
     const totals = computeTotals(piLines.map(l => computeLine(l, form.is_interstate)))
     setSaving(true)
-    const fy = await resolveFY()
-    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
-    const { data: piNo, error: noErr } = await supabase.rpc('next_pi_no', { ent_id: form.from_entity_id, fy_id: fy.id })
-    if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PI number: '+noErr.message, type: 'error' }) }
-    const payload = { ...form, ...totals, pi_no: piNo, financial_year_id: fy.id }
+    // CHANGED: use the manually-entered PI number if the user supplied one,
+    // otherwise suggest one via suggestNextNo(). FY code is now computed
+    // directly from the PI's own date (Indian FY: Apr–Mar) instead of a
+    // financial_years table lookup — the DB round-trip only ever existed to
+    // fetch this one string, and this removes a "no financial year found"
+    // failure path that no longer served any purpose.
+    const fyCode = fyCodeForDate(form.pi_date)
+    let piNo = (form.pi_no || '').trim()
+    if (piNo) {
+      const dup = pis.find(p => p.pi_no?.toLowerCase() === piNo.toLowerCase())
+      if (dup) { setSaving(false); return setToast({ message: `PI number "${piNo}" is already in use`, type: 'error' }) }
+    } else {
+      const fromEntity = entities.find(e => e.id === form.from_entity_id)
+      piNo = await suggestNextNo({ table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromEntity?.short_name || fromEntity?.name, fyCode })
+    }
+    // CHANGED: financial_year_id does NOT exist on the live proforma_invoices
+    // table (confirmed via information_schema — only pi_no, no FK column at all).
+    const payload = { ...form, ...totals, pi_no: piNo }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
     if (!payload.valid_upto)   delete payload.valid_upto
@@ -187,8 +204,11 @@ function PIList() {
   })
 
   // ── CSV bulk upload ──────────────────────────────────────────────────────────
-  // Format: pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes
-  // Multiple rows with same pi_date+from+to = grouped into one PI
+  // Format: pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no
+  // Multiple rows with same pi_date+from+to = grouped into one PI.
+  // CHANGED: pi_no is optional — blank = suggested via suggestNextNo() (see numbering.js
+  // behaviour). If supplied, that exact number is used instead, after checking it
+  // isn't already used by an existing PI or another row/group in this same file.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -196,6 +216,9 @@ function PIList() {
     const delim = detectDelimiter(lines[0])
     const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
+    // CHANGED: dedupe pool for manually-supplied pi_no values — seeded with
+    // every PI number already in the DB, then grown as this file assigns more.
+    const usedPiNos = new Set(pis.map(p => p.pi_no?.toLowerCase()).filter(Boolean))
 
     // Group rows by pi_date+from_entity+to_entity
     const groups = {}
@@ -214,6 +237,27 @@ function PIList() {
       const toE   = entities.find(e => e.short_name?.toLowerCase() === meta.to_entity?.toLowerCase()   || e.name?.toLowerCase() === meta.to_entity?.toLowerCase())
       if (!fromE) { errors.push(`Row group ${meta.from_entity}: entity not found`); continue }
       if (!toE)   { errors.push(`Row group ${meta.to_entity}: entity not found`);   continue }
+
+      // CHANGED: accept YYYY-MM-DD or DD-MM-YYYY from the CSV, normalize to ISO.
+      // Raw DD-MM-YYYY strings sent straight to Postgres fail with
+      // "date/time field value out of range" once the day exceeds 12.
+      const piDate = parseFlexibleDate(meta.pi_date)
+      if (!piDate) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: pi_date "${meta.pi_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
+      const validUpto = meta.valid_upto ? parseFlexibleDate(meta.valid_upto) : null
+      if (meta.valid_upto && !validUpto) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: valid_upto "${meta.valid_upto}" is not a valid date`); continue }
+
+      // CHANGED: pi_no is used from the CSV if supplied, else suggested via
+      // suggestNextNo(). FY code computed directly from this row's own
+      // piDate (Indian FY: Apr–Mar) instead of a financial_years lookup.
+      const fyCode = fyCodeForDate(piDate)
+
+      let piNo = (meta.pi_no || '').trim()
+      if (piNo) {
+        if (usedPiNos.has(piNo.toLowerCase())) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: PI number "${piNo}" is already in use`); continue }
+      } else {
+        piNo = await suggestNextNo({ table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromE.short_name || fromE.name, fyCode, excludeSet: usedPiNos })
+      }
+      usedPiNos.add(piNo.toLowerCase())
 
       const interstate = meta.is_interstate === 'true' || (fromE.state_code && toE.state_code && fromE.state_code !== toE.state_code)
 
@@ -246,9 +290,9 @@ function PIList() {
       }), { taxable_amount: 0, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 0 })
 
       const { data: pi, error: piErr } = await supabase.from('proforma_invoices').insert({
-        pi_date: meta.pi_date, from_entity_id: fromE.id, to_entity_id: toE.id,
-        is_interstate: interstate, valid_upto: meta.valid_upto || null,
-        notes: meta.notes || null, status: 'draft', ...totals,
+        pi_date: piDate, from_entity_id: fromE.id, to_entity_id: toE.id,
+        is_interstate: interstate, valid_upto: validUpto,
+        notes: meta.notes || null, status: 'draft', pi_no: piNo, ...totals,
       }).select().single()
 
       if (piErr) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: ${piErr.message}`); continue }
@@ -264,7 +308,30 @@ function PIList() {
     load()
   }
 
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(p => p.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('proforma_invoices').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} PI(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   const columns = [
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: p => <input type='checkbox' checked={selected.has(p.id)}
+        onChange={() => toggleSelect(p.id)} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.', render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'PI No', render: p => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{p.pi_no || '—'}</span> },
     { label: 'From → To', render: p => <span style={{ fontSize: '12px' }}>{p.from_entity?.short_name || p.from_entity?.name} → {p.to_entity?.short_name || p.to_entity?.name}</span> },
@@ -315,6 +382,16 @@ function PIList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
       </div>
 
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fdeeee', border: '1px solid #f0c4c4', borderRadius: '6px', padding: '10px 14px', marginBottom: '14px' }}>
+          <span style={{ fontSize: '13px', color: '#8a2f2f' }}>{selected.size} PI{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -322,6 +399,9 @@ function PIList() {
               emptyState={<EmptyState icon='📄' title='No PIs yet' action={<Btn onClick={() => setModalOpen(true)}>+ New PI</Btn>} />} />
         }
       </Card>
+
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Proforma Invoices' message={`Delete ${selected.size} selected PI(s)? This cannot be undone.`} danger />
 
       {/* CSV Upload Modal */}
       <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Proforma Invoices' width={680}>
@@ -331,8 +411,8 @@ function PIList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('pi')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes</code><br /><br />
-            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no</code><br /><br />
+            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -385,6 +465,9 @@ function PIList() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
             <FormRow label='PI Date' required>
               <Input type='date' value={form.pi_date} onChange={e => setF('pi_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='PI Number' hint='Leave blank to auto-generate'>
+              <Input value={form.pi_no} onChange={e => setF('pi_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Valid Upto'>
               <Input type='date' value={form.valid_upto} onChange={e => setF('valid_upto', e.target.value)} />
@@ -467,6 +550,10 @@ function PIList() {
 function PIDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [pi, setPI]         = useState(null)
   const [lines, setLines]   = useState([])
   const [editLines, setEditLines] = useState([])
@@ -491,16 +578,24 @@ function PIDetail() {
   useEffect(() => { load() }, [load])
 
   function startEdit() {
-    setEditForm({pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||''})
+    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||''})
     setEditLines(lines.map(l=>({...l,_id:l.id,_hsn_resolved_rate:null,_hsn_override:false,_hsn_manually_set:false,_cost_rate:null,_margin_pct:''})))
     setEditing(true)
   }
 
   async function handleSaveEdit() {
+    // CHANGED: PI number is now editable — required, and checked for
+    // duplicates against every other PI (excluding this one) before saving.
+    const piNo = (editForm.pi_no || '').trim()
+    if (!piNo) return setToast({message:'PI number cannot be blank',type:'error'})
     setSaving(true)
+    if (piNo.toLowerCase() !== (pi.pi_no||'').toLowerCase()) {
+      const { data: dup } = await supabase.from('proforma_invoices').select('id').ilike('pi_no', piNo).neq('id', id).limit(1)
+      if (dup?.length) { setSaving(false); return setToast({message:`PI number "${piNo}" is already in use`,type:'error'}) }
+    }
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
     const totals = computeTotals(computedLines)
-    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,...totals,updated_at:new Date()}).eq('id',id)
+    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,...totals,updated_at:new Date()}).eq('id',id)
     if (piErr) { setSaving(false); return setToast({message:piErr.message,type:'error'}) }
     await supabase.from('proforma_invoice_lines').delete().eq('pi_id',id)
     const linesPayload = computedLines.map((l,i)=>{
@@ -523,6 +618,14 @@ function PIDetail() {
   async function updateStatus(status) {
     await supabase.from('proforma_invoices').update({status,updated_at:new Date()}).eq('id',id)
     setToast({message:`PI marked as ${status}`,type:'success'}); load()
+  }
+
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('proforma_invoices').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/pi')
   }
 
   if (loading) return <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
@@ -548,6 +651,7 @@ function PIDetail() {
             {!editing&&pi.status==='sent'&&<Btn size='sm' variant='ghost' onClick={()=>updateStatus('accepted')}>Mark Accepted</Btn>}
             {canConvert&&<Btn size='sm' onClick={()=>navigate(`/invoices/new?from_pi=${id}`)}>Convert to Invoice</Btn>}
             {!editing&&!isLocked&&<Btn size='sm' variant='ghost' onClick={()=>setConfirmCancel(true)} style={{color:C.danger}}>Cancel PI</Btn>}
+            {!editing&&canDelete&&<Btn size='sm' variant='danger' onClick={()=>setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={pi.status}/>
           </div>
         }
@@ -581,6 +685,7 @@ function PIDetail() {
           <SectionDivider label='Edit Details'/>
           <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'12px',marginTop:'12px'}}>
             <FormRow label='PI Date' required><Input type='date' value={editForm.pi_date} onChange={e=>setEditForm(f=>({...f,pi_date:e.target.value}))}/></FormRow>
+            <FormRow label='PI Number' required><Input value={editForm.pi_no} onChange={e=>setEditForm(f=>({...f,pi_no:e.target.value}))}/></FormRow>
             <FormRow label='Valid Upto'><Input type='date' value={editForm.valid_upto} onChange={e=>setEditForm(f=>({...f,valid_upto:e.target.value}))}/></FormRow>
             <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{PI_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
             <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
@@ -619,6 +724,8 @@ function PIDetail() {
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
         title='Cancel PI' message='Cancel this proforma invoice? This action cannot be undone.' danger />
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
+        title='Delete PI' message={`Delete ${pi.pi_no || 'this PI'}? This cannot be undone.`} danger />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>

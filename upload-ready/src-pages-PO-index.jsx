@@ -7,10 +7,12 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
+import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { useAuth } from '../../hooks/useAuth'
 
 const PO_STATUSES = ['open', 'partial', 'completed', 'cancelled']
 
@@ -20,19 +22,18 @@ const EMPTY_FORM = {
   order_id: '', order_leg_id: '', pi_id: '',
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
-}
-
-
-// Resolve current FY — next_po_no takes (ent_id, fy_id)
-async function resolveFY() {
-  const label = currentFYLabel()
-  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
-  return (data||[]).find(f=>f.name===label)||data?.[0]
+  po_no: '', // CHANGED: optional manual PO number — blank suggests one via suggestNextNo()
 }
 
 // ─── PO List ──────────────────────────────────────────────────────────────────
 function POList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [pos, setPOs]       = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders] = useState([])
@@ -109,11 +110,21 @@ function POList() {
     if (!form.buyer_entity_id || !form.seller_entity_id) return setToast({ message: 'Buyer and Seller are required', type: 'error' })
     const totals = computeTotals(poLines.map(l => computeLine(l, form.is_interstate)))
     setSaving(true)
-    const fy = await resolveFY()
-    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
-    const { data: poNo, error: noErr } = await supabase.rpc('next_po_no', { ent_id: form.buyer_entity_id, fy_id: fy.id })
-    if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PO number: '+noErr.message, type: 'error' }) }
-    const payload = { ...form, ...totals, po_no: poNo, financial_year_id: fy.id }
+    // CHANGED: use the manually-entered PO number if supplied, else suggest
+    // one via suggestNextNo(). FY code computed directly from the PO's own
+    // date (Indian FY: Apr–Mar) — no financial_years lookup needed.
+    const fyCode = fyCodeForDate(form.po_date)
+    let poNo = (form.po_no || '').trim()
+    if (poNo) {
+      const dup = pos.find(p => p.po_no?.toLowerCase() === poNo.toLowerCase())
+      if (dup) { setSaving(false); return setToast({ message: `PO number "${poNo}" is already in use`, type: 'error' }) }
+    } else {
+      const buyerEntity = entities.find(e => e.id === form.buyer_entity_id)
+      poNo = await suggestNextNo({ table: 'purchase_orders', noCol: 'po_no', entityShort: buyerEntity?.short_name || buyerEntity?.name, fyCode })
+    }
+    // CHANGED: financial_year_id does NOT exist on the live purchase_orders
+    // table (confirmed via information_schema).
+    const payload = { ...form, ...totals, po_no: poNo }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
     if (!payload.pi_id)        delete payload.pi_id
@@ -139,6 +150,9 @@ function POList() {
   }
 
   // ── CSV handler ───────────────────────────────────────────────────────────────
+  // Format: po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no
+  // CHANGED: po_no is optional — blank = suggested via suggestNextNo(); if
+  // supplied, used as-is after a duplicate check (existing POs + this file).
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -146,6 +160,7 @@ function POList() {
     const delim = detectDelimiter(lines[0])
     const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
+    const usedPoNos = new Set(pos.map(p => p.po_no?.toLowerCase()).filter(Boolean))
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
       const cols = lines[i].split(delim).map(c => c.trim())
@@ -161,6 +176,27 @@ function POList() {
       const sellerE = entities.find(e => e.short_name?.toLowerCase() === meta.seller_entity?.toLowerCase() || e.name?.toLowerCase() === meta.seller_entity?.toLowerCase())
       if (!buyerE)  { errors.push(`Buyer "${meta.buyer_entity}" not found`); continue }
       if (!sellerE) { errors.push(`Seller "${meta.seller_entity}" not found`); continue }
+
+      // CHANGED: normalize date (accepts YYYY-MM-DD or DD-MM-YYYY) — a raw
+      // DD-MM-YYYY string sent straight to Postgres fails with "date/time
+      // field value out of range" once the day exceeds 12.
+      const poDate = parseFlexibleDate(meta.po_date)
+      if (!poDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: po_date "${meta.po_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
+      const deliveryDate = meta.delivery_date ? parseFlexibleDate(meta.delivery_date) : null
+      if (meta.delivery_date && !deliveryDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: delivery_date "${meta.delivery_date}" is not a valid date`); continue }
+
+      // CHANGED: po_no taken from the CSV if supplied, else suggested via
+      // suggestNextNo(). FY code computed directly from this row's own
+      // poDate (Indian FY: Apr–Mar) instead of a financial_years lookup.
+      const fyCode = fyCodeForDate(poDate)
+      let poNo = (meta.po_no || '').trim()
+      if (poNo) {
+        if (usedPoNos.has(poNo.toLowerCase())) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: PO number "${poNo}" is already in use`); continue }
+      } else {
+        poNo = await suggestNextNo({ table: 'purchase_orders', noCol: 'po_no', entityShort: buyerE.short_name || buyerE.name, fyCode, excludeSet: usedPoNos })
+      }
+      usedPoNos.add(poNo.toLowerCase())
+
       const interstate = meta.is_interstate === 'true' || (buyerE.state_code && sellerE.state_code && buyerE.state_code !== sellerE.state_code)
       const poLines = gLines.map((r, i) => {
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
@@ -170,7 +206,7 @@ function POList() {
         return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
       const totals = poLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
-      const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: meta.po_date, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: meta.delivery_date||null, notes: meta.notes||null, status: 'open', ...totals }).select().single()
+      const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, ...totals }).select().single()
       if (poErr) { errors.push(`PO ${meta.po_date}: ${poErr.message}`); continue }
       await supabase.from('purchase_order_lines').insert(poLines.map(l => ({ ...l, po_id: po.id })))
       created++
@@ -192,7 +228,30 @@ function POList() {
     return ms && mst
   })
 
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(p => p.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('purchase_orders').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} PO(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   const columns = [
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: p => <input type='checkbox' checked={selected.has(p.id)}
+        onChange={() => toggleSelect(p.id)} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.',   render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'PO No',   render: p => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{p.po_no || '—'}</span> },
     { label: 'Buyer',   render: p => <span style={{ fontSize: '12px' }}>{p.buyer?.short_name || p.buyer?.name}</span> },
@@ -230,6 +289,16 @@ function POList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
       </div>
 
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fdeeee', border: '1px solid #f0c4c4', borderRadius: '6px', padding: '10px 14px', marginBottom: '14px' }}>
+          <span style={{ fontSize: '13px', color: '#8a2f2f' }}>{selected.size} PO{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -237,6 +306,9 @@ function POList() {
               emptyState={<EmptyState icon='📋' title='No purchase orders' action={<Btn onClick={() => setModalOpen(true)}>+ New PO</Btn>} />} />
         }
       </Card>
+
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Purchase Orders' message={`Delete ${selected.size} selected PO(s)? This cannot be undone.`} danger />
 
       {/* CSV Upload Modal */}
       <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Purchase Orders' width={680}>
@@ -246,8 +318,8 @@ function POList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('po')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes</code><br /><br />
-            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no</code><br /><br />
+            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO. <code>po_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing POs and other rows in this file).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -274,6 +346,9 @@ function POList() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
             <FormRow label='PO Date' required>
               <Input type='date' value={form.po_date} onChange={e => setF('po_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='PO Number' hint='Leave blank to auto-generate'>
+              <Input value={form.po_no} onChange={e => setF('po_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Delivery Date'>
               <Input type='date' value={form.delivery_date} onChange={e => setF('delivery_date', e.target.value)} />
@@ -334,6 +409,10 @@ function POList() {
 function PODetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [po, setPO]     = useState(null)
   const [lines, setLines] = useState([])
   const [loading, setLoading] = useState(true)
@@ -361,6 +440,14 @@ function PODetail() {
     load()
   }
 
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('purchase_orders').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/po')
+  }
+
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!po)     return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>PO not found.</div>
 
@@ -374,6 +461,7 @@ function PODetail() {
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             {po.status === 'open' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('completed')}>Mark Completed</Btn>}
             {!['cancelled','completed'].includes(po.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={po.status} />
           </div>
         }
@@ -415,6 +503,8 @@ function PODetail() {
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
         title='Cancel PO' message='Cancel this purchase order?' danger />
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
+        title='Delete PO' message={`Delete ${po.po_no || 'this PO'}? This cannot be undone.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

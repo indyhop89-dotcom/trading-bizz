@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Fragment } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
@@ -10,6 +10,37 @@ import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvT
 
 const UNITS = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
 const TABS  = ['Opening Stock', 'Stock Position', 'Products']
+
+// Quote-aware CSV line splitter — plain `line.split(delim)` breaks the moment a
+// field (e.g. a product name or description) contains the delimiter character
+// inside quotes, like `"Steel Tea, Coffee & Sugar Container Set, 3 Pieces"`.
+// This walks the line char-by-char, only splitting on `delim` when outside a
+// quoted span, and un-escapes doubled quotes (""->") per standard CSV rules.
+function parseCSVLine(line, delim) {
+  const out = []
+  let cur = ''
+  let inQuotes = false
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++ }
+        else inQuotes = false
+      } else {
+        cur += ch
+      }
+    } else if (ch === '"') {
+      inQuotes = true
+    } else if (ch === delim) {
+      out.push(cur.trim())
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  out.push(cur.trim())
+  return out
+}
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 function shortfallBadge(planned) {
@@ -120,7 +151,7 @@ function OpeningStock() {
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); setCsvProgress(''); return setToast({ message: 'CSV needs header + data rows', type: 'error' }) }
     const delim = detectDelimiter(lines[0])
-    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    const header = parseCSVLine(lines[0], delim).map(h => h.toLowerCase())
     const norm = s => (s || '').trim().replace(/\s+/g, ' ')
     const totalDataRows = lines.length - 1
 
@@ -128,7 +159,7 @@ function OpeningStock() {
     const parsed = []
     const errors = []
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delim).map(c => c.trim())
+      const cols = parseCSVLine(lines[i], delim)
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       const rowNum = i + 1
@@ -339,7 +370,7 @@ function OpeningStock() {
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>entity,product,fy,qty,unit,rate,hsn_code,gst_rate,as_of_date,category</code><br />
             <strong>Example:</strong><br />
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>Siddi,T-Shirt Basic,FY 2025-26,1000,Nos,250,6109,12,2025-04-01</code><br />
-            Entity = short name or full name. FY = exact name from Settings (required — no default). If <code>product</code> doesn't match an existing product by exact name, a new product is auto-created using this row's unit / hsn_code / gst_rate / rate. unit / hsn_code / gst_rate are optional for existing products — blank falls back to the product's current defaults. Re-uploading the same file skips rows that already exist (same entity + product + FY) — only new rows are added; to change a value on an existing row, edit it directly in the table.
+            Entity = short name or full name. FY = exact name from Settings (required — no default). If <code>product</code> doesn't match an existing product by exact name, a new product is auto-created using this row's unit / hsn_code / gst_rate / rate. unit / hsn_code / gst_rate are optional for existing products — blank falls back to the product's current defaults. Re-uploading the same file skips rows that already exist (same entity + product + FY) — only new rows are added; to change a value on an existing row, edit it directly in the table. If a product name contains a comma, wrap that field in double quotes, e.g. <code>"Steel Tea, Coffee &amp; Sugar Container Set, 3 Pieces"</code>.
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -421,6 +452,14 @@ function StockPosition() {
   // CHANGED: category filter + group-by-category summary toggle
   const [categoryFilter, setCategoryFilter] = useState('')
   const [groupByCategory, setGroupByCategory] = useState(false)
+  const [expandedCategories, setExpandedCategories] = useState(() => new Set())
+  function toggleCategory(cat) {
+    setExpandedCategories(prev => {
+      const next = new Set(prev)
+      if (next.has(cat)) next.delete(cat); else next.add(cat)
+      return next
+    })
+  }
 
   useEffect(() => {
     Promise.all([
@@ -500,12 +539,18 @@ function StockPosition() {
     : position
   ).map((r, i) => ({ ...r, sno: i + 1 }))
 
-  // CHANGED: category → total planned qty, for the group-by-category summary
-  const categoryTotals = {}
+  // CHANGED: category → totals + line items, for the group-by-category table
+  const categoryGroupMap = {}
   for (const r of filteredPosition) {
     const cat = r.product?.category || 'Uncategorised'
-    categoryTotals[cat] = (categoryTotals[cat] || 0) + toNum(r.planned_qty)
+    if (!categoryGroupMap[cat]) categoryGroupMap[cat] = { qty: 0, value: 0, items: [] }
+    categoryGroupMap[cat].qty   += toNum(r.planned_qty)
+    categoryGroupMap[cat].value += toNum(r.opening_qty) * toNum(r.rate)
+    categoryGroupMap[cat].items.push(r)
   }
+  const categoryRows = Object.entries(categoryGroupMap)
+    .map(([cat, g]) => ({ cat, qty: g.qty, value: g.value, items: g.items }))
+    .sort((a, b) => b.qty - a.qty)
 
   const shortfallCount = filteredPosition.filter(r => r.planned_qty < 0).length
   const totalValue     = filteredPosition.reduce((s, r) => s + toNum(r.opening_qty) * toNum(r.rate), 0)
@@ -568,16 +613,74 @@ function StockPosition() {
         <Btn size='sm' variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
       </div>
 
-      {/* CHANGED: category totals summary, shown when grouping is on */}
+      {/* CHANGED: category totals table — click a category row to expand its line items */}
       {groupByCategory && (
-        <Card style={{ marginBottom: '16px' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: '1px', background: C.border }}>
-            {Object.entries(categoryTotals).sort((a, b) => b[1] - a[1]).map(([cat, qty]) => (
-              <div key={cat} style={{ background: C.surface, padding: '10px 14px' }}>
-                <div style={{ fontSize: '11px', color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.04em' }}>{cat}</div>
-                <div style={{ fontSize: '16px', fontWeight: 700 }}>{qty.toLocaleString('en-IN')}</div>
-              </div>
-            ))}
+        <Card style={{ marginBottom: '16px', padding: 0, overflow: 'hidden' }}>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+              <thead>
+                <tr>
+                  {['', 'Category', 'Products', 'Total Qty', 'Opening Value'].map((h, i) => (
+                    <th key={i} style={{
+                      padding: '8px 12px', textAlign: i >= 2 ? 'right' : 'left',
+                      fontSize: '11px', fontWeight: 700, color: '#9a8a6a',
+                      textTransform: 'uppercase', letterSpacing: '0.05em',
+                      background: C.bg, borderBottom: `1px solid ${C.border}`, borderTop: `1px solid ${C.border}`,
+                      whiteSpace: 'nowrap',
+                    }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {categoryRows.map(({ cat, qty, value, items }) => {
+                  const open = expandedCategories.has(cat)
+                  return (
+                    <Fragment key={cat}>
+                      <tr onClick={() => toggleCategory(cat)} style={{ cursor: 'pointer', background: C.surface }}>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, color: C.textMuted, width: '24px' }}>{open ? '▾' : '▸'}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontWeight: 600 }}>{cat}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', color: C.textMid }}>{items.length}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>{qty.toLocaleString('en-IN')}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(value)}</td>
+                      </tr>
+                      {open && (
+                        <tr>
+                          <td colSpan={5} style={{ padding: 0, borderBottom: `1px solid ${C.border}`, background: C.bg }}>
+                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                              <thead>
+                                <tr>
+                                  {['Entity', 'Product', 'HSN', 'Unit', 'Opening Qty', 'Rate', 'Value'].map((h, i) => (
+                                    <th key={i} style={{
+                                      padding: '6px 12px 6px 32px', textAlign: i >= 4 ? 'right' : 'left',
+                                      fontSize: '10px', fontWeight: 700, color: C.textMuted,
+                                      textTransform: 'uppercase', letterSpacing: '0.04em',
+                                      borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap',
+                                    }}>{h}</th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {items.map(it => (
+                                  <tr key={`${it.entity_id}__${it.product_id}`}>
+                                    <td style={{ padding: '7px 12px 7px 32px' }}>{it.entity?.short_name || it.entity?.name}</td>
+                                    <td style={{ padding: '7px 12px' }}>{it.product?.name}</td>
+                                    <td style={{ padding: '7px 12px', fontFamily: 'monospace', color: C.textMuted }}>{it.product?.hsn_code}</td>
+                                    <td style={{ padding: '7px 12px' }}>{it.product?.unit}</td>
+                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.opening_qty).toLocaleString('en-IN')}</td>
+                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{formatINR(it.rate)}</td>
+                                    <td style={{ padding: '7px 12px', textAlign: 'right', fontWeight: 600 }}>{formatINR(toNum(it.opening_qty) * toNum(it.rate))}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  )
+                })}
+              </tbody>
+            </table>
           </div>
         </Card>
       )}
@@ -666,10 +769,10 @@ function Products() {
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data', type: 'error' }) }
     const delim = detectDelimiter(lines[0])
-    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    const header = parseCSVLine(lines[0], delim).map(h => h.toLowerCase())
     let added = 0, errors = []
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delim).map(c => c.trim())
+      const cols = parseCSVLine(lines[i], delim)
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       if (!row.name || !row.hsn_code) { errors.push(`Row ${i+1}: name and hsn_code required`); continue }
@@ -757,7 +860,7 @@ function Products() {
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('products')}>↓ Download Template</Btn>
             </div>
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>name,hsn_code,gst_rate,unit,default_rate,description,category</code><br />
-            Upserts on <code>name</code> — existing products will be updated.
+            Upserts on <code>name</code> — existing products will be updated. If a name or description contains a comma, wrap that field in double quotes, e.g. <code>"Steel Tea, Coffee &amp; Sugar Container Set, 3 Pieces"</code>.
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
