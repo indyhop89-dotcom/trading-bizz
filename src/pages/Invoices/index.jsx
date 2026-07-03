@@ -11,6 +11,7 @@ import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/d
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV } from '../../utils/csvTemplate'
+import { useAuth } from '../../hooks/useAuth'
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
 const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
@@ -59,6 +60,12 @@ async function writeStockMovements(invoice, lines) {
 // ─── Invoice List ─────────────────────────────────────────────────────────────
 function InvoiceList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [invoices, setInvoices] = useState([])
   const [entities, setEntities] = useState([])
   const [loading, setLoading]   = useState(true)
@@ -177,7 +184,30 @@ function InvoiceList() {
   const totalOutstanding = filtered.reduce((s, i) => s + (i.outstanding_amount || 0), 0)
   const totalAmount      = filtered.reduce((s, i) => s + (i.total_amount || 0), 0)
 
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(i => i.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('invoices').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} invoice(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   const columns = [
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: i => <input type='checkbox' checked={selected.has(i.id)}
+        onChange={() => toggleSelect(i.id)} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.',      render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'Invoice No', render: i => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{i.invoice_no || '—'}</span> },
     { label: 'Type',    render: i => <Badge status={i.invoice_type} label={i.invoice_type === 'sales' ? 'Sales' : 'Purchase'} /> },
@@ -239,6 +269,16 @@ function InvoiceList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
       </div>
 
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fdeeee', border: '1px solid #f0c4c4', borderRadius: '6px', padding: '10px 14px', marginBottom: '14px' }}>
+          <span style={{ fontSize: '13px', color: '#8a2f2f' }}>{selected.size} invoice{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -246,6 +286,10 @@ function InvoiceList() {
               emptyState={<EmptyState icon='🧾' title='No invoices' action={<Btn onClick={() => navigate('/invoices/new')}>+ New Invoice</Btn>} />} />
         }
       </Card>
+
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Invoices' message={`Delete ${selected.size} selected invoice(s)? This cannot be undone.`} danger />
+
 
       {/* CSV Upload Modal */}
       <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Invoices' width={680}>

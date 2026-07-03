@@ -11,6 +11,7 @@ import { fmtDate, today, currentFYLabel, parseFlexibleDate } from '../../utils/d
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { useAuth } from '../../hooks/useAuth'
 
 const PO_STATUSES = ['open', 'partial', 'completed', 'cancelled']
 
@@ -34,6 +35,12 @@ async function resolveFY() {
 // ─── PO List ──────────────────────────────────────────────────────────────────
 function POList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [pos, setPOs]       = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders] = useState([])
@@ -229,7 +236,30 @@ function POList() {
     return ms && mst
   })
 
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(p => p.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('purchase_orders').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} PO(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   const columns = [
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: p => <input type='checkbox' checked={selected.has(p.id)}
+        onChange={() => toggleSelect(p.id)} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.',   render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'PO No',   render: p => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{p.po_no || '—'}</span> },
     { label: 'Buyer',   render: p => <span style={{ fontSize: '12px' }}>{p.buyer?.short_name || p.buyer?.name}</span> },
@@ -267,6 +297,16 @@ function POList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
       </div>
 
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fdeeee', border: '1px solid #f0c4c4', borderRadius: '6px', padding: '10px 14px', marginBottom: '14px' }}>
+          <span style={{ fontSize: '13px', color: '#8a2f2f' }}>{selected.size} PO{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -274,6 +314,9 @@ function POList() {
               emptyState={<EmptyState icon='📋' title='No purchase orders' action={<Btn onClick={() => setModalOpen(true)}>+ New PO</Btn>} />} />
         }
       </Card>
+
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Purchase Orders' message={`Delete ${selected.size} selected PO(s)? This cannot be undone.`} danger />
 
       {/* CSV Upload Modal */}
       <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Purchase Orders' width={680}>

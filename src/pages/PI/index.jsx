@@ -12,6 +12,7 @@ import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { useAuth } from '../../hooks/useAuth'
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 
@@ -48,6 +49,15 @@ async function writeStockMovementsForPI(pi, lines) {
 // ─── PI List ──────────────────────────────────────────────────────────────────
 function PIList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to the 'master' role, which is the only
+  // elevated/full-access role in this app's schema (ROLES = master, entity_user,
+  // viewer — see Settings). This matches the existing `isAdmin` convention used
+  // in Payments (`profile?.role === 'master'`).
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [pis, setPIs]           = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
@@ -306,7 +316,30 @@ function PIList() {
     load()
   }
 
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(p => p.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('proforma_invoices').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} PI(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   const columns = [
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: p => <input type='checkbox' checked={selected.has(p.id)}
+        onChange={() => toggleSelect(p.id)} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.', render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'PI No', render: p => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{p.pi_no || '—'}</span> },
     { label: 'From → To', render: p => <span style={{ fontSize: '12px' }}>{p.from_entity?.short_name || p.from_entity?.name} → {p.to_entity?.short_name || p.to_entity?.name}</span> },
@@ -357,6 +390,16 @@ function PIList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
       </div>
 
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fdeeee', border: '1px solid #f0c4c4', borderRadius: '6px', padding: '10px 14px', marginBottom: '14px' }}>
+          <span style={{ fontSize: '13px', color: '#8a2f2f' }}>{selected.size} PI{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -364,6 +407,9 @@ function PIList() {
               emptyState={<EmptyState icon='📄' title='No PIs yet' action={<Btn onClick={() => setModalOpen(true)}>+ New PI</Btn>} />} />
         }
       </Card>
+
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Proforma Invoices' message={`Delete ${selected.size} selected PI(s)? This cannot be undone.`} danger />
 
       {/* CSV Upload Modal */}
       <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Proforma Invoices' width={680}>
