@@ -33,6 +33,7 @@ const EMPTY_FORM = {
   einvoice_irn: '', einvoice_ack_no: '', einvoice_ack_date: '',
   tds_amount: 0, tcs_amount: 0,
   notes: '',
+  invoice_no: '', // CHANGED: optional manual invoice number — blank auto-generates via next_inv_no()
 }
 
 
@@ -368,9 +369,27 @@ function NewInvoice() {
     const totals = computeTotals(computedLines)
     setSaving(true)
 
+    // CHANGED: invoice_no and financial_year_id are NOT NULL columns with no
+    // DB default — this insert previously omitted both entirely, so every
+    // manually-created invoice would have failed on that constraint. This
+    // mirrors PI/PO: resolve FY, then use the typed invoice_no or generate one.
+    const fy = await resolveFY()
+    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
+    let invoiceNo = (form.invoice_no || '').trim()
+    if (invoiceNo) {
+      const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).limit(1)
+      if (dup?.length) { setSaving(false); return setToast({ message: `Invoice number "${invoiceNo}" is already in use`, type: 'error' }) }
+    } else {
+      const { data: generated, error: noErr } = await supabase.rpc('next_inv_no', { ent_id: form.seller_entity_id, fy_id: fy.id })
+      if (noErr) { setSaving(false); return setToast({ message: 'Could not generate invoice number: '+noErr.message, type: 'error' }) }
+      invoiceNo = generated
+    }
+
     const payload = {
       ...form,
       ...totals,
+      invoice_no: invoiceNo,
+      financial_year_id: fy.id,
       outstanding_amount: totals.total_amount,
       paid_amount: 0,
     }
@@ -472,6 +491,9 @@ function NewInvoice() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginTop: '12px' }}>
             <FormRow label='Invoice Date' required>
               <Input type='date' value={form.invoice_date} onChange={e => setF('invoice_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='Invoice Number' hint='Leave blank to auto-generate'>
+              <Input value={form.invoice_no} onChange={e => setF('invoice_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Due Date'>
               <Input type='date' value={form.due_date} onChange={e => setF('due_date', e.target.value)} />

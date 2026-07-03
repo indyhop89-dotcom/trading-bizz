@@ -20,6 +20,7 @@ const EMPTY_FORM = {
   order_id: '', order_leg_id: '', pi_id: '',
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
+  po_no: '', // CHANGED: optional manual PO number — blank auto-generates via next_po_no()
 }
 
 
@@ -111,8 +112,16 @@ function POList() {
     setSaving(true)
     const fy = await resolveFY()
     if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
-    const { data: poNo, error: noErr } = await supabase.rpc('next_po_no', { ent_id: form.buyer_entity_id, fy_id: fy.id })
-    if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PO number: '+noErr.message, type: 'error' }) }
+    // CHANGED: use the manually-entered PO number if supplied, else auto-generate.
+    let poNo = (form.po_no || '').trim()
+    if (poNo) {
+      const dup = pos.find(p => p.po_no?.toLowerCase() === poNo.toLowerCase())
+      if (dup) { setSaving(false); return setToast({ message: `PO number "${poNo}" is already in use`, type: 'error' }) }
+    } else {
+      const { data: generated, error: noErr } = await supabase.rpc('next_po_no', { ent_id: form.buyer_entity_id, fy_id: fy.id })
+      if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PO number: '+noErr.message, type: 'error' }) }
+      poNo = generated
+    }
     const payload = { ...form, ...totals, po_no: poNo, financial_year_id: fy.id }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
@@ -302,6 +311,9 @@ function POList() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
             <FormRow label='PO Date' required>
               <Input type='date' value={form.po_date} onChange={e => setF('po_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='PO Number' hint='Leave blank to auto-generate'>
+              <Input value={form.po_no} onChange={e => setF('po_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Delivery Date'>
               <Input type='date' value={form.delivery_date} onChange={e => setF('delivery_date', e.target.value)} />
