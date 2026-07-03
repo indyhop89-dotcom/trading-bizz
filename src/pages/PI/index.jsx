@@ -146,7 +146,11 @@ function PIList() {
       if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PI number: '+noErr.message, type: 'error' }) }
       piNo = generated
     }
-    const payload = { ...form, ...totals, pi_no: piNo, financial_year_id: fy.id }
+    // CHANGED: financial_year_id does NOT exist on the live proforma_invoices
+    // table (confirmed via information_schema — only pi_no, no FK column at
+    // all). fy.id is still needed as the fy_id param for next_pi_no(), just
+    // not stored on the row.
+    const payload = { ...form, ...totals, pi_no: piNo }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
     if (!payload.valid_upto)   delete payload.valid_upto
@@ -249,11 +253,10 @@ function PIList() {
       const validUpto = meta.valid_upto ? parseFlexibleDate(meta.valid_upto) : null
       if (meta.valid_upto && !validUpto) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: valid_upto "${meta.valid_upto}" is not a valid date`); continue }
 
-      // CHANGED: pi_no and financial_year_id are NOT NULL columns with no DB
-      // default — previously omitted here entirely, so every CSV-created PI
-      // would have failed on that constraint. financial_year_id is always
-      // required; pi_no is now either taken from the CSV (if supplied) or
-      // generated via next_pi_no(), same as the manual single-PI create flow.
+      // CHANGED: pi_no is used from the CSV if supplied, else generated via
+      // next_pi_no(). fy.id is passed as the RPC's fy_id param only — it is
+      // NOT stored on the row: financial_year_id does not exist as a column
+      // on the live proforma_invoices table (confirmed via information_schema).
       const fy = await resolveFY()
       if (!fy) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: no financial year found`); continue }
 
@@ -300,7 +303,7 @@ function PIList() {
       const { data: pi, error: piErr } = await supabase.from('proforma_invoices').insert({
         pi_date: piDate, from_entity_id: fromE.id, to_entity_id: toE.id,
         is_interstate: interstate, valid_upto: validUpto,
-        notes: meta.notes || null, status: 'draft', pi_no: piNo, financial_year_id: fy.id, ...totals,
+        notes: meta.notes || null, status: 'draft', pi_no: piNo, ...totals,
       }).select().single()
 
       if (piErr) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: ${piErr.message}`); continue }

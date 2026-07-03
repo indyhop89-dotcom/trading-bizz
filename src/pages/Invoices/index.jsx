@@ -98,8 +98,13 @@ function InvoiceList() {
   useEffect(() => { load() }, [load])
 
   // Format: invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no
-  // CHANGED: invoice_no and financial_year_id were previously never set on CSV-created
-  // invoices at all — invoices.invoice_no and financial_year_id are NOT NULL with no
+  // CHANGED: invoice_no was previously never set on CSV-created invoices at
+  // all — not a hard insert failure (invoice_no is nullable on the live
+  // schema, confirmed via information_schema), but every CSV-created invoice
+  // was silently getting no invoice number whatsoever. This now generates
+  // one via next_inv_no() or uses a supplied value, same as PI/PO.
+  // NOTE: financial_year_id does NOT exist on the live invoices table either
+  // (confirmed) — fy.id is only used as the RPC's fy_id parameter, never stored.
   // DB default, so every CSV upload here would have failed outright. This adds the
   // same FY-resolve + next_inv_no() generation the other modules use, plus lets you
   // supply your own invoice_no per row (optional — blank auto-generates).
@@ -134,9 +139,10 @@ function InvoiceList() {
       const dueDate = meta.due_date ? parseFlexibleDate(meta.due_date) : null
       if (meta.due_date && !dueDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: due_date "${meta.due_date}" is not a valid date`); continue }
 
-      // CHANGED: financial_year_id always resolved; invoice_no taken from the
-      // CSV if supplied, else generated via next_inv_no() keyed to the seller
-      // (the entity issuing the invoice — mirrors PI's use of from_entity).
+      // CHANGED: invoice_no taken from the CSV if supplied, else generated
+      // via next_inv_no() keyed to the seller (the entity issuing the
+      // invoice — mirrors PI's use of from_entity). fy.id is only used as
+      // the RPC's fy_id param — financial_year_id is not a real column.
       const fy = await resolveFY()
       if (!fy) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: no financial year found`); continue }
       let invoiceNo = (meta.invoice_no || '').trim()
@@ -158,7 +164,7 @@ function InvoiceList() {
         return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
       const totals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
-      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, financial_year_id: fy.id, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
+      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
       if (invErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: ${invErr.message}`); continue }
       await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
       created++
@@ -413,10 +419,12 @@ function NewInvoice() {
     const totals = computeTotals(computedLines)
     setSaving(true)
 
-    // CHANGED: invoice_no and financial_year_id are NOT NULL columns with no
-    // DB default — this insert previously omitted both entirely, so every
-    // manually-created invoice would have failed on that constraint. This
-    // mirrors PI/PO: resolve FY, then use the typed invoice_no or generate one.
+    // CHANGED: invoice_no was previously never set here at all (not a hard
+    // constraint failure — invoice_no is nullable on the live schema — but
+    // every manually-created invoice was getting no invoice number). This
+    // mirrors PI/PO: resolve FY (needed as the RPC param only), then use the
+    // typed invoice_no or generate one. financial_year_id is not a real
+    // column on invoices (confirmed via information_schema) — not stored.
     const fy = await resolveFY()
     if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
     let invoiceNo = (form.invoice_no || '').trim()
@@ -433,7 +441,6 @@ function NewInvoice() {
       ...form,
       ...totals,
       invoice_no: invoiceNo,
-      financial_year_id: fy.id,
       outstanding_amount: totals.total_amount,
       paid_amount: 0,
     }

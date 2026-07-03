@@ -129,7 +129,10 @@ function POList() {
       if (noErr) { setSaving(false); return setToast({ message: 'Could not generate PO number: '+noErr.message, type: 'error' }) }
       poNo = generated
     }
-    const payload = { ...form, ...totals, po_no: poNo, financial_year_id: fy.id }
+    // CHANGED: financial_year_id does NOT exist on the live purchase_orders
+    // table (confirmed via information_schema). fy.id is only needed as the
+    // fy_id param for next_po_no(), not stored on the row.
+    const payload = { ...form, ...totals, po_no: poNo }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
     if (!payload.pi_id)        delete payload.pi_id
@@ -190,9 +193,10 @@ function POList() {
       const deliveryDate = meta.delivery_date ? parseFlexibleDate(meta.delivery_date) : null
       if (meta.delivery_date && !deliveryDate) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: delivery_date "${meta.delivery_date}" is not a valid date`); continue }
 
-      // CHANGED: po_no and financial_year_id are NOT NULL with no DB default —
-      // financial_year_id is always resolved; po_no is taken from the CSV if
-      // supplied, otherwise generated via next_po_no() (same as manual create).
+      // CHANGED: po_no taken from the CSV if supplied, else generated via
+      // next_po_no(). fy.id is only used as the RPC's fy_id param —
+      // financial_year_id is not a real column on purchase_orders (confirmed
+      // via information_schema).
       const fy = await resolveFY()
       if (!fy) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: no financial year found`); continue }
       let poNo = (meta.po_no || '').trim()
@@ -214,7 +218,7 @@ function POList() {
         return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
       const totals = poLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
-      const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, financial_year_id: fy.id, ...totals }).select().single()
+      const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, ...totals }).select().single()
       if (poErr) { errors.push(`PO ${meta.po_date}: ${poErr.message}`); continue }
       await supabase.from('purchase_order_lines').insert(poLines.map(l => ({ ...l, po_id: po.id })))
       created++
