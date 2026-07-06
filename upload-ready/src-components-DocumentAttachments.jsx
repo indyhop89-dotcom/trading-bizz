@@ -258,32 +258,53 @@ export default function DocumentAttachments({
             </div>
 
             {/* Actions */}
+            {/* CHANGED: View/Download now go through authenticated fetch+blob
+                (see utils/drive.js) since the GET endpoint requires a
+                session token that a plain <a href> can't send. */}
             <div style={{ display: 'flex', gap: '5px', flexShrink: 0 }}>
-              <a
-                href={getDriveViewUrl(doc.drive_file_id, doc.drive_url)}
-                target='_blank'
-                rel='noopener noreferrer'
+              <button
+                onClick={async () => {
+                  try {
+                    const url = await getDriveViewUrl(doc.drive_file_id, doc.drive_url)
+                    window.open(url, '_blank', 'noopener,noreferrer')
+                    setTimeout(() => URL.revokeObjectURL(url), 60000)
+                  } catch (err) {
+                    setToast({ message: err.message || 'Could not open file', type: 'error' })
+                  }
+                }}
                 style={{
                   padding: '4px 11px', borderRadius: '4px',
-                  fontSize: '12px', fontWeight: 600, textDecoration: 'none',
+                  fontSize: '12px', fontWeight: 600,
                   background: '#e8f0f3', color: '#1a4a6a',
-                  border: '1px solid #c0d8e8', whiteSpace: 'nowrap',
+                  border: '1px solid #c0d8e8', whiteSpace: 'nowrap', cursor: 'pointer', fontFamily: 'inherit',
                 }}
               >
                 View
-              </a>
-              <a
-                href={getDriveDownloadUrl(doc.drive_file_id, doc.drive_url)}
-                download={doc.file_name}
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    const url = await getDriveDownloadUrl(doc.drive_file_id, doc.drive_url)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = doc.file_name || 'download'
+                    document.body.appendChild(a)
+                    a.click()
+                    a.remove()
+                    setTimeout(() => URL.revokeObjectURL(url), 60000)
+                  } catch (err) {
+                    setToast({ message: err.message || 'Could not download file', type: 'error' })
+                  }
+                }}
                 style={{
                   padding: '4px 10px', borderRadius: '4px',
-                  fontSize: '12px', fontWeight: 600, textDecoration: 'none',
+                  fontSize: '12px', fontWeight: 600,
                   background: '#e8f3ec', color: '#1a5c30',
-                  border: '1px solid #b8dfc8', whiteSpace: 'nowrap',
+                  border: '1px solid #b8dfc8', whiteSpace: 'nowrap', cursor: 'pointer', fontFamily: 'inherit',
                 }}
               >
                 ↓
-              </a>
+              </button>
               <button
                 onClick={() => setConfirmDelete(doc)}
                 style={{

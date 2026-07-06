@@ -79,12 +79,26 @@ function ModuleCard({ label, desc, icon, path, color, onClick }) {
   )
 }
 
+// CHANGED: groups raw notification_type values into a handful of at-a-glance
+// buckets for the dashboard panel — the Notifications page still shows every
+// type individually, this is just a coarser summary for "what needs my
+// attention right now" without having to click through.
+const ALERT_CATEGORIES = [
+  { key: 'stock',      label: 'Stock & Compliance', color: RAW.danger,
+    types: ['stock_shortfall', 'missing_product_mapping', 'negative_stock_risk', 'invalid_date_mismatch', 'duplicate_invoice_number', 'entity_access_mismatch', 'invoice_cancelled_after_eway'] },
+  { key: 'payments',   label: 'Payments Due',        color: RAW.warning,
+    types: ['payment_due', 'overdue_invoice'] },
+  { key: 'financing',  label: 'Financing',           color: RAW.accent,
+    types: ['bill_discounting_due'] },
+]
+
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 export default function Dashboard() {
   const navigate = useNavigate()
   const { user } = useAuth()
   const [data, setData]       = useState(null)
   const [loading, setLoading] = useState(true)
+  const [alertSummary, setAlertSummary] = useState(null)
 
   useEffect(() => {
     async function load() {
@@ -101,7 +115,10 @@ export default function Dashboard() {
         supabase.from('payments').select('id,payment_type,net_amount,payment_date').eq('is_deleted', false),
         supabase.from('orders').select('id,status').eq('is_deleted', false),
         supabase.from('expenses').select('id,status,total_amount').eq('is_deleted', false),
-        supabase.from('bill_discounting').select('id,status,outstanding_amount').eq('is_deleted', false),
+        // CHANGED: was querying 'bill_discounting' — a table from an old
+        // migration the app has never actually written real events to (see
+        // 013_missing_payment_bank_tables.sql). This always returned 0/empty.
+        supabase.from('bill_discounting_events').select('id,status,outstanding_amount').eq('is_deleted', false),
         supabase.from('invoices')
           .select('id,invoice_no,invoice_type,status,total_amount,outstanding_amount,invoice_date,seller:seller_entity_id(name,short_name),buyer:buyer_entity_id(name,short_name)')
           .eq('is_deleted', false).order('invoice_date', { ascending: false }).limit(8),
@@ -123,7 +140,22 @@ export default function Dashboard() {
       setLoading(false)
     }
     load()
-    if (user?.id) generateNotifications(user.id)
+    if (user?.id) {
+      generateNotifications(user.id).then(async () => {
+        const { data: notifs } = await supabase
+          .from('notifications')
+          .select('notification_type')
+          .eq('user_id', user.id)
+          .eq('is_read', false)
+          .eq('is_dismissed', false)
+        const counts = {}
+        for (const n of (notifs || [])) counts[n.notification_type] = (counts[n.notification_type] || 0) + 1
+        const categories = ALERT_CATEGORIES
+          .map(cat => ({ ...cat, count: cat.types.reduce((s, t) => s + (counts[t] || 0), 0) }))
+          .filter(cat => cat.count > 0)
+        setAlertSummary({ categories, total: categories.reduce((s, c) => s + c.count, 0) })
+      })
+    }
   }, [user])
 
   if (loading) return (
@@ -145,6 +177,33 @@ export default function Dashboard() {
           Vananam Group — Live overview
         </p>
       </div>
+
+      {/* ── Alerts & Insights ── */}
+      {alertSummary && alertSummary.total > 0 && (
+        <div
+          onClick={() => navigate('/notifications')}
+          style={{
+            display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap',
+            padding: '12px 16px', marginBottom: '18px', cursor: 'pointer',
+            background: 'var(--bg)', border: `1px solid ${RAW.warning}55`, borderRadius: '8px',
+          }}
+        >
+          <span style={{ fontSize: '13px', fontWeight: 700, color: 'var(--text)' }}>
+            🔔 {alertSummary.total} thing{alertSummary.total === 1 ? '' : 's'} need{alertSummary.total === 1 ? 's' : ''} attention
+          </span>
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+            {alertSummary.categories.map(cat => (
+              <span key={cat.key} style={{
+                fontSize: '11px', fontWeight: 700, padding: '3px 9px', borderRadius: '999px',
+                background: `${cat.color}18`, color: cat.color,
+              }}>
+                {cat.label} · {cat.count}
+              </span>
+            ))}
+          </div>
+          <span style={{ marginLeft: 'auto', fontSize: '11px', color: 'var(--text-muted)' }}>View all →</span>
+        </div>
+      )}
 
       {/* ── KPI strip ── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px,1fr))', gap: '10px', marginBottom: '28px' }}>

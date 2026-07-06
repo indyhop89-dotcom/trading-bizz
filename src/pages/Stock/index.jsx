@@ -6,47 +6,32 @@ import {
 } from '../../components/UI/index'
 import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
-import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
+// CHANGED: reuse the existing, tested actual-stock logic (already powers
+// LineItemsEditor's stockMap) instead of duplicating it here.
+import { fetchStockMovementData, buildActualStockMap } from '../../utils/stock'
+import { cleanProductName, productMatchKey } from '../../utils/products'
+// CHANGED: needed to know the current user's role/id for entity-access scoping
+import { useAuth } from '../../hooks/useAuth'
 
 const UNITS = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
 const TABS  = ['Opening Stock', 'Stock Position', 'Products']
-
-// Quote-aware CSV line splitter — plain `line.split(delim)` breaks the moment a
-// field (e.g. a product name or description) contains the delimiter character
-// inside quotes, like `"Steel Tea, Coffee & Sugar Container Set, 3 Pieces"`.
-// This walks the line char-by-char, only splitting on `delim` when outside a
-// quoted span, and un-escapes doubled quotes (""->") per standard CSV rules.
-function parseCSVLine(line, delim) {
-  const out = []
-  let cur = ''
-  let inQuotes = false
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]
-    if (inQuotes) {
-      if (ch === '"') {
-        if (line[i + 1] === '"') { cur += '"'; i++ }
-        else inQuotes = false
-      } else {
-        cur += ch
-      }
-    } else if (ch === '"') {
-      inQuotes = true
-    } else if (ch === delim) {
-      out.push(cur.trim())
-      cur = ''
-    } else {
-      cur += ch
-    }
-  }
-  out.push(cur.trim())
-  return out
-}
+// CHANGED: parseCSVLine moved to utils/csvTemplate.js so PI/PO/Invoices CSV
+// upload can reuse the same quote-aware parsing — it was previously private
+// to this file only.
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 function shortfallBadge(planned) {
   if (planned < 0) return <span style={{ fontSize: '11px', fontWeight: 700, background: '#f0e8e8', color: '#8a2020', padding: '2px 8px', borderRadius: '4px' }}>⚠ Shortfall</span>
   if (planned === 0) return <span style={{ fontSize: '11px', fontWeight: 700, background: '#fff3cc', color: '#7a5000', padding: '2px 8px', borderRadius: '4px' }}>Zero</span>
   return <span style={{ fontSize: '11px', fontWeight: 700, background: '#e8f3ec', color: '#1a5c30', padding: '2px 8px', borderRadius: '4px' }}>OK</span>
+}
+
+// CHANGED: separate indicator from the Planned/PI shortfall badge above —
+// this one fires when actual (invoice-based) stock has gone negative, i.e.
+// an entity has billed out more than it actually had on hand.
+function billedBeyondStockBadge() {
+  return <span style={{ fontSize: '11px', fontWeight: 700, background: '#fbe4e4', color: '#a31414', padding: '2px 8px', borderRadius: '4px' }}>🔴 Billed beyond stock</span>
 }
 
 // ─── Opening Stock Tab ────────────────────────────────────────────────────────
@@ -141,10 +126,16 @@ function OpeningStock() {
   // CHANGED: category is optional — only used when auto-creating a new product;
   // it does not update the category of a product that already exists.
   // Products not found by exact name are auto-created from the row's hsn_code/gst_rate/unit/rate.
-  // Rows matching an entity+product+fy that already exists are skipped (not re-added/updated) —
-  // re-running the same file only adds genuinely new rows.
+  // CHANGED: rows are now UPSERTED on (entity_id, product_id, financial_year_id) —
+  // re-uploading updates the qty/rate/etc. of an existing opening-stock row
+  // instead of failing with a duplicate-key error. (The old code tried to skip
+  // existing rows by comparing against the currently-loaded list, but that list
+  // is capped at Supabase's default 1000 rows, so anything past 1000 slipped
+  // through and hit the DB unique constraint.) This makes "re-upload to fix the
+  // numbers" work reliably. Duplicate keys WITHIN one file are collapsed too
+  // (last row wins), since a single upsert can't touch the same key twice.
   // Runs in batches (not one row at a time) so large files (1000+ rows) don't take minutes,
-  // and every row is accounted for in the result: added, skipped (with reason), or errored (with reason).
+  // and every row is accounted for in the result.
   async function handleCSV() {
     setCsvSaving(true)
     setCsvProgress('Parsing file…')
@@ -174,39 +165,64 @@ function OpeningStock() {
 
     // Phase 2 — bulk-create any missing products in one request
     setCsvProgress('Checking products…')
-    const productList = [...products]
-    const findProduct = name => productList.find(p => norm(p.name).toLowerCase() === name.toLowerCase())
-    const missingNames = [...new Set(parsed.filter(p => !findProduct(p.productName)).map(p => p.productName))]
+    // CHANGED: match on name + HSN + rate + GST together, not name alone.
+    // A single source file can have several genuinely different products
+    // sharing one generic name (e.g. "Embroidered Cotton Cushion Cover" at 7
+    // different rates = 7 different designs) — matching by name only would
+    // silently merge them and lose real stock quantity. Only collapse to the
+    // same product when ALL FOUR fields match (per product-owner decision);
+    // the normalized name key alone still catches the trailing-')' junk cases.
+    //
+    // CHANGED: uses a precomputed Map (key -> product) instead of an
+    // array .find() re-run per row. With ~1000 products x ~1100 rows, a
+    // linear scan recomputing productMatchKey for every candidate on every
+    // row means millions of string/regex operations — slow enough on a large
+    // file that the upload looked hung. A Map lookup is O(1) per row.
+    const productMap = new Map()
+    for (const p of products) {
+      productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+    }
+    const rowMatchKey = row => productMatchKey({ name: row.product, hsn_code: row.hsn_code, rate: row.rate, gst_rate: row.gst_rate })
+    const findProduct = row => productMap.get(rowMatchKey(row))
+    const missingRowKeys = new Set()
+    const missingRows = []
+    for (const p of parsed) {
+      const k = rowMatchKey(p.row)
+      if (productMap.has(k) || missingRowKeys.has(k)) continue
+      missingRowKeys.add(k)
+      missingRows.push(p)
+    }
     let productsCreated = 0
     const createdProductNames = []
-    if (missingNames.length > 0) {
-      const payloads = missingNames.map(name => {
-        const src = parsed.find(p => p.productName === name).row
-        return { name, hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, category: src.category || null, is_active: true }
-      })
+    if (missingRows.length > 0) {
+      const payloads = missingRows.map(p => ({ name: cleanProductName(p.productName), hsn_code: p.row.hsn_code || null, gst_rate: toNum(p.row.gst_rate) || 18, unit: p.row.unit || 'Nos', default_rate: toNum(p.row.rate) || null, category: p.row.category || null, is_active: true }))
       const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
       if (pErr) {
-        errors.push(`Could not auto-create ${missingNames.length} new product(s) — ${pErr.message}`)
+        errors.push(`Could not auto-create ${missingRows.length} new product(s) — ${pErr.message}`)
       } else {
-        productList.push(...(newProducts || []))
+        for (const p of (newProducts || [])) {
+          productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+        }
         productsCreated = (newProducts || []).length
         createdProductNames.push(...(newProducts || []).map(p => p.name))
       }
     }
 
-    // Phase 3 — resolve each row's product, skip anything that already exists (in DB or earlier in this same file)
-    setCsvProgress('Checking for duplicates…')
-    const existingKeys = new Set(rows.map(r => `${r.entity_id}__${r.product_id}__${r.financial_year_id}`))
-    const toInsert = []
+    // Phase 3 — resolve each row's product; collapse duplicate keys within the
+    // file (last row wins) since one upsert can't touch the same key twice.
+    // Note: two rows with the same product NAME but different HSN/rate/GST
+    // resolve to different products here, so they land in different
+    // entity+product+fy keys and do NOT collapse into each other.
+    setCsvProgress('Preparing rows…')
+    const byKey = new Map()
     const skippedItems = []
     for (const p of parsed) {
-      const product = findProduct(p.productName)
+      const product = findProduct(p.row)
       if (!product) { errors.push(`Row ${p.rowNum}: product "${p.productName}" could not be created`); continue }
       const label = `${p.row.entity} — ${p.productName} — ${p.row.fy}`
       const key = `${p.entity.id}__${product.id}__${p.fy.id}`
-      if (existingKeys.has(key)) { skippedItems.push(`${label} — already exists`); continue }
-      existingKeys.add(key)
-      toInsert.push({
+      if (byKey.has(key)) skippedItems.push(`${label} — listed more than once in this file; last value used`)
+      byKey.set(key, {
         entity_id: p.entity.id, product_id: product.id, financial_year_id: p.fy.id,
         qty: toNum(p.row.qty), unit: p.row.unit || product.unit || null, rate: toNum(p.row.rate),
         hsn_code: p.row.hsn_code || product.hsn_code || null,
@@ -215,24 +231,27 @@ function OpeningStock() {
         _label: label,
       })
     }
+    const toUpsert = [...byKey.values()]
 
-    // Phase 4 — insert in batches; if a batch fails, retry that batch row-by-row so we
-    // can attribute the error to the specific row instead of losing the whole chunk.
+    // Phase 4 — UPSERT in batches on the (entity, product, fy) unique key so an
+    // existing row is updated rather than throwing a duplicate-key error. If a
+    // batch fails, retry row-by-row to attribute the error to the specific row.
     let added = 0
     const addedItems = []
+    const CONFLICT = 'entity_id,product_id,financial_year_id'
     const CHUNK = 200
-    for (let c = 0; c < toInsert.length; c += CHUNK) {
-      const chunk = toInsert.slice(c, c + CHUNK)
-      setCsvProgress(`Uploading rows ${c + 1}–${Math.min(c + CHUNK, toInsert.length)} of ${toInsert.length}…`)
+    for (let c = 0; c < toUpsert.length; c += CHUNK) {
+      const chunk = toUpsert.slice(c, c + CHUNK)
+      setCsvProgress(`Uploading rows ${c + 1}–${Math.min(c + CHUNK, toUpsert.length)} of ${toUpsert.length}…`)
       const payload = chunk.map(({ _label, ...rest }) => rest)
-      const { error } = await supabase.from('stock_opening_balance').insert(payload)
+      const { error } = await supabase.from('stock_opening_balance').upsert(payload, { onConflict: CONFLICT })
       if (!error) {
         added += chunk.length
         addedItems.push(...chunk.map(r => r._label))
       } else {
         for (const r of chunk) {
           const { _label, ...rest } = r
-          const { error: rowErr } = await supabase.from('stock_opening_balance').insert(rest)
+          const { error: rowErr } = await supabase.from('stock_opening_balance').upsert(rest, { onConflict: CONFLICT })
           if (rowErr) errors.push(`${_label}: ${rowErr.message}`)
           else { added++; addedItems.push(_label) }
         }
@@ -386,8 +405,8 @@ function OpeningStock() {
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>
-                {csvResult.totalDataRows} rows in file — {csvResult.added} added,
-                {` `}{csvResult.skipped} skipped, {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}.
+                {csvResult.totalDataRows} rows in file — {csvResult.added} added/updated,
+                {` `}{csvResult.skipped} in-file duplicate{csvResult.skipped === 1 ? '' : 's'}, {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}.
                 {csvResult.productsCreated > 0 ? ` ${csvResult.productsCreated} new product${csvResult.productsCreated === 1 ? '' : 's'} auto-created.` : ''}
               </strong>
               {csvResult.added + csvResult.skipped + csvResult.errors.length !== csvResult.totalDataRows && (
@@ -446,12 +465,20 @@ function StockPosition() {
   const [position, setPosition] = useState([])
   const [entities, setEntities] = useState([])
   const [fys, setFys]           = useState([])
+  // CHANGED: needed to label entity+product combos that only exist because of
+  // invoice activity (no opening_stock row this FY) with product name/HSN/unit.
+  const [products, setProducts] = useState([])
   const [entityFilter, setEntityFilter] = useState('')
   const [fyFilter, setFyFilter]         = useState('')
   const [loading, setLoading]   = useState(false)
   // CHANGED: category filter + group-by-category summary toggle
   const [categoryFilter, setCategoryFilter] = useState('')
   const [groupByCategory, setGroupByCategory] = useState(false)
+  // CHANGED: click-to-filter from the Shortfalls / Billed Beyond Stock StatCards
+  const [statusFilter, setStatusFilter] = useState(null) // null | 'shortfall' | 'billed_beyond'
+  // CHANGED: tracks invoice lines with no product_id (known CSV-upload data
+  // gap) so we can warn about them instead of showing blank garbage rows
+  const [dataIssues, setDataIssues] = useState({ unresolvedLines: 0, unresolvedQty: 0 })
   const [expandedCategories, setExpandedCategories] = useState(() => new Set())
   function toggleCategory(cat) {
     setExpandedCategories(prev => {
@@ -461,16 +488,45 @@ function StockPosition() {
     })
   }
 
+  // CHANGED: current user's role/id decide which entities they may even see
+  const { profile } = useAuth()
+  const isMaster = profile?.role === 'master'
+
   useEffect(() => {
-    Promise.all([
-      supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('financial_years').select('*').order('start_date', { ascending: false }),
-    ]).then(([{ data: es }, { data: fyData }]) => {
-      setEntities(es || [])
+    if (!profile) return // wait until we know the role before deciding what to fetch
+    async function loadFilters() {
+      const [{ data: fyData }, { data: ps }] = await Promise.all([
+        supabase.from('financial_years').select('*').order('start_date', { ascending: false }),
+        // CHANGED: product lookup for actual-stock-only rows (see below)
+        supabase.from('products').select('id,name,hsn_code,unit,category'),
+      ])
       setFys(fyData || [])
+      setProducts(ps || [])
       if (fyData?.length) setFyFilter(fyData[0].id)
-    })
-  }, [])
+
+      if (profile.role === 'master') {
+        // Master sees every entity, "All entities" included — unchanged behaviour.
+        const { data: es } = await supabase.from('entities')
+          .select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name')
+        setEntities(es || [])
+        setEntityFilter('')
+      } else {
+        // CHANGED: everyone else only sees entities they've been explicitly
+        // granted via user_entity_access. No "All entities" option for them —
+        // the dropdown is built purely from their grants, and if they only
+        // have one grant, it's frozen to that entity (see select below).
+        const { data: grants } = await supabase
+          .from('user_entity_access')
+          .select('entity:entity_id(id,name,short_name)')
+          .eq('user_id', profile.id)
+        const granted = (grants || []).map(g => g.entity).filter(Boolean)
+          .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+        setEntities(granted)
+        setEntityFilter(granted[0]?.id || '')
+      }
+    }
+    loadFilters()
+  }, [profile])
 
   const loadPosition = useCallback(async () => {
     if (!fyFilter) return
@@ -486,11 +542,20 @@ function StockPosition() {
     // Get PIs — incoming and outgoing per entity+product
     // We need proforma_invoice_lines joined with proforma_invoices
     // Planned stock = opening + incoming PI qty - outgoing PI qty
+    // NOTE: this Planned/PI logic is untouched — it's correct as-is.
     const { data: piLines } = await supabase
       .from('proforma_invoice_lines')
       .select('qty, product_id, pi:pi_id(from_entity_id, to_entity_id, status)')
       .not('pi', 'is', null)
       .neq('pi.status', 'cancelled')
+
+    // CHANGED: Actual Stock — the real, invoice-based position per entity.
+    // This is deliberately NOT scoped to fyFilter: opening stock is entered
+    // incrementally whenever new stock is purchased (not reset each FY), so
+    // actual stock must be a running total across all-time opening entries +
+    // all-time invoice movements. Reuses the same tested logic that already
+    // feeds LineItemsEditor's available-stock check.
+    const actualMap = buildActualStockMap(await fetchStockMovementData())
 
     // Build position map: key = entity_id + product_id
     const map = {}
@@ -519,24 +584,82 @@ function StockPosition() {
       if (map[toKey])   map[toKey].incoming   += qty
     }
 
-    // Compute planned qty
-    const rows = Object.values(map).map(r => ({
-      ...r,
-      planned_qty: r.opening_qty + r.incoming - r.outgoing,
-    }))
+    // CHANGED: surface entity+product combos that have real invoice activity
+    // (via actualMap) but no opening_stock row in the selected FY — e.g. a
+    // pure buyer entity. Without this they'd hold real stock but be invisible
+    // on this page.
+    // CHANGED: skip any combo where product_id is null — these come from
+    // invoice/PI lines with no product link (a known CSV-upload data gap,
+    // not a real product) and would otherwise show up as blank, meaningless
+    // rows. Counted separately below so the problem stays visible instead of
+    // silently vanishing.
+    const entityById  = Object.fromEntries(entities.map(e => [e.id, e]))
+    const productById = Object.fromEntries(products.map(p => [p.id, p]))
+    let unresolvedLines = 0, unresolvedQty = 0
+    for (const row of Object.values(actualMap)) {
+      if (!row.product_id) {
+        unresolvedLines++
+        unresolvedQty += Math.abs(toNum(row.invoiced_in) - toNum(row.invoiced_out))
+        continue
+      }
+      if (entityFilter && row.entity_id !== entityFilter) continue
+      const key = `${row.entity_id}__${row.product_id}`
+      if (!map[key]) {
+        map[key] = {
+          entity_id:   row.entity_id,
+          entity:      entityById[row.entity_id] || null,
+          product_id:  row.product_id,
+          product:     productById[row.product_id] || null,
+          opening_qty: 0,
+          incoming:    0,
+          outgoing:    0,
+          rate:        0,
+        }
+      }
+    }
+    setDataIssues({ unresolvedLines, unresolvedQty })
+
+    // Compute planned qty (PI-based, unchanged) and actual qty (invoice-based)
+    const rows = Object.values(map).map(r => {
+      const key        = `${r.entity_id}__${r.product_id}`
+      const actual_qty = actualMap[key] ? actualMap[key].actual_qty : r.opening_qty
+      return {
+        ...r,
+        planned_qty: r.opening_qty + r.incoming - r.outgoing,
+        actual_qty,
+        billed_beyond_stock: actual_qty < 0,
+      }
+    })
+    // CHANGED: hide rows with nothing to show — no opening, no PI movement, no
+    // actual stock. These carry no information and just pad the table.
+    .filter(r => !(r.opening_qty === 0 && r.incoming === 0 && r.outgoing === 0 && r.actual_qty === 0))
 
     setPosition(rows)
     setLoading(false)
-  }, [entityFilter, fyFilter])
+  }, [entityFilter, fyFilter, entities, products])
 
   useEffect(() => { loadPosition() }, [loadPosition])
 
   // CHANGED: category filter applied client-side (product.category comes
   // through the join, not filterable server-side without a second query)
   const categories = [...new Set(position.map(r => r.product?.category).filter(Boolean))].sort()
-  const filteredPosition = (categoryFilter
+  const categoryOnlyFiltered = categoryFilter
     ? position.filter(r => r.product?.category === categoryFilter)
     : position
+
+  // CHANGED: counts always reflect the category filter only, never the status
+  // toggle itself — otherwise clicking "Shortfalls" would make its own count
+  // collapse to match whatever's left after filtering.
+  const shortfallCount = categoryOnlyFiltered.filter(r => r.planned_qty < 0).length
+  const billedBeyondCount = categoryOnlyFiltered.filter(r => r.billed_beyond_stock).length
+
+  // CHANGED: clicking a StatCard filters the table down to just those rows;
+  // clicking the same one again clears it.
+  const filteredPosition = (statusFilter === 'shortfall'
+    ? categoryOnlyFiltered.filter(r => r.planned_qty < 0)
+    : statusFilter === 'billed_beyond'
+    ? categoryOnlyFiltered.filter(r => r.billed_beyond_stock)
+    : categoryOnlyFiltered
   ).map((r, i) => ({ ...r, sno: i + 1 }))
 
   // CHANGED: category → totals + line items, for the group-by-category table
@@ -552,7 +675,6 @@ function StockPosition() {
     .map(([cat, g]) => ({ cat, qty: g.qty, value: g.value, items: g.items }))
     .sort((a, b) => b.qty - a.qty)
 
-  const shortfallCount = filteredPosition.filter(r => r.planned_qty < 0).length
   const totalValue     = filteredPosition.reduce((s, r) => s + toNum(r.opening_qty) * toNum(r.rate), 0)
 
   const columns = [
@@ -562,7 +684,15 @@ function StockPosition() {
     { label: 'Category', render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{r.product?.category || '—'}</span> },
     { label: 'Product',  render: r => <div><div style={{ fontWeight: 600 }}>{r.product?.name}</div><div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>{r.product?.hsn_code}</div></div> },
     { label: 'Unit',     render: r => <span style={{ fontSize: '12px' }}>{r.product?.unit}</span> },
-    { label: 'Opening',  right: true, render: r => <span>{Number(r.opening_qty).toLocaleString('en-IN')}</span> },
+    // CHANGED: Actual Stock is now the headline number — real, invoice-based
+    // stock the entity actually holds right now (opening + all invoiced in −
+    // all invoiced out, all-time). Placed right after Unit so it reads first.
+    { label: 'Actual Stock', right: true, render: r => (
+      <span style={{ fontWeight: 800, fontSize: '14px', color: r.actual_qty < 0 ? C.danger : C.text }}>
+        {Number(r.actual_qty).toLocaleString('en-IN')}
+      </span>
+    )},
+    { label: 'Opening',  right: true, render: r => <span style={{ color: C.textMuted }}>{Number(r.opening_qty).toLocaleString('en-IN')}</span> },
     { label: '+ Incoming PI', right: true, render: r => <span style={{ color: C.success }}>+{Number(r.incoming).toLocaleString('en-IN')}</span> },
     { label: '− Outgoing PI', right: true, render: r => <span style={{ color: C.danger }}>−{Number(r.outgoing).toLocaleString('en-IN')}</span> },
     { label: 'Planned',  right: true, render: r => (
@@ -570,36 +700,75 @@ function StockPosition() {
         {Number(r.planned_qty).toLocaleString('en-IN')}
       </span>
     )},
-    { label: 'Status',   render: r => shortfallBadge(r.planned_qty) },
+    // CHANGED: two independent indicators — Planned/PI shortfall (unchanged)
+    // and the new Actual/billed-beyond-stock flag, stacked when both apply.
+    { label: 'Status',   render: r => (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'flex-start' }}>
+        {shortfallBadge(r.planned_qty)}
+        {r.billed_beyond_stock && billedBeyondStockBadge()}
+      </div>
+    )},
   ]
 
   function handleExportCSV() {
     // CHANGED: export the currently filtered rows (respects entity/category
     // filters already applied on screen), category column added.
+    // CHANGED: actual_qty and billed_beyond_stock columns added.
     downloadCSV(`stock_position_${new Date().toISOString().split('T')[0]}.csv`,
-      ['sno','entity','category','product','hsn_code','unit','opening_qty','incoming_pi_qty','outgoing_pi_qty','planned_qty','status'],
-      filteredPosition.map(r=>({sno:r.sno,entity:r.entity?.name||'',category:r.product?.category||'',product:r.product?.name||'',hsn_code:r.product?.hsn_code||'',unit:r.product?.unit||'',opening_qty:r.opening_qty||0,incoming_pi_qty:r.incoming||0,outgoing_pi_qty:r.outgoing||0,planned_qty:r.planned_qty||0,status:r.planned_qty<0?'Shortfall':r.planned_qty===0?'Zero':'OK'}))
+      ['sno','entity','category','product','hsn_code','unit','actual_qty','billed_beyond_stock','opening_qty','incoming_pi_qty','outgoing_pi_qty','planned_qty','status'],
+      filteredPosition.map(r=>({sno:r.sno,entity:r.entity?.name||'',category:r.product?.category||'',product:r.product?.name||'',hsn_code:r.product?.hsn_code||'',unit:r.product?.unit||'',actual_qty:r.actual_qty||0,billed_beyond_stock:r.billed_beyond_stock?'Yes':'No',opening_qty:r.opening_qty||0,incoming_pi_qty:r.incoming||0,outgoing_pi_qty:r.outgoing||0,planned_qty:r.planned_qty||0,status:r.planned_qty<0?'Shortfall':r.planned_qty===0?'Zero':'OK'}))
     )
   }
 
   return (
     <div>
+      {/* CHANGED: data-quality warning — invoice/PI lines with no product
+          link (CSV-upload gap) are excluded from the table below rather than
+          shown as blank garbage rows, but surfaced here so the problem isn't
+          silently lost. */}
+      {dataIssues.unresolvedLines > 0 && (
+        <div style={{ background: '#fff3cc', border: '1px solid #e6c040', borderRadius: '6px', padding: '10px 14px', fontSize: '12px', color: '#7a5000', marginBottom: '16px' }}>
+          ⚠ {dataIssues.unresolvedLines} invoice line{dataIssues.unresolvedLines === 1 ? '' : 's'} (~{Number(dataIssues.unresolvedQty).toLocaleString('en-IN')} units) have no product linked and are excluded from the table below — likely from CSV-uploaded PIs/Invoices missing a product reference. This is a data issue, not a display bug; the actual stock numbers shown for real products are correct.
+        </div>
+      )}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
-        <StatCard label='Shortfalls'    value={shortfallCount} color={shortfallCount > 0 ? C.danger : C.success} />
+        {/* CHANGED: clicking toggles a table filter; clicking the same card again clears it */}
+        <StatCard label='Shortfalls'    value={shortfallCount} color={shortfallCount > 0 ? C.danger : C.success}
+          onClick={() => setStatusFilter(f => f === 'shortfall' ? null : 'shortfall')}
+          sub={statusFilter === 'shortfall' ? '● Filtering — click to clear' : 'Click to filter'} />
+        {/* CHANGED: billed-beyond-stock count — entities that have invoiced out more than they actually had */}
+        <StatCard label='Billed Beyond Stock' value={billedBeyondCount} color={billedBeyondCount > 0 ? C.danger : C.success}
+          onClick={() => setStatusFilter(f => f === 'billed_beyond' ? null : 'billed_beyond')}
+          sub={statusFilter === 'billed_beyond' ? '● Filtering — click to clear' : 'Click to filter'} />
         <StatCard label='Products'      value={filteredPosition.length} />
         <StatCard label='Opening Value' value={formatINR(totalValue)} />
       </div>
+      {/* CHANGED: explicit clear-filter affordance when a status filter is active */}
+      {statusFilter && (
+        <div style={{ marginBottom: '12px' }}>
+          <Btn size='sm' variant='ghost' onClick={() => setStatusFilter(null)}>
+            ✕ Clear "{statusFilter === 'shortfall' ? 'Shortfalls' : 'Billed Beyond Stock'}" filter
+          </Btn>
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
         <select value={fyFilter} onChange={e => setFyFilter(e.target.value)}
           style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
         </select>
+        {/* CHANGED: entity dropdown is now access-scoped — master gets "All
+            entities" + full list; anyone else only sees their granted
+            entities, and is frozen to it if they only have one. */}
         <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All entities</option>
+          disabled={!isMaster && entities.length <= 1}
+          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: (!isMaster && entities.length <= 1) ? C.bg : C.surface, fontSize: '13px', outline: 'none', cursor: (!isMaster && entities.length <= 1) ? 'not-allowed' : 'pointer', fontFamily: 'inherit' }}>
+          {isMaster && <option value=''>All entities</option>}
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
+        {!isMaster && entities.length <= 1 && (
+          <span style={{ fontSize: '11px', color: C.textMuted }}>🔒 Locked to your assigned entity</span>
+        )}
         {/* CHANGED: category filter */}
         <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
           style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
@@ -689,7 +858,7 @@ function StockPosition() {
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Calculating stock position…</div>
           : <Table columns={columns} rows={filteredPosition}
-              emptyState={<EmptyState icon='📦' title='No stock data' message='Add opening stock first, then create PIs to see planned position.' />}
+              emptyState={<EmptyState icon='📦' title={statusFilter ? 'No matching rows' : 'No stock data'} message={statusFilter ? 'Nothing matches this filter right now — try clearing it.' : 'Add opening stock first, then create PIs to see planned position.'} />}
             />
         }
       </Card>
@@ -742,7 +911,7 @@ function Products() {
     if (!form.name.trim() || !form.hsn_code.trim())
       return setToast({ message: 'Name and HSN Code are required', type: 'error' })
     setSaving(true)
-    const payload = { name: form.name.trim(), description: form.description||null, hsn_code: form.hsn_code.trim(), gst_rate: toNum(form.gst_rate), unit: form.unit, default_rate: toNum(form.default_rate)||null, is_active: form.is_active, category: form.category||null, updated_at: new Date() }
+    const payload = { name: cleanProductName(form.name), description: form.description||null, hsn_code: form.hsn_code.trim(), gst_rate: toNum(form.gst_rate), unit: form.unit, default_rate: toNum(form.default_rate)||null, is_active: form.is_active, category: form.category||null, updated_at: new Date() }
     let error
     if (editing) {
       const res = await supabase.from('products').update(payload).eq('id', editing.id)
@@ -892,7 +1061,7 @@ export default function Stock() {
   const [tab, setTab] = useState('Stock Position')
   return (
     <div>
-      <PageHeader title='Stock' subtitle='Products, opening stock and planned position' />
+      <PageHeader title='Stock' subtitle='Actual stock, opening stock and planned position' />
       <div style={{ display: 'flex', gap: '4px', marginBottom: '24px', borderBottom: `2px solid ${C.border}` }}>
         {TABS.map(t => (
           <button key={t} onClick={() => setTab(t)} style={{

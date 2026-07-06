@@ -8,6 +8,7 @@ import {
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import { formatINR } from '../../utils/money'
+import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master-only delete, matches PI/PO/Invoices pattern
 
 const MOVEMENT_TYPES    = ['domestic', 'export', 'blended']
 const ORDER_STATUSES    = ['open', 'in_progress', 'completed', 'cancelled']
@@ -107,6 +108,12 @@ function OrderSummaryTable({ legs, piMap, invMap }) {
 
 function OrdersList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to 'master' role, same convention as PI/PO/Invoices
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [orders, setOrders]   = useState([])
   const [entities, setEntities] = useState([])
   const [loading, setLoading] = useState(true)
@@ -159,6 +166,24 @@ function OrdersList() {
   })
   const en = e=>e?.short_name||e?.name||'—'
 
+  // CHANGED: multi-select + bulk soft-delete, same shape as PI/PO/Invoices
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(o => o.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('orders').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} order(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   return (
     <div>
       <PageHeader title='Orders' subtitle='Track every movement of goods end-to-end' action={<Btn onClick={()=>{setForm(EMPTY_ORDER);setModalOpen(true)}}>+ New Order</Btn>}/>
@@ -173,18 +198,39 @@ function OrdersList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear dates</Btn>}
       </div>
 
+      {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff3cc', border: '1px solid #e8d89a', borderRadius: '6px', padding: '8px 14px', marginBottom: '12px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 600 }}>{selected.size} order{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px',overflow:'hidden'}}>
         {loading ? <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
         : <div style={{overflowX:'auto'}}>
             <table style={{width:'100%',borderCollapse:'collapse',fontSize:'13px'}}>
-              <thead><tr>{['Order','Type','From','To','FY','Status','Date',''].map((h,i)=>(
+              <thead><tr>
+                {/* CHANGED: checkbox column, master-only, same as PI/PO/Invoices */}
+                {canDelete && <th style={{padding:'8px 12px',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,width:'32px'}}>
+                  <input type='checkbox' checked={filtered.length>0 && selected.size===filtered.length}
+                    onChange={toggleSelectAll} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
+                </th>}
+                {['Order','Type','From','To','FY','Status','Date',''].map((h,i)=>(
                 <th key={i} style={{padding:'8px 12px',textAlign:i===7?'right':'left',fontSize:'11px',fontWeight:700,color:C.textSoft,textTransform:'uppercase',letterSpacing:'0.05em',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,whiteSpace:'nowrap'}}>{h}</th>
               ))}</tr></thead>
               <tbody>
-                {filtered.length===0&&<tr><td colSpan={8} style={{padding:'48px',textAlign:'center',color:C.textMuted}}>No orders found.</td></tr>}
+                {filtered.length===0&&<tr><td colSpan={canDelete?9:8} style={{padding:'48px',textAlign:'center',color:C.textMuted}}>No orders found.</td></tr>}
                 {filtered.map((o,ri)=>(
                   <React.Fragment key={o.id}>
                     <tr key={o.id} style={{background:ri%2===0?C.surface:'#faf6ed'}} onMouseEnter={e=>e.currentTarget.style.background='#f0e8d8'} onMouseLeave={e=>e.currentTarget.style.background=ri%2===0?C.surface:'#faf6ed'}>
+                      {/* CHANGED: per-row checkbox */}
+                      {canDelete && <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}} onClick={e=>e.stopPropagation()}>
+                        <input type='checkbox' checked={selected.has(o.id)} onChange={()=>toggleSelect(o.id)} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
+                      </td>}
                       <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
                       <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}}><Badge status={o.movement_type}/></td>
                       <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.origin)}</td>
@@ -201,7 +247,7 @@ function OrdersList() {
                     </tr>
                     {expandedRow===o.id&&(
                       <tr key={o.id+'-exp'}>
-                        <td colSpan={8} style={{padding:0,borderBottom:`1px solid ${C.border}`}}>
+                        <td colSpan={canDelete?9:8} style={{padding:0,borderBottom:`1px solid ${C.border}`}}>
                           <div style={{padding:'14px 16px',background:'#f5f0e8',display:'flex',gap:'24px',alignItems:'flex-start',flexWrap:'wrap'}}>
                             <div style={{flex:1,minWidth:'200px'}}>
                               <div style={{fontSize:'11px',fontWeight:700,color:C.textMuted,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:'6px'}}>Order Details</div>
@@ -265,6 +311,9 @@ function OrdersList() {
           </div>
         </div>
       </Modal>
+      {/* CHANGED: bulk delete confirmation, same pattern as PI/PO/Invoices */}
+      <ConfirmModal open={confirmBulkDelete} onClose={()=>setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Orders' message={`Delete ${selected.size} selected order(s)? This cannot be undone.`} danger/>
       {toast&&<Toast message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
     </div>
   )
@@ -273,6 +322,11 @@ function OrdersList() {
 function OrderDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: single-order delete, master-only, same convention as PI/PO/Invoices detail pages
+  const canDelete = profile?.role === 'master'
+  const [confirmDeleteOrder, setConfirmDeleteOrder] = useState(false)
+  const [deletingOrder, setDeletingOrder] = useState(false)
   const [order, setOrder]       = useState(null)
   const [legs, setLegs]         = useState([])
   const [entities, setEntities] = useState([])
@@ -342,6 +396,15 @@ function OrderDetail() {
     await supabase.from('orders').update(payload).eq('id',id)
     setEditOrderModal(false); load()
   }
+  // CHANGED: soft-delete the order itself (order_legs are untouched — same
+  // as PI/PO/Invoices, which don't cascade-delete their child rows either)
+  async function handleDeleteOrder(){
+    setDeletingOrder(true)
+    const { error } = await supabase.from('orders').update({ is_deleted: true }).eq('id', id)
+    setDeletingOrder(false); setConfirmDeleteOrder(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/orders')
+  }
 
   if (loading) return <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
   if (!order)  return <div style={{padding:'48px',textAlign:'center',color:C.danger}}>Order not found.</div>
@@ -360,6 +423,8 @@ function OrderDetail() {
         action={<div style={{display:'flex',gap:'8px'}}>
           <Btn variant='ghost' onClick={()=>{setOrderForm({name:order.name,movement_type:order.movement_type,status:order.status,origin_entity_id:order.origin_entity_id||'',destination_entity_id:order.destination_entity_id||'',notes:order.notes||''});setEditOrderModal(true)}}>Edit Order</Btn>
           <Btn onClick={openNewLeg}>+ Add Leg</Btn>
+          {/* CHANGED: master-only order delete, same convention as PI/PO/Invoices */}
+          {canDelete && <Btn variant='danger' onClick={()=>setConfirmDeleteOrder(true)} disabled={deletingOrder}>{deletingOrder?'Deleting…':'Delete Order'}</Btn>}
         </div>}
       />
 
@@ -468,6 +533,9 @@ function OrderDetail() {
       </Modal>
 
       <ConfirmModal open={!!confirmDelete} onClose={()=>setConfirmDelete(null)} onConfirm={handleDeleteLeg} title='Remove Leg' message={`Remove Leg ${confirmDelete?.leg_no}? This cannot be undone.`} danger/>
+      {/* CHANGED: confirm modal for deleting the whole order */}
+      <ConfirmModal open={confirmDeleteOrder} onClose={()=>setConfirmDeleteOrder(false)} onConfirm={handleDeleteOrder}
+        title='Delete Order' message={`Delete "${order.name}"${order.order_no?' ('+order.order_no+')':''}? This cannot be undone.`} danger/>
       {toast&&<Toast message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
     </div>
   )

@@ -39,12 +39,32 @@ export async function deleteFileFromDrive(driveFileId) {
   return data
 }
 
-export function getDriveViewUrl(driveFileId, driveUrl) {
-  return driveUrl
+// CHANGED: the b2-upload GET /file/:key endpoint now requires an
+// Authorization header (it previously had none — anyone with a leaked file
+// key could fetch any document). A plain <a href> or window.open(url) can't
+// attach that header, so viewing/downloading now goes through an
+// authenticated fetch that returns a blob URL instead of the raw B2 URL.
+// Callers must now `await` these and open/download the returned blob URL —
+// see DocumentAttachments.jsx / DocumentChecklist.jsx for the updated call
+// sites. Revoke the blob URL when done (e.g. after the tab opens) to avoid
+// leaking memory on long sessions.
+async function fetchAuthedFileUrl(driveFileId) {
+  if (!driveFileId) throw new Error('No file to open')
+  const { data: { session } } = await supabase.auth.getSession()
+  const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/b2-upload/file/${encodeURIComponent(driveFileId)}`, {
+    headers: { Authorization: `Bearer ${session?.access_token}` },
+  })
+  if (!res.ok) throw new Error('Could not load file')
+  const blob = await res.blob()
+  return URL.createObjectURL(blob)
 }
 
-export function getDriveDownloadUrl(driveFileId, driveUrl) {
-  return driveUrl
+export async function getDriveViewUrl(driveFileId, driveUrl) {
+  return fetchAuthedFileUrl(driveFileId)
+}
+
+export async function getDriveDownloadUrl(driveFileId, driveUrl) {
+  return fetchAuthedFileUrl(driveFileId)
 }
 
 export function formatFileSize(bytes) {

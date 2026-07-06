@@ -12,7 +12,7 @@ import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
-import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
@@ -54,6 +54,10 @@ function PIList() {
   const [pis, setPIs]           = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
+  // CHANGED: needed to resolve/auto-create products for CSV-uploaded lines —
+  // previously this handler never set product_id at all, which silently
+  // broke stock tracking (Planned Stock) for every CSV-created PI line.
+  const [products, setProducts] = useState([])
   const [hsnMap, setHsnMap]     = useState(new Map())
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
@@ -78,7 +82,7 @@ function PIList() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: ps }, { data: es }, { data: os }, { data: hsnRows }, { data: stockRows }] = await Promise.all([
+    const [{ data: ps }, { data: es }, { data: os }, { data: hsnRows }, { data: stockRows }, { data: prods }] = await Promise.all([
       supabase.from('proforma_invoices')
         .select('*, from_entity:from_entity_id(name,short_name), to_entity:to_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('pi_date', { ascending: false }),
@@ -86,8 +90,11 @@ function PIList() {
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
       supabase.from('hsn_master').select('*').eq('is_active', true),
       supabase.from('stock_opening_balance').select('product_id,qty'),
+      // CHANGED: for CSV product resolution below
+      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate'),
     ])
     setPIs(ps||[]); setEntities(es||[]); setOrders(os||[]); setHsnMap(buildHSNMap(hsnRows||[]))
+    setProducts(prods||[])
     const sMap={}
     for (const r of (stockRows||[])) sMap[r.product_id]=(sMap[r.product_id]||0)+Number(r.qty)
     setStockMap(sMap)
@@ -204,17 +211,25 @@ function PIList() {
   })
 
   // ── CSV bulk upload ──────────────────────────────────────────────────────────
-  // Format: pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no
+  // Format: pi_date,from_entity,to_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no
   // Multiple rows with same pi_date+from+to = grouped into one PI.
   // CHANGED: pi_no is optional — blank = suggested via suggestNextNo() (see numbering.js
   // behaviour). If supplied, that exact number is used instead, after checking it
   // isn't already used by an existing PI or another row/group in this same file.
+  // CHANGED: added a "product" column + resolution step. Previously every line
+  // from this uploader had product_id = null (no lookup existed at all), which
+  // silently broke Planned Stock tracking for every CSV-created PI line. Now
+  // mirrors the same find-or-auto-create pattern Opening Stock's CSV upload
+  // already uses, and the same fix just applied to Invoices' CSV upload.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
     const delim = detectDelimiter(lines[0])
-    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    // CHANGED: quote-aware parsing — plain split(delim) shredded any product
+    // name/description containing a comma inside quotes (e.g. "Steel Tea,
+    // Coffee & Sugar Container Set, 3 Pieces") across the wrong columns.
+    const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
     // CHANGED: dedupe pool for manually-supplied pi_no values — seeded with
     // every PI number already in the DB, then grown as this file assigns more.
@@ -223,12 +238,28 @@ function PIList() {
     // Group rows by pi_date+from_entity+to_entity
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delim).map(c => c.trim())
+      const cols = parseCSVLine(lines[i], delim)
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       const key = `${row.pi_date}__${row.from_entity}__${row.to_entity}`
       if (!groups[key]) groups[key] = { meta: row, lines: [] }
       groups[key].lines.push(row)
+    }
+
+    // CHANGED: resolve/auto-create products up front, across all groups, in
+    // one batch — same approach as Stock/Opening Stock's CSV handler.
+    const productList = [...products]
+    const findProduct = name => productList.find(p => (p.name || '').trim().toLowerCase() === (name || '').trim().toLowerCase())
+    const allRows = Object.values(groups).flatMap(g => g.lines)
+    const missingNames = [...new Set(allRows.filter(r => r.product?.trim() && !findProduct(r.product)).map(r => r.product.trim()))]
+    if (missingNames.length > 0) {
+      const payloads = missingNames.map(name => {
+        const src = allRows.find(r => r.product?.trim() === name)
+        return { name, hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }
+      })
+      const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
+      if (pErr) errors.push(`Could not auto-create ${missingNames.length} new product(s) — ${pErr.message}`)
+      else productList.push(...(newProducts || []))
     }
 
     for (const [key, group] of Object.entries(groups)) {
@@ -261,7 +292,14 @@ function PIList() {
 
       const interstate = meta.is_interstate === 'true' || (fromE.state_code && toE.state_code && fromE.state_code !== toE.state_code)
 
+      // CHANGED: require a resolvable product per line — a line with no
+      // product reference cannot be tracked in stock, so we reject it
+      // clearly rather than silently inserting it with product_id = null.
+      let lineErr = false
       const piLines = gLines.map((r, i) => {
+        const product = r.product?.trim() ? findProduct(r.product) : null
+        if (r.product?.trim() && !product) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
+        if (!r.product?.trim()) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate    = toNum(r.rate)
         const qty     = toNum(r.qty)
         const taxable = Math.round(qty * rate)
@@ -271,7 +309,7 @@ function PIList() {
         const cgst    = !interstate ? Math.round(taxable * half / 100) : 0
         const sgst    = cgst
         return {
-          line_no: i + 1, description: r.description, hsn_code: r.hsn_code,
+          line_no: i + 1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code,
           qty, unit: r.unit || 'Nos', rate, gst_rate: gstRate,
           taxable_amount: taxable,
           cgst_rate: half, cgst_amount: cgst,
@@ -280,6 +318,7 @@ function PIList() {
           total_amount: taxable + igst + cgst + sgst,
         }
       })
+      if (lineErr) continue
 
       const totals = piLines.reduce((acc, l) => ({
         taxable_amount: acc.taxable_amount + l.taxable_amount,
@@ -411,8 +450,8 @@ function PIList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('pi')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no</code><br /><br />
-            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates).
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no</code><br /><br />
+            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />

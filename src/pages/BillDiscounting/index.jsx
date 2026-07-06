@@ -2,13 +2,15 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Modal, Toast, EmptyState,
+  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import { formatINR, toNum, roundRupees } from '../../utils/money'
 import { downloadCSV } from '../../utils/csvTemplate'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import DocumentAttachments from '../../components/DocumentAttachments'
+import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -566,6 +568,15 @@ function BDReports({ events, banks }) {
 
 function BDList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
+  const canDelete = profile?.role === 'master'
+  // CHANGED: bde_write is gated on has_entity_grant(entity_id) — a bill
+  // discounting event belongs to one entity, no counterparty.
+  const { entities: accessEntities, frozen: entityFrozen, defaultEntityId } = useEntityAccess()
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [view,setView]         = useState('list')      // 'list' | 'banks'
   const [tab,setTab]           = useState('dashboard') // 'dashboard' | 'events' | 'reports'
   const [events,setEvents]     = useState([])
@@ -748,6 +759,26 @@ function BDList() {
 
   if (view==='banks') return <BanksMaster onBack={()=>{setView('list');load()}}/>
 
+  const filteredEvents = sf==='all' ? events : events.filter(e=>sf==='overdue'?isOverdue(e):e.status===sf)
+
+  // CHANGED: multi-select + bulk soft-delete, same shape as PI/PO/Invoices
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filteredEvents.length ? new Set() : new Set(filteredEvents.map(e => e.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('bill_discounting_events').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} event(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   return (
     <div>
       <PageHeader title='Bill Discounting' subtitle='Invoice financing with banks and NBFCs'
@@ -757,7 +788,7 @@ function BDList() {
           <input ref={csvRef} type='file' accept='.csv' style={{display:'none'}} onChange={handleImport}/>
           <Btn variant='ghost' onClick={handleExport}>↓ Export CSV</Btn>
           <Btn variant='ghost' onClick={()=>setView('banks')}>🏦 Banks</Btn>
-          <Btn onClick={()=>{setForm(EMPTY);setSelInv([]);setModal(true)}}>+ New Event</Btn>
+          <Btn onClick={()=>{setForm({...EMPTY,entity_id:defaultEntityId});setSelInv([]);setModal(true)}}>+ New Event</Btn>
         </div>}
       />
 
@@ -768,7 +799,7 @@ function BDList() {
         ))}
       </div>
 
-      {tab==='dashboard'&&(loading?<div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>:<BDDashboard events={events} banks={banks} onNewEvent={()=>{setForm(EMPTY);setSelInv([]);setModal(true)}}/>)}
+      {tab==='dashboard'&&(loading?<div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>:<BDDashboard events={events} banks={banks} onNewEvent={()=>{setForm({...EMPTY,entity_id:defaultEntityId});setSelInv([]);setModal(true)}}/>)}
 
       {tab==='events'&&(
         <>
@@ -777,10 +808,26 @@ function BDList() {
               <button key={k} onClick={()=>setSF(k)} style={{padding:'6px 14px',border:'none',cursor:'pointer',fontFamily:'inherit',fontWeight:sf===k?700:500,fontSize:'13px',color:sf===k?C.text:C.textSoft,background:'transparent',borderBottom:sf===k?`2px solid ${C.accent}`:'2px solid transparent',marginBottom:'-1px'}}>{l}</button>
             ))}
           </div>
+          {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
+          {canDelete && selected.size > 0 && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff3cc', border: '1px solid #e8d89a', borderRadius: '6px', padding: '8px 14px', marginBottom: '12px' }}>
+              <span style={{ fontSize: '13px', fontWeight: 600 }}>{selected.size} event{selected.size > 1 ? 's' : ''} selected</span>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+                <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+              </div>
+            </div>
+          )}
           <Card>
             {loading?<div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>:(
               <Table
                 columns={[
+                  ...(canDelete ? [{
+                    label: <input type='checkbox' checked={filteredEvents.length>0 && selected.size===filteredEvents.length}
+                      onChange={toggleSelectAll} onClick={e=>e.stopPropagation()} style={{width:'14px',height:'14px',cursor:'pointer'}}/>,
+                    render: e => <input type='checkbox' checked={selected.has(e.id)}
+                      onChange={()=>toggleSelect(e.id)} onClick={ev=>ev.stopPropagation()} style={{width:'14px',height:'14px',cursor:'pointer'}}/>,
+                  }] : []),
                   {label:'S.No.', render:(row,idx)=><span style={{color:C.textMuted}}>{idx+1}</span>},
                   {label:'Date',   render:e=><span style={{fontSize:'12px'}}>{fmtDate(e.discounting_date)}</span>},
                   {label:'Entity', render:e=><span style={{fontSize:'12px',fontWeight:600}}>{e.entity?.short_name||e.entity?.name}</span>},
@@ -799,7 +846,7 @@ function BDList() {
                   {label:'Status',render:e=><Badge status={isOverdue(e)&&e.status==='active'?'overdue':e.status} label={e.status==='partially_repaid'?'Partial':undefined}/>},
                   {label:'',render:e=><Btn size='sm' variant='ghost' onClick={()=>navigate(`/bill-discounting/${e.id}`)}>Open →</Btn>},
                 ]}
-                rows={sf==='all'?events:events.filter(e=>sf==='overdue'?isOverdue(e):e.status===sf)}
+                rows={filteredEvents}
                 emptyState={<EmptyState icon='🏦' title='No events' action={<Btn onClick={()=>setModal(true)}>+ New Event</Btn>}/>}
               />
             )}
@@ -812,10 +859,10 @@ function BDList() {
       <Modal open={modal} onClose={()=>setModal(false)} title='New Bill Discounting Event' width={700}>
         <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
-            <FormRow label='Entity' required>
-              <Select value={form.entity_id||''} onChange={e=>setF('entity_id',e.target.value)}>
+            <FormRow label='Entity' required hint={entityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.entity_id||''} onChange={e=>setF('entity_id',e.target.value)} disabled={entityFrozen}>
                 <option value=''>Select entity…</option>
-                {entities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}
+                {accessEntities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Bank / Financier' required>
@@ -882,6 +929,9 @@ function BDList() {
           </div>
         </div>
       </Modal>
+      {/* CHANGED: bulk delete confirmation */}
+      <ConfirmModal open={confirmBulkDelete} onClose={()=>setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Events' message={`Delete ${selected.size} selected event(s)? This cannot be undone.`} danger/>
       {toast&&<Toast message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
     </div>
   )
@@ -891,6 +941,11 @@ function BDList() {
 
 function BDDetail() {
   const { id }=useParams(), navigate=useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: master-only delete, same convention as PI/PO/Invoices detail pages
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [event,setEvent]     = useState(null)
   const [repays,setRepays]   = useState([])
   const [bdInvs,setBdInvs]   = useState([])
@@ -940,6 +995,14 @@ function BDDetail() {
     await supabase.from('bill_discounting_events').update({status:s,updated_at:new Date()}).eq('id',id)
     setToast({message:`Status → ${s}`,type:'success'}); setStatM(false); load()
   }
+  // CHANGED: single-event soft delete
+  async function handleDeleteEvent() {
+    setDeleting(true)
+    const { error } = await supabase.from('bill_discounting_events').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/bill-discounting')
+  }
 
   if (loading) return <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
   if (!event)  return <div style={{padding:'48px',textAlign:'center',color:C.danger}}>Event not found.</div>
@@ -957,6 +1020,8 @@ function BDDetail() {
         action={<div style={{display:'flex',gap:'8px',alignItems:'center'}}>
           {!['repaid','recourse'].includes(event.status)&&<Btn onClick={()=>{setRF_({repayment_date:today(),amount:'',interest_amount:'0',payment_mode:'bank_transfer',reference_no:'',notes:''});setRepayM(true)}}>+ Repayment</Btn>}
           {event.status!=='repaid'&&<Btn variant='ghost' onClick={()=>setStatM(true)}>Change Status</Btn>}
+          {/* CHANGED: master-only event delete */}
+          {canDelete&&<Btn variant='danger' onClick={()=>setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
           <Badge status={effSt} label={effSt==='partially_repaid'?'Partial':undefined}/>
         </div>}
       />
@@ -1097,6 +1162,9 @@ function BDDetail() {
           <Btn variant='ghost' onClick={()=>setStatM(false)}>Cancel</Btn>
         </div>
       </Modal>
+      {/* CHANGED: delete confirmation */}
+      <ConfirmModal open={confirmDelete} onClose={()=>setConfirmDelete(false)} onConfirm={handleDeleteEvent}
+        title='Delete Event' message='Delete this bill discounting event? This cannot be undone.' danger/>
       {toast&&<Toast message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
     </div>
   )

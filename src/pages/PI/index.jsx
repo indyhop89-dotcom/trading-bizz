@@ -9,11 +9,14 @@ import LineItemsEditor, { computeLine, computeTotals } from '../../components/Li
 import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
+import { cleanProductName, productMatchKey } from '../../utils/products'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
-import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock } from '../../utils/stock'
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 
@@ -48,12 +51,19 @@ function PIList() {
   // viewer — see Settings). This matches the existing `isAdmin` convention used
   // in Payments (`profile?.role === 'master'`).
   const canDelete = profile?.role === 'master'
+  // CHANGED: which entities this user may raise a PI *from* — master sees
+  // all, everyone else only the entities they've been granted access to.
+  const { entities: accessEntities, frozen: fromEntityFrozen, defaultEntityId } = useEntityAccess()
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [pis, setPIs]           = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
+  // CHANGED: needed to resolve/auto-create products for CSV-uploaded lines —
+  // previously this handler never set product_id at all, which silently
+  // broke stock tracking (Planned Stock) for every CSV-created PI line.
+  const [products, setProducts] = useState([])
   const [hsnMap, setHsnMap]     = useState(new Map())
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
@@ -78,23 +88,32 @@ function PIList() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: ps }, { data: es }, { data: os }, { data: hsnRows }, { data: stockRows }] = await Promise.all([
+    const [{ data: ps }, { data: es }, { data: os }, { data: hsnRows }, { data: prods }] = await Promise.all([
       supabase.from('proforma_invoices')
         .select('*, from_entity:from_entity_id(name,short_name), to_entity:to_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
       supabase.from('hsn_master').select('*').eq('is_active', true),
-      supabase.from('stock_opening_balance').select('product_id,qty'),
+      // CHANGED: for CSV product resolution below
+      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate'),
     ])
     setPIs(ps||[]); setEntities(es||[]); setOrders(os||[]); setHsnMap(buildHSNMap(hsnRows||[]))
-    const sMap={}
-    for (const r of (stockRows||[])) sMap[r.product_id]=(sMap[r.product_id]||0)+Number(r.qty)
-    setStockMap(sMap)
+    setProducts(prods||[])
     setLoading(false)
   }, [])
 
   useEffect(() => { load() }, [load])
+
+  // CHANGED: stockMap must reflect what the *from* entity actually has on
+  // hand right now (opening + invoiced-in − invoiced-out, E-way-Bill gated),
+  // not a global sum of opening balances across every entity. Recomputed
+  // whenever the selected from-entity changes so the "available" hint next
+  // to each line in LineItemsEditor is accurate for a PI's actual seller.
+  useEffect(() => {
+    if (!form.from_entity_id) { setStockMap({}); return }
+    fetchEntityAvailableStock(form.from_entity_id).then(setStockMap)
+  }, [form.from_entity_id])
 
   function setF(k, v) {
     setForm(f => {
@@ -121,9 +140,30 @@ function PIList() {
   }
 
   const [piLines, setPILines] = useState([])
+  // CHANGED: PI planned qty exceeding the from-entity's actual available
+  // stock is a warning, not a hard block — the seller may already have more
+  // incoming, or plan to fulfil from a future purchase. handleSave(true)
+  // (called from the confirm modal below) skips the check and proceeds.
+  const [stockWarning, setStockWarning] = useState(null)
 
-  async function handleSave() {
+  async function handleSave(skipStockCheck = false) {
     if (!form.from_entity_id || !form.to_entity_id) return setToast({ message: 'From and To entity are required', type: 'error' })
+
+    // CHANGED: every stock-planning line must carry a product_id — otherwise
+    // it's invisible to every stock calculation. Hard block, not a warning.
+    const missing = findLinesMissingProductId(piLines)
+    if (missing.length > 0) {
+      return setToast({ message: `Line ${missing.map(l => l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`, type: 'error' })
+    }
+
+    if (!skipStockCheck) {
+      const exceeding = findLinesExceedingStock(piLines, stockMap)
+      if (exceeding.length > 0) {
+        setStockWarning(`${exceeding.length} line(s) plan more quantity than ${entities.find(e => e.id === form.from_entity_id)?.short_name || 'the from-entity'} currently has in stock. Create this PI anyway?`)
+        return
+      }
+    }
+
     const totals = computeTotals(piLines.map(l => computeLine(l, form.is_interstate)))
     setSaving(true)
     // CHANGED: use the manually-entered PI number if the user supplied one,
@@ -204,17 +244,25 @@ function PIList() {
   })
 
   // ── CSV bulk upload ──────────────────────────────────────────────────────────
-  // Format: pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no
+  // Format: pi_date,from_entity,to_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no
   // Multiple rows with same pi_date+from+to = grouped into one PI.
   // CHANGED: pi_no is optional — blank = suggested via suggestNextNo() (see numbering.js
   // behaviour). If supplied, that exact number is used instead, after checking it
   // isn't already used by an existing PI or another row/group in this same file.
+  // CHANGED: added a "product" column + resolution step. Previously every line
+  // from this uploader had product_id = null (no lookup existed at all), which
+  // silently broke Planned Stock tracking for every CSV-created PI line. Now
+  // mirrors the same find-or-auto-create pattern Opening Stock's CSV upload
+  // already uses, and the same fix just applied to Invoices' CSV upload.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
     const delim = detectDelimiter(lines[0])
-    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    // CHANGED: quote-aware parsing — plain split(delim) shredded any product
+    // name/description containing a comma inside quotes (e.g. "Steel Tea,
+    // Coffee & Sugar Container Set, 3 Pieces") across the wrong columns.
+    const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
     // CHANGED: dedupe pool for manually-supplied pi_no values — seeded with
     // every PI number already in the DB, then grown as this file assigns more.
@@ -223,12 +271,51 @@ function PIList() {
     // Group rows by pi_date+from_entity+to_entity
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delim).map(c => c.trim())
+      const cols = parseCSVLine(lines[i], delim)
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       const key = `${row.pi_date}__${row.from_entity}__${row.to_entity}`
       if (!groups[key]) groups[key] = { meta: row, lines: [] }
       groups[key].lines.push(row)
+    }
+
+    // CHANGED: resolve/auto-create products up front, across all groups, in
+    // one batch — same approach as Stock/Opening Stock's CSV handler.
+    // CHANGED: match on name + HSN + rate + GST together, not name alone — a
+    // single file can list several genuinely different products sharing one
+    // generic name at different rates (per product-owner decision, only merge
+    // when all four fields match). New products are stored with a cleaned name.
+    // CHANGED: uses a precomputed Map (key -> product) instead of an array
+    // .find() re-run per row — with ~1000+ products x ~1000+ rows, a linear
+    // scan recomputing the match key for every candidate on every row is
+    // millions of string/regex ops, slow enough to look like a hang.
+    const productMap = new Map()
+    for (const p of products) {
+      productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+    }
+    const rowMatchKey = row => productMatchKey({ name: row.product, hsn_code: row.hsn_code, rate: row.rate, gst_rate: row.gst_rate })
+    const findProduct = row => productMap.get(rowMatchKey(row))
+    const allRows = Object.values(groups).flatMap(g => g.lines)
+    const missingKeys = new Set()
+    const missingRows = []
+    for (const r of allRows) {
+      if (!r.product?.trim()) continue
+      const k = rowMatchKey(r)
+      if (productMap.has(k) || missingKeys.has(k)) continue
+      missingKeys.add(k); missingRows.push(r)
+    }
+    if (missingRows.length > 0) {
+      const payloads = missingRows.map(src => {
+        return { name: cleanProductName(src.product), hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }
+      })
+      const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
+      if (pErr) {
+        errors.push(`Could not auto-create ${missingRows.length} new product(s) — ${pErr.message}`)
+      } else {
+        for (const p of (newProducts || [])) {
+          productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+        }
+      }
     }
 
     for (const [key, group] of Object.entries(groups)) {
@@ -261,7 +348,14 @@ function PIList() {
 
       const interstate = meta.is_interstate === 'true' || (fromE.state_code && toE.state_code && fromE.state_code !== toE.state_code)
 
+      // CHANGED: require a resolvable product per line — a line with no
+      // product reference cannot be tracked in stock, so we reject it
+      // clearly rather than silently inserting it with product_id = null.
+      let lineErr = false
       const piLines = gLines.map((r, i) => {
+        const product = r.product?.trim() ? findProduct(r) : null
+        if (r.product?.trim() && !product) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
+        if (!r.product?.trim()) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate    = toNum(r.rate)
         const qty     = toNum(r.qty)
         const taxable = Math.round(qty * rate)
@@ -271,7 +365,7 @@ function PIList() {
         const cgst    = !interstate ? Math.round(taxable * half / 100) : 0
         const sgst    = cgst
         return {
-          line_no: i + 1, description: r.description, hsn_code: r.hsn_code,
+          line_no: i + 1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code,
           qty, unit: r.unit || 'Nos', rate, gst_rate: gstRate,
           taxable_amount: taxable,
           cgst_rate: half, cgst_amount: cgst,
@@ -280,6 +374,7 @@ function PIList() {
           total_amount: taxable + igst + cgst + sgst,
         }
       })
+      if (lineErr) continue
 
       const totals = piLines.reduce((acc, l) => ({
         taxable_amount: acc.taxable_amount + l.taxable_amount,
@@ -359,7 +454,7 @@ function PIList() {
           <div style={{ display: 'flex', gap: '8px' }}>
             <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
             <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
-            <Btn onClick={() => { setForm(EMPTY_FORM); setPILines([]); setModalOpen(true) }}>+ New PI</Btn>
+            <Btn onClick={() => { setForm({ ...EMPTY_FORM, from_entity_id: defaultEntityId }); setPILines([]); setModalOpen(true) }}>+ New PI</Btn>
           </div>
         }
       />
@@ -411,8 +506,8 @@ function PIList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('pi')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no</code><br /><br />
-            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates).
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no</code><br /><br />
+            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -477,10 +572,10 @@ function PIList() {
                 {PI_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
               </Select>
             </FormRow>
-            <FormRow label='From Entity' required>
-              <Select value={form.from_entity_id} onChange={e => setF('from_entity_id', e.target.value)}>
+            <FormRow label='From Entity' required hint={fromEntityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.from_entity_id} onChange={e => setF('from_entity_id', e.target.value)} disabled={fromEntityFrozen}>
                 <option value=''>Select entity</option>
-                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='To Entity' required>
@@ -513,7 +608,7 @@ function PIList() {
           <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'-4px'}}>
             <Btn size='sm' variant='ghost' onClick={openCopyModal}>📋 Copy from previous leg PI…</Btn>
           </div>
-          <LineItemsEditor lines={piLines} setLines={setPILines} interstate={form.is_interstate} hsnMap={hsnMap} showMargin={true} stockMap={stockMap}/>
+          <LineItemsEditor lines={piLines} setLines={setPILines} interstate={form.is_interstate} hsnMap={hsnMap} showMargin={true} stockMap={stockMap} products={products}/>
 
           <SectionDivider label='Billing & Shipping (optional)' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -536,10 +631,14 @@ function PIList() {
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Create PI'}</Btn>
+            <Btn onClick={() => handleSave(false)} disabled={saving}>{saving ? 'Saving…' : 'Create PI'}</Btn>
           </div>
         </div>
       </Modal>
+
+      <ConfirmModal open={!!stockWarning} onClose={() => setStockWarning(null)}
+        onConfirm={() => { setStockWarning(null); handleSave(true) }}
+        title='Planned Quantity Exceeds Stock' message={stockWarning || ''} danger />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
@@ -588,6 +687,10 @@ function PIDetail() {
     // duplicates against every other PI (excluding this one) before saving.
     const piNo = (editForm.pi_no || '').trim()
     if (!piNo) return setToast({message:'PI number cannot be blank',type:'error'})
+    // CHANGED: block edits that leave a line without a product_id — same
+    // rule as PI creation, since these lines feed the same stock calc.
+    const missing = findLinesMissingProductId(editLines)
+    if (missing.length > 0) return setToast({message:`Line ${missing.map(l=>l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`,type:'error'})
     setSaving(true)
     if (piNo.toLowerCase() !== (pi.pi_no||'').toLowerCase()) {
       const { data: dup } = await supabase.from('proforma_invoices').select('id').ilike('pi_no', piNo).neq('id', id).limit(1)
@@ -597,7 +700,13 @@ function PIDetail() {
     const totals = computeTotals(computedLines)
     const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,...totals,updated_at:new Date()}).eq('id',id)
     if (piErr) { setSaving(false); return setToast({message:piErr.message,type:'error'}) }
-    await supabase.from('proforma_invoice_lines').delete().eq('pi_id',id)
+    // CHANGED: this delete's result was never checked. If it silently failed
+    // (RLS/timeout) while the insert below still ran, every re-save stacked
+    // another full copy of the lines on top of the old ones — that's how one
+    // PI ended up with 1000+ duplicate line rows. Abort on a failed delete so
+    // we never insert on top of lines that weren't actually cleared.
+    const { error: delErr } = await supabase.from('proforma_invoice_lines').delete().eq('pi_id',id)
+    if (delErr) { setSaving(false); return setToast({message:`Could not clear old line items: ${delErr.message}. PI header was updated but lines were left unchanged to avoid duplicates.`,type:'error'}) }
     const linesPayload = computedLines.map((l,i)=>{
       const {_id,_cost_rate,_margin_pct,_hsn_resolved_rate,_hsn_override,_hsn_manually_set,_hsn_source,...rest}=l
       return {...rest,pi_id:id,line_no:i+1}

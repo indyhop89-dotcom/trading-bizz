@@ -415,9 +415,17 @@ export default function DocumentChecklist({
                     {linkedDoc?.drive_url && (
                       <>
                         <button
-                          onClick={() => {
-                            const url = getDriveViewUrl(linkedDoc.drive_file_id, linkedDoc.drive_url)
-                            window.open(url, '_blank', 'noopener,noreferrer')
+                          onClick={async () => {
+                            // CHANGED: getDriveViewUrl is now async (fetches
+                            // with the session token, returns a blob URL) —
+                            // the GET endpoint requires auth now.
+                            try {
+                              const url = await getDriveViewUrl(linkedDoc.drive_file_id, linkedDoc.drive_url)
+                              window.open(url, '_blank', 'noopener,noreferrer')
+                              setTimeout(() => URL.revokeObjectURL(url), 60000)
+                            } catch (err) {
+                              setToast({ message: err.message || 'Could not open file', type: 'error' })
+                            }
                           }}
                           style={{
                             padding: '4px 10px', borderRadius: '4px',
@@ -431,17 +439,20 @@ export default function DocumentChecklist({
                         </button>
                         <button
                           onClick={async () => {
-                            const url = getDriveDownloadUrl(linkedDoc.drive_file_id, linkedDoc.drive_url)
+                            // CHANGED: getDriveDownloadUrl already returns an
+                            // authenticated blob URL now — no need for a
+                            // second raw fetch on top of it.
                             try {
-                              const res = await fetch(url)
-                              const blob = await res.blob()
+                              const url = await getDriveDownloadUrl(linkedDoc.drive_file_id, linkedDoc.drive_url)
                               const a = document.createElement('a')
-                              a.href = URL.createObjectURL(blob)
+                              a.href = url
                               a.download = linkedDoc.file_name || 'download'
+                              document.body.appendChild(a)
                               a.click()
-                              URL.revokeObjectURL(a.href)
-                            } catch {
-                              window.open(url, '_blank')
+                              a.remove()
+                              setTimeout(() => URL.revokeObjectURL(url), 60000)
+                            } catch (err) {
+                              setToast({ message: err.message || 'Could not download file', type: 'error' })
                             }
                           }}
                           style={{
@@ -571,7 +582,17 @@ export default function DocumentChecklist({
                   </div>
                   <div style={{ display: 'flex', gap: '5px', flexShrink: 0 }}>
                     <button
-                      onClick={() => window.open(getDriveViewUrl(doc.drive_file_id, doc.drive_url), '_blank', 'noopener,noreferrer')}
+                      onClick={async () => {
+                        // CHANGED: getDriveViewUrl is now async (fetches with
+                        // the session token, returns a blob URL).
+                        try {
+                          const url = await getDriveViewUrl(doc.drive_file_id, doc.drive_url)
+                          window.open(url, '_blank', 'noopener,noreferrer')
+                          setTimeout(() => URL.revokeObjectURL(url), 60000)
+                        } catch (err) {
+                          setToast({ message: err.message || 'Could not open file', type: 'error' })
+                        }
+                      }}
                       style={{
                         padding: '4px 10px', borderRadius: '4px',
                         fontSize: '11px', fontWeight: 600,
@@ -584,17 +605,19 @@ export default function DocumentChecklist({
                     </button>
                     <button
                       onClick={async () => {
-                        const url = getDriveDownloadUrl(doc.drive_file_id, doc.drive_url)
+                        // CHANGED: getDriveDownloadUrl already returns an
+                        // authenticated blob URL — no extra fetch needed.
                         try {
-                          const res = await fetch(url)
-                          const blob = await res.blob()
+                          const url = await getDriveDownloadUrl(doc.drive_file_id, doc.drive_url)
                           const a = document.createElement('a')
-                          a.href = URL.createObjectURL(blob)
+                          a.href = url
                           a.download = doc.file_name || 'download'
+                          document.body.appendChild(a)
                           a.click()
-                          URL.revokeObjectURL(a.href)
-                        } catch {
-                          window.open(url, '_blank')
+                          a.remove()
+                          setTimeout(() => URL.revokeObjectURL(url), 60000)
+                        } catch (err) {
+                          setToast({ message: err.message || 'Could not download file', type: 'error' })
                         }
                       }}
                       style={{

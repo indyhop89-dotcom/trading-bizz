@@ -6,8 +6,12 @@ import {
   PageHeader, Card, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import DocumentChecklist from '../../components/DocumentChecklist'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
 import { formatINR } from '../../utils/money'
+import { suggestNextNo } from '../../utils/numbering'
+import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master-only delete, matches PI/PO/Invoices pattern
+import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { getInvoiceLifecycleStage } from '../../utils/stock'
 
 const MOVEMENT_TYPES    = ['domestic', 'export', 'blended']
 const ORDER_STATUSES    = ['open', 'in_progress', 'completed', 'cancelled']
@@ -20,14 +24,20 @@ const EMPTY_LEG   = { from_entity_id:'', to_entity_id:'', movement_status:'pendi
 // Resolve current FY — next_order_no takes ONLY fy_id (no ent_id)
 async function resolveFY() {
   const label = currentFYLabel()
-  const { data } = await supabase.from('financial_years').select('id,name,code').order('start_date',{ascending:false}).limit(5)
+  const { data } = await supabase.from('financial_years').select('id,name,code,start_date').order('start_date',{ascending:false}).limit(5)
   return (data||[]).find(f=>f.name===label) || data?.[0]
 }
 
 function LegPipeline({ pi, inv }) {
+  // CHANGED: third stage reflects actual stock movement (E-way-Bill-gated),
+  // distinct from the Invoice stage's payment status above it — an invoice
+  // can be fully paid while stock still sits with the seller if no E-way
+  // Bill has been generated yet, or vice versa.
+  const stockStage = inv ? getInvoiceLifecycleStage(inv) : null
   const stages = [
     { label:'Proforma Invoice', no:pi?.pi_no||null, status:pi?.status||null, amount:pi?.total_amount||0, stage:!pi?'pending':pi.status==='converted'?'done':'active' },
     { label:'Invoice', no:inv?.invoice_no||null, status:inv?.status||null, amount:inv?.total_amount||0, stage:!inv?'pending':inv.status==='paid'?'done':'active' },
+    { label:'Stock', no:stockStage?.label||null, status:stockStage?.key||null, amount:0, stage:!inv?'pending':stockStage.key==='completed'?'done':stockStage.key==='overdue'||stockStage.key==='cancelled'?'active':'active' },
   ]
   const COL = { done:{bg:'#edf7f1',text:'#1a7a40',border:'#b8dfca'}, active:{bg:'#e8f3fd',text:'#2490ef',border:'#b8d8f8'}, pending:{bg:'#f5f0e8',text:'#9a8a6a',border:'#e8dfc8'} }
   return (
@@ -71,7 +81,7 @@ function OrderSummaryTable({ legs, piMap, invMap }) {
             <th style={{...th,textAlign:'right'}}>PI Value</th>
             <th style={{...th,textAlign:'right'}}>Inv Value</th>
             <th style={{...th,textAlign:'right'}}>Margin</th>
-            <th style={th}>Inv Status</th><th style={th}>Movement</th>
+            <th style={th}>Inv Status</th><th style={th}>Stock</th><th style={th}>Movement</th>
             <th style={{...th,textAlign:'right'}}>Payment</th>
           </tr>
         </thead>
@@ -94,6 +104,7 @@ function OrderSummaryTable({ legs, piMap, invMap }) {
                 <td style={{...td,textAlign:'right',fontWeight:600,fontVariantNumeric:'tabular-nums'}}>{inv?.total_amount>0?formatINR(inv.total_amount):'—'}</td>
                 <td style={{...td,textAlign:'right',fontWeight:700,color:margin===null?C.textMuted:margin>=0?'#1a5c30':C.danger}}>{margin!==null?`${margin>=0?'+':''}${margin.toFixed(1)}%`:'—'}</td>
                 <td style={td}>{inv?<Badge status={inv.status}/>:<span style={{color:C.textMuted,fontSize:'11px'}}>—</span>}</td>
+                <td style={td}>{inv?(()=>{const s=getInvoiceLifecycleStage(inv);return <Badge status={s.key} label={s.label}/>})():pi?<Badge status='pending' label='Planned'/>:<span style={{color:C.textMuted,fontSize:'11px'}}>—</span>}</td>
                 <td style={td}><Badge status={leg.movement_status}/></td>
                 <td style={{...td,textAlign:'right',fontWeight:600,color:payColor}}>{payStatus}</td>
               </tr>
@@ -107,6 +118,15 @@ function OrderSummaryTable({ legs, piMap, invMap }) {
 
 function OrdersList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk delete — restricted to 'master' role, same convention as PI/PO/Invoices
+  const canDelete = profile?.role === 'master'
+  // CHANGED: which entities this user may raise an order *from* — orders_write
+  // is gated on has_entity_grant(origin_entity_id).
+  const { entities: accessEntities, frozen: originEntityFrozen, defaultEntityId } = useEntityAccess()
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [orders, setOrders]   = useState([])
   const [entities, setEntities] = useState([])
   const [loading, setLoading] = useState(true)
@@ -137,9 +157,14 @@ function OrdersList() {
     setSaving(true)
     const fy = await resolveFY()
     if (!fy) { setSaving(false); return setToast({message:'No financial year found in DB',type:'error'}) }
-    // next_order_no takes ONLY fy_id
-    const { data: orderNo, error: noErr } = await supabase.rpc('next_order_no', { fy_id: fy.id })
-    if (noErr) { setSaving(false); return setToast({message:'Could not generate order number: '+noErr.message,type:'error'}) }
+    // CHANGED: was calling the next_order_no RPC, which relied on the
+    // order_sequence counter table. After that table was reset (and like the
+    // other numbering RPCs that never reliably existed on the live DB), the
+    // RPC returned NULL with no error → NOT-NULL violation on order_no. Now
+    // uses the same client-side suggestNextNo() pattern as PI/PO/Invoice:
+    // format ORD-{fyCode}-NNN, derived from the highest existing order_no.
+    const fyCode = fyCodeForDate(fy.start_date || today())
+    const orderNo = await suggestNextNo({ table: 'orders', noCol: 'order_no', entityShort: 'ORD', fyCode })
     const payload = {...form, order_no:orderNo, financial_year_id:fy.id}
     if (!payload.origin_entity_id) delete payload.origin_entity_id
     if (!payload.destination_entity_id) delete payload.destination_entity_id
@@ -159,9 +184,27 @@ function OrdersList() {
   })
   const en = e=>e?.short_name||e?.name||'—'
 
+  // CHANGED: multi-select + bulk soft-delete, same shape as PI/PO/Invoices
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(o => o.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('orders').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} order(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   return (
     <div>
-      <PageHeader title='Orders' subtitle='Track every movement of goods end-to-end' action={<Btn onClick={()=>{setForm(EMPTY_ORDER);setModalOpen(true)}}>+ New Order</Btn>}/>
+      <PageHeader title='Orders' subtitle='Track every movement of goods end-to-end' action={<Btn onClick={()=>{setForm({...EMPTY_ORDER,origin_entity_id:defaultEntityId});setModalOpen(true)}}>+ New Order</Btn>}/>
       <div style={{display:'flex',gap:'10px',marginBottom:'16px',flexWrap:'wrap'}}>
         <input value={search} onChange={e=>setSearch(e.target.value)} placeholder='Search orders…' style={{padding:'8px 12px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',flex:1,minWidth:'180px',fontFamily:'inherit'}}/>
         <select value={statusFilter} onChange={e=>setStatusFilter(e.target.value)} style={{padding:'8px 12px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',cursor:'pointer',fontFamily:'inherit'}}>
@@ -173,18 +216,39 @@ function OrdersList() {
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear dates</Btn>}
       </div>
 
+      {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff3cc', border: '1px solid #e8d89a', borderRadius: '6px', padding: '8px 14px', marginBottom: '12px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 600 }}>{selected.size} order{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px',overflow:'hidden'}}>
         {loading ? <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
         : <div style={{overflowX:'auto'}}>
             <table style={{width:'100%',borderCollapse:'collapse',fontSize:'13px'}}>
-              <thead><tr>{['Order','Type','From','To','FY','Status','Date',''].map((h,i)=>(
+              <thead><tr>
+                {/* CHANGED: checkbox column, master-only, same as PI/PO/Invoices */}
+                {canDelete && <th style={{padding:'8px 12px',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,width:'32px'}}>
+                  <input type='checkbox' checked={filtered.length>0 && selected.size===filtered.length}
+                    onChange={toggleSelectAll} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
+                </th>}
+                {['Order','Type','From','To','FY','Status','Date',''].map((h,i)=>(
                 <th key={i} style={{padding:'8px 12px',textAlign:i===7?'right':'left',fontSize:'11px',fontWeight:700,color:C.textSoft,textTransform:'uppercase',letterSpacing:'0.05em',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,whiteSpace:'nowrap'}}>{h}</th>
               ))}</tr></thead>
               <tbody>
-                {filtered.length===0&&<tr><td colSpan={8} style={{padding:'48px',textAlign:'center',color:C.textMuted}}>No orders found.</td></tr>}
+                {filtered.length===0&&<tr><td colSpan={canDelete?9:8} style={{padding:'48px',textAlign:'center',color:C.textMuted}}>No orders found.</td></tr>}
                 {filtered.map((o,ri)=>(
                   <React.Fragment key={o.id}>
                     <tr key={o.id} style={{background:ri%2===0?C.surface:'#faf6ed'}} onMouseEnter={e=>e.currentTarget.style.background='#f0e8d8'} onMouseLeave={e=>e.currentTarget.style.background=ri%2===0?C.surface:'#faf6ed'}>
+                      {/* CHANGED: per-row checkbox */}
+                      {canDelete && <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}} onClick={e=>e.stopPropagation()}>
+                        <input type='checkbox' checked={selected.has(o.id)} onChange={()=>toggleSelect(o.id)} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
+                      </td>}
                       <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
                       <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}}><Badge status={o.movement_type}/></td>
                       <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.origin)}</td>
@@ -201,7 +265,7 @@ function OrdersList() {
                     </tr>
                     {expandedRow===o.id&&(
                       <tr key={o.id+'-exp'}>
-                        <td colSpan={8} style={{padding:0,borderBottom:`1px solid ${C.border}`}}>
+                        <td colSpan={canDelete?9:8} style={{padding:0,borderBottom:`1px solid ${C.border}`}}>
                           <div style={{padding:'14px 16px',background:'#f5f0e8',display:'flex',gap:'24px',alignItems:'flex-start',flexWrap:'wrap'}}>
                             <div style={{flex:1,minWidth:'200px'}}>
                               <div style={{fontSize:'11px',fontWeight:700,color:C.textMuted,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:'6px'}}>Order Details</div>
@@ -247,9 +311,9 @@ function OrdersList() {
             <FormRow label='Status'>
               <Select value={form.status} onChange={e=>setF('status',e.target.value)}>{ORDER_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select>
             </FormRow>
-            <FormRow label='Origin Entity'>
-              <Select value={form.origin_entity_id} onChange={e=>setF('origin_entity_id',e.target.value)}>
-                <option value=''>Select entity</option>{entities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}
+            <FormRow label='Origin Entity' hint={originEntityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.origin_entity_id} onChange={e=>setF('origin_entity_id',e.target.value)} disabled={originEntityFrozen}>
+                <option value=''>Select entity</option>{accessEntities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Destination Entity'>
@@ -265,6 +329,9 @@ function OrdersList() {
           </div>
         </div>
       </Modal>
+      {/* CHANGED: bulk delete confirmation, same pattern as PI/PO/Invoices */}
+      <ConfirmModal open={confirmBulkDelete} onClose={()=>setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Orders' message={`Delete ${selected.size} selected order(s)? This cannot be undone.`} danger/>
       {toast&&<Toast message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
     </div>
   )
@@ -273,6 +340,15 @@ function OrdersList() {
 function OrderDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: single-order delete, master-only, same convention as PI/PO/Invoices detail pages
+  const canDelete = profile?.role === 'master'
+  // CHANGED: orders_write / order_legs_write are both gated on
+  // has_entity_grant(origin_entity_id / from_entity_id) — same "creating
+  // side" restriction as the New Order form.
+  const { entities: accessEntities, frozen: originEntityFrozen, defaultEntityId } = useEntityAccess()
+  const [confirmDeleteOrder, setConfirmDeleteOrder] = useState(false)
+  const [deletingOrder, setDeletingOrder] = useState(false)
   const [order, setOrder]       = useState(null)
   const [legs, setLegs]         = useState([])
   const [entities, setEntities] = useState([])
@@ -288,6 +364,9 @@ function OrderDetail() {
   const [piMap, setPiMap]       = useState({})
   const [invMap, setInvMap]     = useState({})
   const [docsOpen, setDocsOpen] = useState({})
+  // CHANGED: order-wide document completeness — sums each leg's checklist
+  // instead of only showing completeness one leg at a time.
+  const [docCompleteness, setDocCompleteness] = useState({ uploaded: 0, total: 0 })
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -299,14 +378,21 @@ function OrderDetail() {
     setOrder(o); setLegs(ls||[]); setEntities(es||[]); setLoading(false)
     if (ls?.length) {
       const legIds = ls.map(l=>l.id)
-      const [{ data: piRows },{ data: invRows }] = await Promise.all([
-        supabase.from('proforma_invoices').select('id,pi_no,status,total_amount,taxable_amount,leg_id,pi_date').in('leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
-        supabase.from('invoices').select('id,invoice_no,status,total_amount,taxable_amount,outstanding_amount,leg_id,invoice_date').in('leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+      const [{ data: piRows },{ data: invRows },{ data: checklistRows }] = await Promise.all([
+        // CHANGED: was querying/filtering on `leg_id`, but proforma_invoices/
+        // invoices reference a leg via `order_leg_id` (see PI/Invoices save
+        // payloads) — `leg_id` doesn't exist on these two tables, so both
+        // queries errored and this map silently stayed empty for every leg.
+        supabase.from('proforma_invoices').select('id,pi_no,status,total_amount,taxable_amount,order_leg_id,pi_date').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+        supabase.from('invoices').select('id,invoice_no,status,total_amount,taxable_amount,outstanding_amount,order_leg_id,invoice_date,eway_bill_no,invoice_type').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+        supabase.from('leg_document_checklist').select('leg_id,status').in('leg_id',legIds),
       ])
       const pMap={}, iMap={}
-      for (const pi of (piRows||[])){ if(!pMap[pi.leg_id]) pMap[pi.leg_id]=pi }
-      for (const inv of (invRows||[])){ if(!iMap[inv.leg_id]) iMap[inv.leg_id]=inv }
+      for (const pi of (piRows||[])){ if(!pMap[pi.order_leg_id]) pMap[pi.order_leg_id]=pi }
+      for (const inv of (invRows||[])){ if(!iMap[inv.order_leg_id]) iMap[inv.order_leg_id]=inv }
       setPiMap(pMap); setInvMap(iMap)
+      const relevant = (checklistRows||[]).filter(c=>c.status!=='na')
+      setDocCompleteness({ uploaded: relevant.filter(c=>c.status==='uploaded').length, total: relevant.length })
     }
   }, [id])
 
@@ -314,7 +400,7 @@ function OrderDetail() {
   function setLF(k,v){ setLegForm(f=>({...f,[k]:v})) }
   function setOF(k,v){ setOrderForm(f=>({...f,[k]:v})) }
   function toggleDocs(legId){ setDocsOpen(d=>({...d,[legId]:!d[legId]})) }
-  function openNewLeg(){ setEditingLeg(null); setLegForm({...EMPTY_LEG}); setLegModal(true) }
+  function openNewLeg(){ setEditingLeg(null); setLegForm({...EMPTY_LEG,from_entity_id:defaultEntityId}); setLegModal(true) }
   function openEditLeg(leg){ setEditingLeg(leg); setLegForm({from_entity_id:leg.from_entity_id||'',to_entity_id:leg.to_entity_id||'',movement_status:leg.movement_status||'pending',cargo_status:leg.cargo_status||'awaiting_cargo',dispatch_date:leg.dispatch_date||'',delivery_date:leg.delivery_date||'',notes:leg.notes||''}); setLegModal(true) }
 
   async function handleSaveLeg(){
@@ -342,6 +428,15 @@ function OrderDetail() {
     await supabase.from('orders').update(payload).eq('id',id)
     setEditOrderModal(false); load()
   }
+  // CHANGED: soft-delete the order itself (order_legs are untouched — same
+  // as PI/PO/Invoices, which don't cascade-delete their child rows either)
+  async function handleDeleteOrder(){
+    setDeletingOrder(true)
+    const { error } = await supabase.from('orders').update({ is_deleted: true }).eq('id', id)
+    setDeletingOrder(false); setConfirmDeleteOrder(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/orders')
+  }
 
   if (loading) return <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
   if (!order)  return <div style={{padding:'48px',textAlign:'center',color:C.danger}}>Order not found.</div>
@@ -360,6 +455,8 @@ function OrderDetail() {
         action={<div style={{display:'flex',gap:'8px'}}>
           <Btn variant='ghost' onClick={()=>{setOrderForm({name:order.name,movement_type:order.movement_type,status:order.status,origin_entity_id:order.origin_entity_id||'',destination_entity_id:order.destination_entity_id||'',notes:order.notes||''});setEditOrderModal(true)}}>Edit Order</Btn>
           <Btn onClick={openNewLeg}>+ Add Leg</Btn>
+          {/* CHANGED: master-only order delete, same convention as PI/PO/Invoices */}
+          {canDelete && <Btn variant='danger' onClick={()=>setConfirmDeleteOrder(true)} disabled={deletingOrder}>{deletingOrder?'Deleting…':'Delete Order'}</Btn>}
         </div>}
       />
 
@@ -385,7 +482,18 @@ function OrderDetail() {
       )}
 
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'12px'}}>
-        <div style={{fontWeight:700,fontSize:'14px',color:C.text}}>Order Legs</div>
+        <div style={{display:'flex',alignItems:'center',gap:'10px'}}>
+          <div style={{fontWeight:700,fontSize:'14px',color:C.text}}>Order Legs</div>
+          {docCompleteness.total > 0 && (
+            <span style={{
+              fontSize:'11px',fontWeight:700,padding:'2px 8px',borderRadius:'4px',
+              background: docCompleteness.uploaded===docCompleteness.total ? '#e6f4ec' : '#fef6e4',
+              color: docCompleteness.uploaded===docCompleteness.total ? '#1a6b35' : '#7a4f00',
+            }}>
+              📎 {docCompleteness.uploaded}/{docCompleteness.total} docs across order
+            </span>
+          )}
+        </div>
         <Btn size='sm' onClick={openNewLeg}>+ Add Leg</Btn>
       </div>
 
@@ -438,7 +546,7 @@ function OrderDetail() {
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
             <FormRow label='Movement Type'><Select value={orderForm.movement_type||'domestic'} onChange={e=>setOF('movement_type',e.target.value)}>{MOVEMENT_TYPES.map(t=><option key={t} value={t}>{t}</option>)}</Select></FormRow>
             <FormRow label='Status'><Select value={orderForm.status||'open'} onChange={e=>setOF('status',e.target.value)}>{ORDER_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
-            <FormRow label='Origin Entity'><Select value={orderForm.origin_entity_id||''} onChange={e=>setOF('origin_entity_id',e.target.value)}><option value=''>Select</option>{entities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}</Select></FormRow>
+            <FormRow label='Origin Entity' hint={originEntityFrozen ? 'Locked to the only entity you have access to' : undefined}><Select value={orderForm.origin_entity_id||''} onChange={e=>setOF('origin_entity_id',e.target.value)} disabled={originEntityFrozen}><option value=''>Select</option>{accessEntities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}</Select></FormRow>
             <FormRow label='Destination Entity'><Select value={orderForm.destination_entity_id||''} onChange={e=>setOF('destination_entity_id',e.target.value)}><option value=''>Select</option>{entities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}</Select></FormRow>
           </div>
           <FormRow label='Notes'><Textarea value={orderForm.notes||''} onChange={e=>setOF('notes',e.target.value)} rows={2}/></FormRow>
@@ -452,7 +560,7 @@ function OrderDetail() {
       <Modal open={legModal} onClose={()=>setLegModal(false)} title={editingLeg?'Edit Leg':'Add Leg'} width={540}>
         <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
-            <FormRow label='From Entity' required><Select value={legForm.from_entity_id} onChange={e=>setLF('from_entity_id',e.target.value)}><option value=''>Select</option>{entities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}</Select></FormRow>
+            <FormRow label='From Entity' required hint={originEntityFrozen ? 'Locked to the only entity you have access to' : undefined}><Select value={legForm.from_entity_id} onChange={e=>setLF('from_entity_id',e.target.value)} disabled={originEntityFrozen}><option value=''>Select</option>{accessEntities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}</Select></FormRow>
             <FormRow label='To Entity' required><Select value={legForm.to_entity_id} onChange={e=>setLF('to_entity_id',e.target.value)}><option value=''>Select</option>{entities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}</Select></FormRow>
             <FormRow label='Movement Status'><Select value={legForm.movement_status} onChange={e=>setLF('movement_status',e.target.value)}>{MOVEMENT_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
             <FormRow label='Cargo Status'><Select value={legForm.cargo_status} onChange={e=>setLF('cargo_status',e.target.value)}>{CARGO_STATUSES.map(s=><option key={s} value={s}>{s.replace(/_/g,' ')}</option>)}</Select></FormRow>
@@ -468,6 +576,9 @@ function OrderDetail() {
       </Modal>
 
       <ConfirmModal open={!!confirmDelete} onClose={()=>setConfirmDelete(null)} onConfirm={handleDeleteLeg} title='Remove Leg' message={`Remove Leg ${confirmDelete?.leg_no}? This cannot be undone.`} danger/>
+      {/* CHANGED: confirm modal for deleting the whole order */}
+      <ConfirmModal open={confirmDeleteOrder} onClose={()=>setConfirmDeleteOrder(false)} onConfirm={handleDeleteOrder}
+        title='Delete Order' message={`Delete "${order.name}"${order.order_no?' ('+order.order_no+')':''}? This cannot be undone.`} danger/>
       {toast&&<Toast message={toast.message} type={toast.type} onClose={()=>setToast(null)}/>}
     </div>
   )

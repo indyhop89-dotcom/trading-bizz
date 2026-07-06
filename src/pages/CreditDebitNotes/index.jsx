@@ -8,8 +8,10 @@ import {
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { formatINR } from '../../utils/money'
-import { fmtDate, today, currentFYLabel } from '../../utils/dates'
+import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
 import { buildHSNMap } from '../../utils/hsn'
+import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces broken next_note_no RPC / undefined resolveFY
 
 const NOTE_TYPES = ['credit_note', 'debit_note']
 const REASONS    = ['return', 'rate_correction', 'quantity_correction', 'other']
@@ -18,6 +20,12 @@ const STATUSES   = ['draft', 'submitted', 'cancelled']
 // ─── List ──────────────────────────────────────────────────────────────────────
 function NoteList() {
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
+  const canDelete = profile?.role === 'master'
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
   const [notes, setNotes]       = useState([])
   const [entities, setEntities] = useState([])
   const [invoices, setInvoices] = useState([])
@@ -31,6 +39,7 @@ function NoteList() {
     issuer_entity_id: '', receiver_entity_id: '',
     note_date: today(), reason: 'return', reason_notes: '',
     is_interstate: false, notes: '',
+    note_no: '', // CHANGED: optional manual note number — blank suggests one via suggestNextNo()
   })
   const [noteLines, setNoteLines] = useState([])
   const [saving, setSaving]     = useState(false)
@@ -76,19 +85,39 @@ function NoteList() {
     const computed = noteLines.map(l => computeLine(l, form.is_interstate))
     const totals   = computeTotals(computed)
     setSaving(true)
+    // CHANGED: resolveFY() was called here but never defined anywhere in this
+    // file — every note creation threw "resolveFY is not defined" before
+    // even reaching the (also broken — next_note_no was never created on the
+    // live DB, no note_sequence table either) RPC call. Replaced with the
+    // same suggestNextNo() pattern already proven for PI/PO/Invoices: an
+    // optional manual note number (checked for duplicates), or an
+    // auto-suggested one if left blank. FY code computed directly from the
+    // note's own date, same as the other modules — no DB round-trip needed.
+    const fyCode = fyCodeForDate(form.note_date)
+    let noteNo = (form.note_no || '').trim()
+    if (noteNo) {
+      const dup = notes.find(n => n.note_no?.toLowerCase() === noteNo.toLowerCase())
+      if (dup) { setSaving(false); return setToast({ message: `Note number "${noteNo}" is already in use`, type: 'error' }) }
+    } else {
+      const issuerEntity = entities.find(e => e.id === form.issuer_entity_id)
+      const typePrefix = form.note_type === 'credit_note' ? 'CN' : 'DN'
+      noteNo = await suggestNextNo({ table: 'credit_debit_notes', noCol: 'note_no', entityShort: `${issuerEntity?.short_name || issuerEntity?.name || 'X'}-${typePrefix}`, fyCode })
+    }
     const payload = {
       note_type: form.note_type, against_invoice_id: form.against_invoice_id,
       issuer_entity_id: form.issuer_entity_id, receiver_entity_id: form.receiver_entity_id,
       note_date: form.note_date, reason: form.reason, reason_notes: form.reason_notes||null,
       is_interstate: form.is_interstate, ...totals,
-      status: 'draft', notes: form.notes||null,
+      status: 'draft', notes: form.notes||null, note_no: noteNo,
     }
-    const fy = await resolveFY()
-    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
-    const { data: noteNo, error: noErr } = await supabase.rpc('next_note_no', { ent_id: form.issuer_entity_id, fy_id: fy.id, note_type: form.note_type })
-    if (noErr) { setSaving(false); return setToast({ message: 'Could not generate note number: '+noErr.message, type: 'error' }) }
-    payload.note_no = noteNo
-    payload.financial_year_id = fy.id
+    // NOTE: the migration doc for credit_debit_notes marks financial_year_id
+    // NOT NULL, but the same doc-vs-live mismatch was confirmed for
+    // proforma_invoices/purchase_orders/invoices (column simply doesn't
+    // exist on the live tables despite the migration file). Not setting it
+    // here to match that precedent — if it turns out this table's live
+    // schema DOES have and require the column, this insert will fail with a
+    // clear "null value in column financial_year_id" error rather than
+    // silently succeeding wrong, and it's a one-line fix to add it back.
     const { data: note, error } = await supabase.from('credit_debit_notes').insert(payload).select().single()
     if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
     if (noteLines.length > 0) {
@@ -109,7 +138,31 @@ function NoteList() {
     return mt && ms
   })
 
+  // CHANGED: multi-select + bulk soft-delete, same shape as PI/PO/Invoices
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(n => n.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('credit_debit_notes').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} note(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+
   const columns = [
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: n => <input type='checkbox' checked={selected.has(n.id)}
+        onChange={() => toggleSelect(n.id)} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.',    render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'Note No',  render: n => <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{n.note_no || '—'}</span> },
     { label: 'Type',     render: n => <Badge status={n.note_type === 'credit_note' ? 'receipt' : 'payment'} label={n.note_type === 'credit_note' ? 'Credit Note' : 'Debit Note'} /> },
@@ -127,7 +180,7 @@ function NoteList() {
       <PageHeader
         title='Credit & Debit Notes'
         subtitle='Adjustments against issued invoices'
-        action={<Btn onClick={() => { setForm({ note_type: 'credit_note', against_invoice_id: '', issuer_entity_id: '', receiver_entity_id: '', note_date: today(), reason: 'return', reason_notes: '', is_interstate: false, notes: '' }); setNoteLines([]); setModalOpen(true) }}>+ New Note</Btn>}
+        action={<Btn onClick={() => { setForm({ note_type: 'credit_note', against_invoice_id: '', issuer_entity_id: '', receiver_entity_id: '', note_date: today(), reason: 'return', reason_notes: '', is_interstate: false, notes: '', note_no: '' }); setNoteLines([]); setModalOpen(true) }}>+ New Note</Btn>}
       />
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
@@ -143,6 +196,17 @@ function NoteList() {
           {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
       </div>
+
+      {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff3cc', border: '1px solid #e8d89a', borderRadius: '6px', padding: '8px 14px', marginBottom: '12px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 600 }}>{selected.size} note{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
 
       <Card>
         {loading
@@ -166,6 +230,9 @@ function NoteList() {
             </FormRow>
             <FormRow label='Note Date' required>
               <Input type='date' value={form.note_date} onChange={e => setF('note_date', e.target.value)} />
+            </FormRow>
+            <FormRow label='Note Number' hint='Leave blank to auto-generate'>
+              <Input value={form.note_no} onChange={e => setF('note_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Reason' required>
               <Select value={form.reason} onChange={e => setF('reason', e.target.value)}>
@@ -207,6 +274,9 @@ function NoteList() {
           </div>
         </div>
       </Modal>
+      {/* CHANGED: bulk delete confirmation */}
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Notes' message={`Delete ${selected.size} selected note(s)? This cannot be undone.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
@@ -216,6 +286,11 @@ function NoteList() {
 function NoteDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const { profile } = useAuth()
+  // CHANGED: master-only delete, same convention as PI/PO/Invoices detail pages
+  const canDelete = profile?.role === 'master'
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [note, setNote]   = useState(null)
   const [lines, setLines] = useState([])
   const [loading, setLoading] = useState(true)
@@ -242,6 +317,14 @@ function NoteDetail() {
     setToast({ message: `Note ${status}`, type: 'success' })
     load()
   }
+  // CHANGED: single-note soft delete
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('credit_debit_notes').update({ is_deleted: true }).eq('id', id)
+    setDeleting(false); setConfirmDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    navigate('/credit-debit-notes')
+  }
 
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!note)   return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>Note not found.</div>
@@ -260,6 +343,8 @@ function NoteDetail() {
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
             {note.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {note.status !== 'cancelled' && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            {/* CHANGED: master-only note delete */}
+            {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting ? 'Deleting…' : 'Delete'}</Btn>}
             <Badge status={isCredit ? 'receipt' : 'payment'} label={isCredit ? 'Credit Note' : 'Debit Note'} />
             <Badge status={note.status} />
           </div>
@@ -299,6 +384,9 @@ function NoteDetail() {
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
         title='Cancel Note' message='Cancel this note? This cannot be undone.' danger />
+      {/* CHANGED: delete confirmation */}
+      <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
+        title='Delete Note' message={`Delete ${note.note_no || 'this note'}? This cannot be undone.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

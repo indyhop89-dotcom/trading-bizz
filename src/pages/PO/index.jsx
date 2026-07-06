@@ -10,11 +10,31 @@ import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
+import { withTimeout } from '../../utils/query'
+import { cleanProductName, productMatchKey } from '../../utils/products'
 import DocumentAttachments from '../../components/DocumentAttachments'
-import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 const PO_STATUSES = ['open', 'partial', 'completed', 'cancelled']
+
+// CHANGED: LineItemsEditor lines carry UI-only helper fields (_id, _cost_rate,
+// _margin_pct, _hsn_*) that are NOT columns on purchase_order_lines. Sending
+// them made every insert fail with "Could not find the '_id' column…". This
+// keeps only the real DB columns. (The old `_id: undefined` trick didn't work —
+// undefined survives supabase-js serialization for some fields, and the other
+// _-prefixed helpers were still being sent regardless.)
+const PO_LINE_COLUMNS = [
+  'product_id', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
+  'taxable_amount', 'cgst_rate', 'cgst_amount', 'sgst_rate', 'sgst_amount',
+  'igst_rate', 'igst_amount', 'total_amount',
+]
+function toPOLinePayload(computedLine, poId, lineNo) {
+  const out = { po_id: poId, line_no: lineNo }
+  for (const col of PO_LINE_COLUMNS) if (computedLine[col] !== undefined) out[col] = computedLine[col]
+  return out
+}
 
 const EMPTY_FORM = {
   po_date: today(), delivery_date: '', status: 'open',
@@ -31,6 +51,10 @@ function POList() {
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
   const canDelete = profile?.role === 'master'
+  // CHANGED: which entities this user may raise a PO *as buyer* — the buyer
+  // converts the seller's PI into their own PO, so buyer is the writing side
+  // (see 015_fix_po_write_gate.sql — po_write is gated on buyer_entity_id).
+  const { entities: accessEntities, frozen: buyerEntityFrozen, defaultEntityId } = useEntityAccess()
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
@@ -38,6 +62,10 @@ function POList() {
   const [entities, setEntities] = useState([])
   const [orders, setOrders] = useState([])
   const [pis, setPIs]       = useState([])
+  // CHANGED: needed to resolve/auto-create products for CSV-uploaded lines —
+  // same product_id=null gap found in PI and Invoice CSV upload also existed
+  // here.
+  const [products, setProducts] = useState([])
   const [hsnMap, setHsnMap] = useState(new Map())
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
@@ -46,6 +74,7 @@ function POList() {
   const [form, setForm]     = useState(EMPTY_FORM)
   const [legs, setLegs]     = useState([])
   const [poLines, setPOLines] = useState([])
+  const [linesLoading, setLinesLoading] = useState(false)  // CHANGED: PI line-item fetch in progress
   const [saving, setSaving] = useState(false)
   const [toast, setToast]   = useState(null)
   const [csvModal, setCsvModal]   = useState(false)
@@ -57,20 +86,23 @@ function POList() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: ps }, { data: es }, { data: os }, { data: piData }, { data: hsnRows }] = await Promise.all([
+    const [{ data: ps }, { data: es }, { data: os }, { data: piData }, { data: hsnRows }, { data: prods }] = await Promise.all([
       supabase.from('purchase_orders')
         .select('*, buyer:buyer_entity_id(name,short_name), seller:seller_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
-      supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
+      supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
+      // CHANGED: for CSV product resolution below
+      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate'),
     ])
     setPOs(ps || [])
     setEntities(es || [])
     setOrders(os || [])
     setPIs(piData || [])
     setHsnMap(buildHSNMap(hsnRows || []))
+    setProducts(prods || [])
     setLoading(false)
   }, [])
 
@@ -87,15 +119,64 @@ function POList() {
         if (buyerE?.state_code && sellerE?.state_code)
           updated.is_interstate = buyerE.state_code !== sellerE.state_code
       }
-      if (k === 'pi_id' && v) {
-        const pi = pis.find(p => p.id === v)
-        if (pi) {
-          if (!updated.seller_entity_id) updated.seller_entity_id = pi.from_entity_id
-          if (!updated.buyer_entity_id)  updated.buyer_entity_id  = pi.to_entity_id
-        }
-      }
       return updated
     })
+  }
+
+  // CHANGED: selecting a linked PI previously only prefilled buyer/seller —
+  // the actual planned line items from the PI never carried over, so every
+  // PO required re-typing every line by hand even though the PI already had
+  // them. Now pulls the PI's order/leg and its proforma_invoice_lines in,
+  // converting them into PO line shape (recomputed via computeLine so tax
+  // splits match this PO's own is_interstate). Only overwrites poLines when
+  // it's empty, so it won't clobber lines you've already started editing.
+  async function handlePISelect(piId) {
+    const pi = pis.find(p => p.id === piId)
+    setForm(f => ({
+      ...f,
+      pi_id: piId,
+      seller_entity_id: f.seller_entity_id || pi?.from_entity_id || '',
+      buyer_entity_id:  f.buyer_entity_id  || pi?.to_entity_id   || '',
+      order_id:         f.order_id         || pi?.order_id       || '',
+      order_leg_id:     f.order_leg_id     || pi?.order_leg_id   || '',
+    }))
+    if (pi?.order_id && !form.order_id) loadLegs(pi.order_id)
+    if (!piId || poLines.length > 0) return
+    // CHANGED: show a visible "loading" state while the PI lines are fetched
+    // (previously nothing appeared, so a slow query looked like a freeze), and
+    // bound the wait with a timeout so it can't hang the modal indefinitely.
+    setLinesLoading(true)
+    try {
+      const { data: piLines, error } = await withTimeout(
+        supabase.from('proforma_invoice_lines')
+          .select('product_id,description,hsn_code,qty,unit,rate,gst_rate,line_no')
+          .eq('pi_id', piId).order('line_no'),
+        20000, 'Loading PI line items',
+      )
+      if (error) { setToast({ message: `Could not load PI lines: ${error.message}`, type: 'error' }); return }
+      if (piLines?.length) {
+        // computeLine() is normally only run by LineItemsEditor's own onChange
+        // handlers — lines injected directly via setPOLines skip it, leaving
+        // taxable_amount/total_amount at 0. Run it up front so the preview is
+        // correct immediately.
+        setPOLines(piLines.map((l, i) => computeLine({
+          _id: Date.now() + i, line_no: i + 1,
+          product_id: l.product_id || '', description: l.description,
+          hsn_code: l.hsn_code, qty: l.qty, unit: l.unit,
+          rate: l.rate, gst_rate: l.gst_rate,
+          _hsn_resolved_rate: null, _hsn_override: false, _cost_rate: null, _margin_pct: '',
+        }, form.is_interstate)))
+      } else {
+        // CHANGED: make "nothing to load" explicit — otherwise a PI with no
+        // saved lines just silently shows an empty table, which looks like a
+        // hang. (This is exactly what happened with PI/LS/01.)
+        setToast({ message: `${pi?.pi_no || 'This PI'} has no line items saved — add lines manually below, or open the PI to check it.`, type: 'info' })
+      }
+    } catch (e) {
+      setToast({ message: `Could not load PI lines: ${e.message}`, type: 'error' })
+    } finally {
+      setLinesLoading(false)
+    }
   }
 
   async function loadLegs(orderId) {
@@ -134,12 +215,14 @@ function POList() {
     if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
 
     if (poLines.length > 0) {
-      const linesPayload = poLines.map((l, i) => ({
-        ...computeLine(l, form.is_interstate),
-        po_id: po.id, line_no: i + 1,
-        _id: undefined,
-      }))
-      await supabase.from('purchase_order_lines').insert(linesPayload)
+      const linesPayload = poLines.map((l, i) => toPOLinePayload(computeLine(l, form.is_interstate), po.id, i + 1))
+      // CHANGED: was never checking this insert's result — a silent failure
+      // left a PO header with zero lines and no indication anything went wrong.
+      const { error: lErr } = await supabase.from('purchase_order_lines').insert(linesPayload)
+      if (lErr) {
+        setSaving(false)
+        return setToast({ message: `PO was created, but its line items failed to save: ${lErr.message}. Delete this PO and try again.`, type: 'error' })
+      }
     }
 
     setSaving(false)
@@ -150,26 +233,67 @@ function POList() {
   }
 
   // ── CSV handler ───────────────────────────────────────────────────────────────
-  // Format: po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no
+  // Format: po_date,buyer_entity,seller_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no
   // CHANGED: po_no is optional — blank = suggested via suggestNextNo(); if
   // supplied, used as-is after a duplicate check (existing POs + this file).
+  // CHANGED: added a "product" column + resolution step — same product_id=null
+  // gap found and fixed in PI and Invoice CSV upload also existed here.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
     const delim = detectDelimiter(lines[0])
-    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    // CHANGED: quote-aware parsing — same fix applied to PI/Invoices, plain
+    // split(delim) shredded any product name/description containing a comma
+    // inside quotes.
+    const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
     const usedPoNos = new Set(pos.map(p => p.po_no?.toLowerCase()).filter(Boolean))
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delim).map(c => c.trim())
+      const cols = parseCSVLine(lines[i], delim)
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       const key = `${row.po_date}__${row.buyer_entity}__${row.seller_entity}`
       if (!groups[key]) groups[key] = { meta: row, lines: [] }
       groups[key].lines.push(row)
     }
+
+    // CHANGED: resolve/auto-create products up front, across all groups —
+    // same approach as Opening Stock / PI / Invoices CSV handlers.
+    // CHANGED: match on name + HSN + rate + GST together, not name alone —
+    // only merge when all four match (per product-owner decision); otherwise
+    // treat as a different product even if the name is identical.
+    // CHANGED: precomputed Map (key -> product) instead of an array .find()
+    // re-run per row — avoids millions of redundant match-key computations on
+    // a large file, which was slow enough to look like a hang.
+    const productMap = new Map()
+    for (const p of products) {
+      productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+    }
+    const rowMatchKey = row => productMatchKey({ name: row.product, hsn_code: row.hsn_code, rate: row.rate, gst_rate: row.gst_rate })
+    const findProduct = row => productMap.get(rowMatchKey(row))
+    const allRows = Object.values(groups).flatMap(g => g.lines)
+    const missingKeys = new Set()
+    const missingRows = []
+    for (const r of allRows) {
+      if (!r.product?.trim()) continue
+      const k = rowMatchKey(r)
+      if (productMap.has(k) || missingKeys.has(k)) continue
+      missingKeys.add(k); missingRows.push(r)
+    }
+    if (missingRows.length > 0) {
+      const payloads = missingRows.map(src => ({ name: cleanProductName(src.product), hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }))
+      const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
+      if (pErr) {
+        errors.push(`Could not auto-create ${missingRows.length} new product(s) — ${pErr.message}`)
+      } else {
+        for (const p of (newProducts || [])) {
+          productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+        }
+      }
+    }
+
     for (const [key, group] of Object.entries(groups)) {
       const { meta, lines: gLines } = group
       const buyerE  = entities.find(e => e.short_name?.toLowerCase() === meta.buyer_entity?.toLowerCase()  || e.name?.toLowerCase() === meta.buyer_entity?.toLowerCase())
@@ -197,18 +321,27 @@ function POList() {
       }
       usedPoNos.add(poNo.toLowerCase())
 
+      // CHANGED: require a resolvable product per line — a line with no
+      // product reference cannot be tracked in stock, so we reject it
+      // clearly rather than silently inserting it with product_id = null.
+      let lineErr = false
       const interstate = meta.is_interstate === 'true' || (buyerE.state_code && sellerE.state_code && buyerE.state_code !== sellerE.state_code)
       const poLines = gLines.map((r, i) => {
+        const product = r.product?.trim() ? findProduct(r) : null
+        if (r.product?.trim() && !product) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
+        if (!r.product?.trim()) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
         const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
         const igst = interstate ? Math.round(taxable * gstRate / 100) : 0
         const cgst = !interstate ? Math.round(taxable * half / 100) : 0
-        return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
+        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
+      if (lineErr) continue
       const totals = poLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
       const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, ...totals }).select().single()
       if (poErr) { errors.push(`PO ${meta.po_date}: ${poErr.message}`); continue }
-      await supabase.from('purchase_order_lines').insert(poLines.map(l => ({ ...l, po_id: po.id })))
+      const { error: lineInsertErr } = await supabase.from('purchase_order_lines').insert(poLines.map(l => ({ ...l, po_id: po.id })))
+      if (lineInsertErr) { errors.push(`PO ${poNo}: header created but line items failed to save: ${lineInsertErr.message}`); continue }
       created++
     }
     setCsvSaving(false); setCsvResult({ created, errors }); load()
@@ -245,6 +378,10 @@ function POList() {
     load()
   }
 
+  // CHANGED: live totals for the New PO modal — shown at top and bottom so the
+  // buyer can confirm the figures before creating the PO.
+  const modalTotals = computeTotals(poLines.map(l => computeLine(l, form.is_interstate)))
+
   const columns = [
     ...(canDelete ? [{
       label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
@@ -271,7 +408,7 @@ function POList() {
           <div style={{ display: 'flex', gap: '8px' }}>
             <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
             <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
-            <Btn onClick={() => { setForm(EMPTY_FORM); setPOLines([]); setModalOpen(true) }}>+ New PO</Btn>
+            <Btn onClick={() => { setForm({ ...EMPTY_FORM, buyer_entity_id: defaultEntityId }); setPOLines([]); setModalOpen(true) }}>+ New PO</Btn>
           </div>
         }
       />
@@ -318,8 +455,8 @@ function POList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('po')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no</code><br /><br />
-            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO. <code>po_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing POs and other rows in this file).
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no</code><br /><br />
+            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO. <code>po_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing POs and other rows in this file). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -341,7 +478,19 @@ function POList() {
 
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title='New Purchase Order' width={900}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          <div style={{background:'#e8f3ec',border:'1px solid #b8dfca',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#1a5c30'}}>📅 Will be created under <strong>{currentFYLabel()}</strong></div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+            <div style={{background:'#e8f3ec',border:'1px solid #b8dfca',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#1a5c30'}}>📅 Will be created under <strong>{currentFYLabel()}</strong></div>
+            {/* CHANGED: totals summary + a Create button at the top so the PO can
+                be reviewed and created without scrolling to the bottom. */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+              <div style={{ textAlign: 'right', fontSize: '12px', color: C.textMid, lineHeight: 1.5 }}>
+                <div>Taxable: <strong style={{ color: C.text, fontVariantNumeric: 'tabular-nums' }}>{formatINR(modalTotals.taxable_amount)}</strong>
+                  {'  '}·{'  '}Tax: <strong style={{ color: C.text, fontVariantNumeric: 'tabular-nums' }}>{formatINR(modalTotals.cgst_amount + modalTotals.sgst_amount + modalTotals.igst_amount)}</strong></div>
+                <div style={{ fontSize: '14px', fontWeight: 700, color: C.text, fontVariantNumeric: 'tabular-nums' }}>Total: {formatINR(modalTotals.total_amount)}</div>
+              </div>
+              <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Create PO'}</Btn>
+            </div>
+          </div>
           <SectionDivider label='Details' />
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' }}>
             <FormRow label='PO Date' required>
@@ -354,15 +503,15 @@ function POList() {
               <Input type='date' value={form.delivery_date} onChange={e => setF('delivery_date', e.target.value)} />
             </FormRow>
             <FormRow label='Linked PI'>
-              <Select value={form.pi_id} onChange={e => setF('pi_id', e.target.value)}>
+              <Select value={form.pi_id} onChange={e => handlePISelect(e.target.value)}>
                 <option value=''>No PI linked</option>
                 {pis.map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0, 8)}</option>)}
               </Select>
             </FormRow>
-            <FormRow label='Buyer Entity' required>
-              <Select value={form.buyer_entity_id} onChange={e => setF('buyer_entity_id', e.target.value)}>
+            <FormRow label='Buyer Entity' required hint={buyerEntityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.buyer_entity_id} onChange={e => setF('buyer_entity_id', e.target.value)} disabled={buyerEntityFrozen}>
                 <option value=''>Select buyer</option>
-                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Seller Entity' required>
@@ -391,7 +540,13 @@ function POList() {
             </FormRow>
           </div>
           <SectionDivider label='Line Items' />
-          <LineItemsEditor lines={poLines} setLines={setPOLines} interstate={form.is_interstate} hsnMap={hsnMap} />
+          {linesLoading && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', background: '#fff8e6', border: '1px solid #e6c877', borderRadius: '6px', padding: '10px 14px', fontSize: '13px', color: '#7a5000' }}>
+              <span style={{ width: 16, height: 16, border: '2px solid #d9b24d', borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+              Loading line items from the linked PI…
+            </div>
+          )}
+          <LineItemsEditor lines={poLines} setLines={setPOLines} interstate={form.is_interstate} hsnMap={hsnMap} products={products} />
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>

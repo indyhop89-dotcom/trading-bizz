@@ -9,6 +9,12 @@ const TYPE_CONFIG = {
   overdue_invoice:      { icon: '⚠️', color: '#8a2020', bg: '#f0e8e8', label: 'Invoice Overdue' },
   bill_discounting_due: { icon: '🏦', color: '#7a5000', bg: '#fff3cc', label: 'BD Due' },
   stock_shortfall:      { icon: '📦', color: '#8a2020', bg: '#f0e8e8', label: 'Stock Shortfall' },
+  missing_product_mapping: { icon: '🏷️', color: '#7a5000', bg: '#fff3cc', label: 'Missing Product Link' },
+  invoice_cancelled_after_eway: { icon: '↩️', color: '#8a2020', bg: '#f0e8e8', label: 'Cancelled After E-way Bill' },
+  duplicate_invoice_number: { icon: '⚠️', color: '#8a2020', bg: '#f0e8e8', label: 'Duplicate Invoice No.' },
+  entity_access_mismatch:   { icon: '🚫', color: '#7a5000', bg: '#fff3cc', label: 'Entity Access Mismatch' },
+  negative_stock_risk:      { icon: '📉', color: '#8a2020', bg: '#f0e8e8', label: 'Negative Stock Risk' },
+  invalid_date_mismatch:    { icon: '📅', color: '#7a5000', bg: '#fff3cc', label: 'Invalid Date' },
   system:               { icon: '🔔', color: '#1a1208', bg: '#f0ebe0', label: 'System' },
   intercompany:         { icon: '🔄', color: '#3a1a6a', bg: '#ede8f3', label: 'Intercompany' },
 }

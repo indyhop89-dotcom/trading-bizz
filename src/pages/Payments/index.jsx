@@ -8,6 +8,8 @@ import DocumentAttachments from '../../components/DocumentAttachments'
 import { formatINR, toNum, roundRupees } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { useAuth } from '../../hooks/useAuth'
+import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { computeInvoiceOutstanding } from '../../utils/payments'
 
 // ─── TDS constants (mirrors Invoices module) ───────────────────────────────────
 const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
@@ -156,7 +158,11 @@ function InvoicePaymentTracker() {
   const [invoices, setInvoices] = useState([])
   const [payments, setPayments] = useState([])
   const [entities, setEntities] = useState([])
-  const [accessEntityIds, setAccessEntityIds] = useState(null) // null = unrestricted (master)
+  // CHANGED: replaces the bespoke accessEntityIds state below with the shared
+  // hook — invpay_write is gated on has_entity_grant(entity_id), and
+  // entity_id here is the buyer/paying side, same "acting entity" concept
+  // used everywhere else.
+  const { entities: accessEntities, frozen: toEntityLocked, defaultEntityId, loading: accessLoading } = useEntityAccess()
   const [loading, setLoading]   = useState(true)
   const [modalOpen, setModalOpen]   = useState(false)
   const [detailOpen, setDetailOpen] = useState(null) // invoice row for tranche-history panel
@@ -192,26 +198,12 @@ function InvoicePaymentTracker() {
 
   useEffect(() => { load() }, [load])
 
-  // Role-based entity access — non-admin users only see invoices billed to entities they have access to.
-  useEffect(() => {
-    async function loadAccess() {
-      if (!profile) return
-      if (profile.role === 'master') { setAccessEntityIds(null); return }
-      const { data } = await supabase.from('user_entity_access').select('entity_id').eq('user_id', profile.id)
-      setAccessEntityIds((data || []).map(a => a.entity_id))
-    }
-    loadAccess()
-  }, [profile])
-
   // Default "To Entity" filter for non-admins: locked if they have exactly one entity, else a scoped dropdown.
   useEffect(() => {
-    if (!isAdmin && accessEntityIds && accessEntityIds.length > 0 && !toEntityFilter) {
-      setToEntityFilter(accessEntityIds[0])
-    }
-  }, [isAdmin, accessEntityIds]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (defaultEntityId && !toEntityFilter) setToEntityFilter(defaultEntityId)
+  }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const toEntityLocked = !isAdmin && accessEntityIds && accessEntityIds.length === 1
-  const toEntityOptions = isAdmin ? entities : entities.filter(e => (accessEntityIds || []).includes(e.id))
+  const toEntityOptions = accessEntities
 
   // ── Aggregate tranches per invoice ──────────────────────────────────────────
   const paymentsByInvoice = useMemo(() => {
@@ -226,11 +218,7 @@ function InvoicePaymentTracker() {
 
   const computed = useMemo(() => invoices.map(inv => {
     const tranches = (paymentsByInvoice.get(inv.id) || []).slice().sort((a, b) => (a.actual_payment_date || '').localeCompare(b.actual_payment_date || ''))
-    const paidSum = tranches.reduce((s, t) => s + toNum(t.amount), 0)
-    const tdsSum  = tranches.reduce((s, t) => s + toNum(t.tds_amount), 0)
-    const adjSum  = tranches.reduce((s, t) => s + toNum(t.adjustments), 0)
-    const settled = paidSum + tdsSum + adjSum
-    const pending = Math.max(0, roundRupees(toNum(inv.total_amount) - settled))
+    const { paidSum, tdsSum, adjSum, pending } = computeInvoiceOutstanding(inv, tranches)
     const daysLeft = pending <= 0 ? 0 : calcInvDaysLeft(inv.due_date)
     const status = invStatus(daysLeft, pending)
     return { ...inv, _tranches: tranches, _paid: paidSum, _tds: tdsSum, _adj: adjSum, _pending: pending, _daysLeft: daysLeft, _status: status }
@@ -244,7 +232,11 @@ function InvoicePaymentTracker() {
     if (fromEntityFilter && inv.seller_entity_id !== fromEntityFilter) return false
     if (toEntityFilter && inv.buyer_entity_id !== toEntityFilter) return false
     // Hard restriction — non-admins never see invoices outside their entity access, filter or no filter.
-    if (!isAdmin && accessEntityIds && accessEntityIds.length > 0 && !accessEntityIds.includes(inv.buyer_entity_id)) return false
+    // accessEntities is the full active-entities list for master, so this is
+    // a no-op restriction for them and a real one for everyone else. Skipped
+    // while the access grants are still loading, so nothing briefly flashes
+    // to empty on first render.
+    if (!accessLoading && !accessEntities.some(e => e.id === inv.buyer_entity_id)) return false
     return true
   })
 
@@ -288,7 +280,7 @@ function InvoicePaymentTracker() {
         basis: String(invoiceRow._pending || 0), actual_payment_date: today(),
       })
     } else {
-      setForm({ ...EMPTY_INV, actual_payment_date: today() })
+      setForm({ ...EMPTY_INV, entity_id: defaultEntityId, actual_payment_date: today() })
     }
     setModalOpen(true)
   }
@@ -499,10 +491,10 @@ function InvoicePaymentTracker() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <SectionDivider label='Entities' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='To Entity (buyer — makes payment)'>
-              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)}>
+            <FormRow label='To Entity (buyer — makes payment)' hint={toEntityLocked ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)} disabled={toEntityLocked}>
                 <option value=''>Select</option>
-                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='From Entity (seller) — optional narrow'>
@@ -612,6 +604,9 @@ const EMPTY_EXP = {
 }
 
 function ExpensePaymentTracker() {
+  // CHANGED: exppay_write is gated on has_entity_grant(from_entity_id) — the
+  // entity actually making the payment.
+  const { entities: accessEntities, frozen: fromEntityFrozen, defaultEntityId } = useEntityAccess()
   const [rows, setRows]         = useState([])
   const [entities, setEntities] = useState([])
   const [invoices, setInvoices] = useState([])
@@ -649,7 +644,7 @@ function ExpensePaymentTracker() {
 
   function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
 
-  function openNew()   { setEditing(null); setForm(EMPTY_EXP); setModalOpen(true) }
+  function openNew()   { setEditing(null); setForm({ ...EMPTY_EXP, from_entity_id: defaultEntityId }); setModalOpen(true) }
   function openEdit(r) {
     setEditing(r)
     setForm({
@@ -836,10 +831,10 @@ function ExpensePaymentTracker() {
 
           <SectionDivider label='Parties' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='From (in system)'>
-              <Select value={form.from_entity_id} onChange={e => setF('from_entity_id', e.target.value)}>
+            <FormRow label='From (in system)' hint={fromEntityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.from_entity_id} onChange={e => setF('from_entity_id', e.target.value)} disabled={fromEntityFrozen}>
                 <option value=''>Select</option>
-                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='From (external)'><Input value={form.from_name} onChange={e => setF('from_name', e.target.value)} disabled={!!form.from_entity_id} /></FormRow>

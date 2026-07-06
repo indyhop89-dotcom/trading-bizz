@@ -1,10 +1,11 @@
 import { supabase } from '../supabaseClient'
 import { toNum } from './money'
 
-// Invoice statuses that represent goods having actually moved. 'draft'
-// invoices haven't been sent yet (see access-control rollout — draft is
-// private to the seller) and 'cancelled' invoices never happened, so
-// neither should affect real stock.
+// Invoice statuses that are never real movements regardless of dispatch —
+// 'draft' invoices haven't been sent yet, 'cancelled' invoices never
+// happened. Kept separately from the E-way Bill check below because a
+// cancelled invoice must never count even if it happened to have an
+// E-way Bill number entered before it was cancelled.
 const MOVEMENT_STATUSES_EXCLUDED = ['draft', 'cancelled']
 
 // Raw data fetch — shared by both consumers below so we only hit the DB once
@@ -13,12 +14,24 @@ export async function fetchStockMovementData() {
   const [{ data: opening }, { data: invLines }] = await Promise.all([
     supabase.from('stock_opening_balance').select('entity_id, product_id, qty'),
     supabase.from('invoice_lines')
-      .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status)')
+      .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no)')
       .not('invoice', 'is', null),
   ])
   return {
     opening: opening || [],
-    invLines: (invLines || []).filter(l => l.invoice && !MOVEMENT_STATUSES_EXCLUDED.includes(l.invoice.status)),
+    // CHANGED: goods only count as physically moved once an E-way Bill has
+    // actually been entered on the invoice — raising or submitting an
+    // invoice alone doesn't move stock, dispatch does. Because this whole
+    // map is recomputed live from source data on every call (never stored),
+    // cancelling an invoice after its E-way Bill was done automatically
+    // reverses the movement on the very next load — no separate reversal
+    // step needed. If the same trade is redone as a fresh invoice later,
+    // it's evaluated independently and follows the same rule from scratch.
+    invLines: (invLines || []).filter(l =>
+      l.invoice &&
+      !MOVEMENT_STATUSES_EXCLUDED.includes(l.invoice.status) &&
+      !!l.invoice.eway_bill_no
+    ),
   }
 }
 

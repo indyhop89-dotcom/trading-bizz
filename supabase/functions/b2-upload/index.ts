@@ -127,6 +127,17 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === 'GET' && url.pathname.includes('/file/')) {
+      // CHANGED: this endpoint had no auth check at all — anyone with a
+      // leaked/guessed file key could fetch any document with no login.
+      // Now matches the same token-verification POST and DELETE already use.
+      const token = (req.headers.get('Authorization') || '').replace('Bearer ', '')
+      if (!token) return json({ error: 'Missing auth token' }, 401, corsHeaders)
+
+      const verifyRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+        headers: { Authorization: `Bearer ${token}`, apikey: SUPABASE_ANON_KEY },
+      })
+      if (!verifyRes.ok) return json({ error: 'Invalid session' }, 401, corsHeaders)
+
       const key = decodeURIComponent(url.pathname.split('/file/')[1])
 
       const auth       = await b2Authorize()

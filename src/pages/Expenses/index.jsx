@@ -1,12 +1,15 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Modal, Toast, EmptyState,
+  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import { formatINR, toNum, roundRupees, round2 } from '../../utils/money'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import DocumentAttachments from '../../components/DocumentAttachments'
+import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces the unconfirmed next_exp_no RPC
 
 const GST_RATES     = [0, 5, 12, 18, 28]
 
@@ -26,6 +29,17 @@ async function resolveFY() {
 }
 
 export default function Expenses() {
+  const { profile } = useAuth()
+  // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
+  const canDelete = profile?.role === 'master'
+  // CHANGED: expenses_write is gated on has_entity_grant(entity_id) — an
+  // expense belongs to one entity, no counterparty to worry about.
+  const { entities: accessEntities, frozen: entityFrozen, defaultEntityId } = useEntityAccess()
+  const [selected, setSelected] = useState(new Set())
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
+  const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [deleting, setDeleting] = useState(false)
   const [expenses, setExpenses] = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
@@ -71,8 +85,14 @@ export default function Expenses() {
     setSaving(true)
     const fy = await resolveFY()
     if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
-    const { data: expNo, error: noErr } = await supabase.rpc('next_exp_no', { ent_id: form.entity_id, fy_id: fy.id })
-    if (noErr) { setSaving(false); return setToast({ message: 'Could not generate expense number: '+noErr.message, type: 'error' }) }
+    // CHANGED: next_exp_no was calling an RPC of unconfirmed reliability —
+    // same shape as the next_pi_no/next_po_no/next_inv_no functions already
+    // confirmed missing on the live DB. Switched to suggestNextNo(), the
+    // same client-side approach already proven for PI/PO/Invoices, so
+    // expense numbering can't silently fail the same way. Stays fully
+    // auto-generated — no manual override field, as requested.
+    const entity = entities.find(e => e.id === form.entity_id)
+    const expNo = await suggestNextNo({ table: 'expenses', noCol: 'expense_no', entityShort: entity?.short_name || entity?.name, fyCode: fy.code })
     const gst_amount   = roundRupees(round2(amount * Number(form.gst_rate) / 100))
     const total_amount = amount + gst_amount
     const payload = {
@@ -110,7 +130,41 @@ export default function Expenses() {
     return ms && mt // CHANGED: removed dateFrom/dateTo (undeclared state; date filter not in UI)
   })
 
+  // CHANGED: multi-select + bulk/single soft-delete, same shape as PI/PO/Invoices
+  function toggleSelect(id) {
+    setSelected(s => { const next = new Set(s); next.has(id) ? next.delete(id) : next.add(id); return next })
+  }
+  function toggleSelectAll() {
+    setSelected(s => s.size === filtered.length ? new Set() : new Set(filtered.map(e => e.id)))
+  }
+  async function handleBulkDelete() {
+    setBulkDeleting(true)
+    const { error } = await supabase.from('expenses').update({ is_deleted: true }).in('id', [...selected])
+    setBulkDeleting(false)
+    setConfirmBulkDelete(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: `${selected.size} expense(s) deleted`, type: 'success' })
+    setSelected(new Set())
+    load()
+  }
+  async function handleDelete() {
+    setDeleting(true)
+    const { error } = await supabase.from('expenses').update({ is_deleted: true }).eq('id', confirmDelete.id)
+    setDeleting(false)
+    setConfirmDelete(null)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: 'Expense deleted', type: 'success' })
+    load()
+  }
+
   const columns = [
+    // CHANGED: checkbox column, master-only
+    ...(canDelete ? [{
+      label: <input type='checkbox' checked={filtered.length > 0 && selected.size === filtered.length}
+        onChange={toggleSelectAll} onClick={e => e.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+      render: e => <input type='checkbox' checked={selected.has(e.id)}
+        onChange={() => toggleSelect(e.id)} onClick={ev => ev.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
+    }] : []),
     { label: 'S.No.',    render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
     { label: 'No',       render: e => <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{e.expense_no || '—'}</span> },
     { label: 'Date',     render: e => <span style={{ fontSize: '12px' }}>{fmtDate(e.expense_date)}</span> },
@@ -121,12 +175,16 @@ export default function Expenses() {
     { label: 'Total',    right: true, render: e => <span style={{ fontWeight: 600 }}>{formatINR(e.total_amount)}</span> },
     { label: 'Status',   render: e => <Badge status={e.status} /> },
     { label: 'Docs',     render: e => <DocumentAttachments sourceType='expenses' sourceId={e.id} entityId={e.entity_id} entityName={e.entity?.name || 'General'} compact /> }, // CHANGED: entityId added
+    // CHANGED: per-row delete, master-only
+    ...(canDelete ? [{
+      label: '', render: e => <Btn size='sm' variant='ghost' onClick={ev => { ev.stopPropagation(); setConfirmDelete(e) }} style={{ color: C.danger }}>Delete</Btn>,
+    }] : []),
   ]
 
   return (
     <div>
       <PageHeader title='Expenses' subtitle='All costs associated with orders and entities'
-        action={<Btn onClick={() => { setForm(EMPTY); setModalOpen(true) }}>+ New Expense</Btn>}
+        action={<Btn onClick={() => { setForm({ ...EMPTY, entity_id: defaultEntityId }); setModalOpen(true) }}>+ New Expense</Btn>}
       />
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px,1fr))', gap: '12px', marginBottom: '20px' }}>
@@ -144,6 +202,17 @@ export default function Expenses() {
         </select>
       </div>
 
+      {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
+      {canDelete && selected.size > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff3cc', border: '1px solid #e8d89a', borderRadius: '6px', padding: '8px 14px', marginBottom: '12px' }}>
+          <span style={{ fontSize: '13px', fontWeight: 600 }}>{selected.size} expense{selected.size > 1 ? 's' : ''} selected</span>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={() => setSelected(new Set())}>Clear</Btn>
+            <Btn size='sm' variant='danger' onClick={() => setConfirmBulkDelete(true)} disabled={bulkDeleting}>{bulkDeleting ? 'Deleting…' : 'Delete Selected'}</Btn>
+          </div>
+        </div>
+      )}
+
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -158,10 +227,10 @@ export default function Expenses() {
             <FormRow label='Date' required>
               <Input type='date' value={form.expense_date} onChange={e => setF('expense_date', e.target.value)} />
             </FormRow>
-            <FormRow label='Entity' required>
-              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)}>
+            <FormRow label='Entity' required hint={entityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)} disabled={entityFrozen}>
                 <option value=''>Select entity</option>
-                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Expense Type' required>
@@ -227,6 +296,12 @@ export default function Expenses() {
           </div>
         </div>
       </Modal>
+
+      {/* CHANGED: delete confirmation modals */}
+      <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
+        title='Delete Expenses' message={`Delete ${selected.size} selected expense(s)? This cannot be undone.`} danger />
+      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
+        title='Delete Expense' message={`Delete "${confirmDelete?.description || 'this expense'}"? This cannot be undone.`} danger />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>

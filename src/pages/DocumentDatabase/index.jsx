@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import { useSearchParams } from 'react-router-dom' // CHANGED: read ?order= for deep-linking from Orders
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, Toast, EmptyState,
@@ -7,6 +8,7 @@ import {
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate } from '../../utils/dates'
 import { getDriveViewUrl, getDriveDownloadUrl, fileIcon } from '../../utils/drive'
+import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -33,13 +35,22 @@ function DocStatusBadge({ uploaded, total }) {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function DocumentDatabase() {
+  const [searchParams] = useSearchParams()
+  const deepLinkOrderId = searchParams.get('order') // CHANGED: set when arriving from Orders' "Open in Document Database"
   const [orders, setOrders]           = useState([])
-  const [entities, setEntities]       = useState([])
+  // CHANGED: documents_access RLS already restricts what a non-master user
+  // can read; this just keeps the filter dropdown from offering entities
+  // they'd get zero results for anyway.
+  const { entities } = useEntityAccess()
   const [loading, setLoading]         = useState(true)
   const [search, setSearch]           = useState('')
   const [entityFilter, setEntityFilter] = useState('all')
   const [taxFilter, setTaxFilter]     = useState('all')
   const [expandedLeg, setExpandedLeg] = useState(null)   // leg.id with checklist open
+  // CHANGED: orders now collapse to a summary row by default (previously
+  // every leg of every order rendered at all times — the "bloated" table).
+  // expandedOrders tracks which order IDs are showing their legs.
+  const [expandedOrders, setExpandedOrders] = useState(new Set())
   const [toast, setToast]             = useState(null)
 
   // Per-leg doc counts
@@ -47,28 +58,24 @@ export default function DocumentDatabase() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: os }, { data: es }] = await Promise.all([
-      supabase.from('orders')
-        .select(`
-          id, order_no, name, movement_type, status, created_at,
-          origin:origin_entity_id(id,name,short_name),
-          destination:destination_entity_id(id,name,short_name),
-          financial_years(name),
-          order_legs(
-            id, leg_no, leg_type, is_interstate, movement_status, cargo_status,
-            dispatch_date, delivery_date,
-            from_entity:from_entity_id(id,name,short_name,state_code),
-            to_entity:to_entity_id(id,name,short_name,state_code)
-          )
-        `)
-        .eq('is_deleted', false)
-        .order('created_at', { ascending: false }),
-      supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
-    ])
+    const { data: os } = await supabase.from('orders')
+      .select(`
+        id, order_no, name, movement_type, status, created_at,
+        origin:origin_entity_id(id,name,short_name),
+        destination:destination_entity_id(id,name,short_name),
+        financial_years(name),
+        order_legs(
+          id, leg_no, leg_type, is_interstate, movement_status, cargo_status,
+          dispatch_date, delivery_date,
+          from_entity:from_entity_id(id,name,short_name,state_code),
+          to_entity:to_entity_id(id,name,short_name,state_code)
+        )
+      `)
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: false })
 
     const allOrders = os || []
     setOrders(allOrders)
-    setEntities(es || [])
 
     // Load doc counts per leg from leg_document_checklist
     const legIds = allOrders.flatMap(o => (o.order_legs || []).map(l => l.id))
@@ -93,6 +100,19 @@ export default function DocumentDatabase() {
 
   useEffect(() => { load() }, [load])
 
+  // CHANGED: auto-expand whichever order we arrived here for (from Orders'
+  // new "Open in Document Database" link), so the person lands directly on
+  // the right leg instead of an empty collapsed list.
+  useEffect(() => {
+    if (deepLinkOrderId && orders.length) {
+      setExpandedOrders(new Set([deepLinkOrderId]))
+    }
+  }, [deepLinkOrderId, orders])
+
+  function toggleOrder(orderId) {
+    setExpandedOrders(s => { const next = new Set(s); next.has(orderId) ? next.delete(orderId) : next.add(orderId); return next })
+  }
+
   // ── Filtering ──────────────────────────────────────────────────────────────
 
   const filtered = orders.filter(o => {
@@ -105,6 +125,15 @@ export default function DocumentDatabase() {
     if (entityFilter !== 'all') {
       const legEntities = (o.order_legs || []).flatMap(l => [l.from_entity?.id, l.to_entity?.id])
       if (!legEntities.includes(entityFilter)) return false
+    }
+    // CHANGED: taxFilter existed as state but was never actually applied —
+    // this is the "filter is not working" bug. An order matches if any of
+    // its legs has the selected tax type.
+    if (taxFilter !== 'all') {
+      const legs = o.order_legs || []
+      const want = taxFilter === 'interstate'
+      const hasMatch = legs.some(l => l.is_interstate === want)
+      if (!hasMatch) return false
     }
     return true
   })
@@ -139,6 +168,20 @@ export default function DocumentDatabase() {
             <option key={e.id} value={e.id}>{e.short_name || e.name}</option>
           ))}
         </Select>
+        {/* CHANGED: this control never existed even though taxFilter state
+            did — that mismatch is exactly what made "the filter" seem broken. */}
+        <Select
+          value={taxFilter}
+          onChange={e => setTaxFilter(e.target.value)}
+          style={{ width: '150px' }}
+        >
+          <option value='all'>All Tax Types</option>
+          <option value='local'>Local (CGST+SGST)</option>
+          <option value='interstate'>Interstate (IGST)</option>
+        </Select>
+        {(search || entityFilter !== 'all' || taxFilter !== 'all') && (
+          <Btn size='sm' variant='ghost' onClick={() => { setSearch(''); setEntityFilter('all'); setTaxFilter('all') }}>Clear</Btn>
+        )}
         <div style={{
           marginLeft: 'auto', fontSize: '12px', color: C.textMuted,
           background: '#f5f0e8', padding: '4px 12px', borderRadius: '6px',
@@ -197,6 +240,14 @@ export default function DocumentDatabase() {
           {filtered.map((order, oi) => {
             const legs = order.order_legs || []
             const isLast = oi === filtered.length - 1
+            // CHANGED: orders collapse by default — this is the main fix for
+            // "the table is very bloated". Only the order summary shows
+            // until you click it; legs render underneath only when expanded.
+            const isOrderOpen = expandedOrders.has(order.id)
+            const orderCounts = legs.reduce((acc, l) => {
+              const c = legDocCounts[l.id] || { uploaded: 0, total: 0 }
+              return { uploaded: acc.uploaded + c.uploaded, total: acc.total + c.total }
+            }, { uploaded: 0, total: 0 })
 
             return (
               <div
@@ -205,13 +256,18 @@ export default function DocumentDatabase() {
                   borderBottom: isLast ? 'none' : `2px solid #e0d8cc`,
                 }}
               >
-                {/* ── Order header row ── */}
-                <div style={{
-                  display: 'flex', alignItems: 'center', gap: '12px',
-                  padding: '10px 16px',
-                  background: '#f8f4ee',
-                  borderBottom: `1px solid ${C.border}`,
-                }}>
+                {/* ── Order header row (click to expand/collapse) ── */}
+                <div
+                  onClick={() => toggleOrder(order.id)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: '12px',
+                    padding: '10px 16px',
+                    background: '#f8f4ee',
+                    borderBottom: isOrderOpen ? `1px solid ${C.border}` : 'none',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <span style={{ fontSize: '11px', color: C.textMuted, width: '10px' }}>{isOrderOpen ? '▼' : '▶'}</span>
                   <span style={{
                     fontWeight: 800, fontSize: '13px', color: C.accent,
                     fontFamily: 'monospace', letterSpacing: '0.02em',
@@ -223,6 +279,8 @@ export default function DocumentDatabase() {
                   </span>
                   <Badge status={order.movement_type} label={order.movement_type} />
                   <Badge status={order.status} />
+                  <span style={{ fontSize: '11px', color: C.textMuted }}>{legs.length} leg{legs.length !== 1 ? 's' : ''}</span>
+                  {!isOrderOpen && <DocStatusBadge uploaded={orderCounts.uploaded} total={orderCounts.total} />}
                   <span style={{ fontSize: '11px', color: C.textMuted, marginLeft: 'auto' }}>
                     {order.financial_years?.name}
                     {' · '}
@@ -232,8 +290,8 @@ export default function DocumentDatabase() {
                   </span>
                 </div>
 
-                {/* ── Leg rows ── */}
-                {legs.length === 0 ? (
+                {/* ── Leg rows (only when order is expanded) ── */}
+                {isOrderOpen && (legs.length === 0 ? (
                   <div style={{ padding: '12px 16px', fontSize: '12px', color: C.textMuted }}>
                     No legs for this order.
                   </div>
@@ -358,7 +416,7 @@ export default function DocumentDatabase() {
                         </div>
                       )
                     })
-                )}
+                ))}
               </div>
             )
           })}

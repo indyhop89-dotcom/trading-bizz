@@ -10,9 +10,13 @@ import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
+import { withTimeout } from '../../utils/query'
+import { cleanProductName, productMatchKey } from '../../utils/products'
 import DocumentAttachments from '../../components/DocumentAttachments'
-import { downloadTemplate, downloadCSV } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock, getInvoiceLifecycleStage } from '../../utils/stock'
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
 const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
@@ -23,6 +27,23 @@ const TDS_SECTION_LABELS = {
   '194J': 'Professional/Technical Services',
   '194Q': 'Purchase of Goods',
   '206C': 'TCS on Sale of Goods',
+}
+
+// CHANGED: LineItemsEditor lines carry UI-only helper fields (_id, _cost_rate,
+// _margin_pct, _hsn_*) that are NOT columns on invoice_lines. Sending them made
+// the insert fail with "Could not find the '_id' column…", which — because the
+// insert result wasn't checked before — silently left invoices with ZERO lines.
+// That was the real root cause of stock never moving: an invoice with no lines
+// moves no stock. This keeps only the real DB columns.
+const INVOICE_LINE_COLUMNS = [
+  'product_id', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
+  'taxable_amount', 'cgst_rate', 'cgst_amount', 'sgst_rate', 'sgst_amount',
+  'igst_rate', 'igst_amount', 'total_amount',
+]
+function toInvoiceLinePayload(computedLine, invoiceId, lineNo) {
+  const out = { invoice_id: invoiceId, line_no: lineNo }
+  for (const col of INVOICE_LINE_COLUMNS) if (computedLine[col] !== undefined) out[col] = computedLine[col]
+  return out
 }
 
 const EMPTY_FORM = {
@@ -38,16 +59,57 @@ const EMPTY_FORM = {
   invoice_no: '', // CHANGED: optional manual invoice number — blank suggests one via suggestNextNo()
 }
 
-async function writeStockMovements(invoice, lines) {
-  if (!lines?.length) return
-  const entries = []
-  for (const l of lines) {
-    if (!l.product_id||!Number(l.qty)) continue
-    const qty=Number(l.qty), rate=Number(l.rate), date=invoice.invoice_date
-    entries.push({entity_id:invoice.seller_entity_id,product_id:l.product_id,posting_date:date,qty_in:0,qty_out:qty,rate,voucher_type:'sales_invoice',voucher_id:invoice.id,voucher_no:invoice.invoice_no||invoice.id,notes:`Invoice outgoing — ${invoice.invoice_no||''}`})
-    entries.push({entity_id:invoice.buyer_entity_id,product_id:l.product_id,posting_date:date,qty_in:qty,qty_out:0,rate,voucher_type:'sales_invoice',voucher_id:invoice.id,voucher_no:invoice.invoice_no||invoice.id,notes:`Invoice incoming — ${invoice.invoice_no||''}`})
+// CHANGED: auto-completes the buyer's purchase-register mirror the moment an
+// E-way Bill is generated on a 'sales' invoice — the E-way Bill is the actual
+// physical-movement event, so this is the only trustworthy trigger for it
+// (previously this was created as a 'draft' at invoice-submit time, before
+// goods had actually moved, and required the buyer to manually confirm it).
+// Skipped for external buyers (no internal bookkeeping needed) and no-ops if
+// a mirror already exists for this invoice (idempotent — safe to call every
+// time the E-way Bill fields are saved).
+async function autoCompletePurchaseMirror(inv, lines) {
+  if (inv.invoice_type !== 'sales' || !inv.eway_bill_no) return {}
+  if (!inv.buyer_entity_id || inv.buyer?.type === 'external') return {}
+
+  const { data: existing } = await supabase.from('invoices')
+    .select('id').eq('source_invoice_id', inv.id).eq('invoice_type', 'purchase').limit(1)
+  if (existing?.length) return {}
+
+  const fyCode = fyCodeForDate(inv.eway_bill_date || inv.invoice_date)
+  const invoiceNo = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: inv.buyer?.short_name || inv.buyer?.name, fyCode })
+
+  const { data: purchaseInv, error } = await supabase.from('invoices').insert({
+    invoice_no: invoiceNo,
+    invoice_date: inv.invoice_date,
+    due_date: inv.due_date || null,
+    invoice_type: 'purchase',
+    status: 'submitted',
+    seller_entity_id: inv.seller_entity_id,
+    buyer_entity_id: inv.buyer_entity_id,
+    source_invoice_id: inv.id,
+    pi_id: inv.pi_id || null,
+    po_id: inv.po_id || null,
+    is_interstate: inv.is_interstate,
+    eway_bill_no: inv.eway_bill_no,
+    eway_bill_date: inv.eway_bill_date || null,
+    taxable_amount: inv.taxable_amount,
+    cgst_amount: inv.cgst_amount,
+    sgst_amount: inv.sgst_amount,
+    igst_amount: inv.igst_amount,
+    total_amount: inv.total_amount,
+    outstanding_amount: inv.total_amount,
+    paid_amount: 0,
+    notes: `Auto-completed from ${inv.invoice_no || 'linked sales invoice'} on E-way Bill generation`,
+  }).select().single()
+
+  if (error || !purchaseInv) return { error }
+
+  if (lines?.length) {
+    const purchaseLines = lines.map((l, i) => toInvoiceLinePayload(l, purchaseInv.id, i + 1))
+    const { error: lineErr } = await supabase.from('invoice_lines').insert(purchaseLines)
+    if (lineErr) return { purchaseInv, error: lineErr }
   }
-  if (entries.length) await supabase.from('stock_movements').insert(entries)
+  return { purchaseInv }
 }
 
 // ─── Invoice List ─────────────────────────────────────────────────────────────
@@ -61,6 +123,10 @@ function InvoiceList() {
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [invoices, setInvoices] = useState([])
   const [entities, setEntities] = useState([])
+  // CHANGED: needed to resolve/auto-create products for CSV-uploaded lines —
+  // previously this handler never set product_id at all, which silently
+  // broke stock tracking for every CSV-created invoice line.
+  const [products, setProducts] = useState([])
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
   const [statusFilter, setStatus] = useState('all')
@@ -76,21 +142,24 @@ function InvoiceList() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: invs }, { data: es }] = await Promise.all([
+    const [{ data: invs }, { data: es }, { data: ps }] = await Promise.all([
       supabase.from('invoices')
         .select('*, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name)')
         .eq('is_deleted', false).neq('invoice_type', 'intercompany')
         .order('invoice_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
+      // CHANGED: for CSV product resolution below
+      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate'),
     ])
     setInvoices(invs || [])
     setEntities(es || [])
+    setProducts(ps || [])
     setLoading(false)
   }, [])
 
   useEffect(() => { load() }, [load])
 
-  // Format: invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no
+  // Format: invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no
   // CHANGED: invoice_no was previously never set on CSV-created invoices at
   // all — not a hard insert failure (invoice_no is nullable on the live
   // schema, confirmed via information_schema), but every CSV-created invoice
@@ -101,22 +170,68 @@ function InvoiceList() {
   // DB default, so every CSV upload here would have failed outright. This adds the
   // same FY-resolve + suggestNextNo() generation the other modules use, plus lets you
   // supply your own invoice_no per row (optional — blank auto-generates).
+  // CHANGED: added a "product" column + resolution step. Previously every line
+  // from this uploader had product_id = null (no lookup existed at all), which
+  // silently broke Actual Stock / Planned Stock tracking for every CSV-created
+  // invoice line. Now mirrors the same find-or-auto-create pattern Opening
+  // Stock's CSV upload already uses.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
-    const header = lines[0].split(',').map(h => h.trim().toLowerCase())
+    // CHANGED: added delimiter detection + quote-aware parsing, matching the
+    // fix applied to PI/PO — this handler previously hardcoded a plain comma
+    // split, which both broke on Excel tab-paste and shredded any product
+    // name/description containing a comma inside quotes.
+    const delim = detectDelimiter(lines[0])
+    const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
     const usedInvoiceNos = new Set(invoices.map(i => i.invoice_no?.toLowerCase()).filter(Boolean))
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(',').map(c => c.trim())
+      const cols = parseCSVLine(lines[i], delim)
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       const key = `${row.invoice_date}__${row.seller_entity}__${row.buyer_entity}`
       if (!groups[key]) groups[key] = { meta: row, lines: [] }
       groups[key].lines.push(row)
     }
+
+    // CHANGED: resolve/auto-create products up front, across all groups, in
+    // one batch — same approach as Stock/Opening Stock's CSV handler.
+    // CHANGED: match on name + HSN + rate + GST together, not name alone —
+    // only merge when all four match (per product-owner decision); otherwise
+    // treat as a different product even if the name is identical.
+    // CHANGED: precomputed Map (key -> product) instead of an array .find()
+    // re-run per row — avoids millions of redundant match-key computations on
+    // a large file, which was slow enough to look like a hang.
+    const productMap = new Map()
+    for (const p of products) {
+      productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+    }
+    const rowMatchKey = row => productMatchKey({ name: row.product, hsn_code: row.hsn_code, rate: row.rate, gst_rate: row.gst_rate })
+    const findProduct = row => productMap.get(rowMatchKey(row))
+    const allRows = Object.values(groups).flatMap(g => g.lines)
+    const missingKeys = new Set()
+    const missingRows = []
+    for (const r of allRows) {
+      if (!r.product?.trim()) continue
+      const k = rowMatchKey(r)
+      if (productMap.has(k) || missingKeys.has(k)) continue
+      missingKeys.add(k); missingRows.push(r)
+    }
+    if (missingRows.length > 0) {
+      const payloads = missingRows.map(src => ({ name: cleanProductName(src.product), hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }))
+      const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
+      if (pErr) {
+        errors.push(`Could not auto-create ${missingRows.length} new product(s) — ${pErr.message}`)
+      } else {
+        for (const p of (newProducts || [])) {
+          productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
+        }
+      }
+    }
+
     for (const [key, group] of Object.entries(groups)) {
       const { meta, lines: gLines } = group
       const sellerE = entities.find(e => e.short_name?.toLowerCase() === meta.seller_entity?.toLowerCase() || e.name?.toLowerCase() === meta.seller_entity?.toLowerCase())
@@ -145,18 +260,27 @@ function InvoiceList() {
       }
       usedInvoiceNos.add(invoiceNo.toLowerCase())
 
+      // CHANGED: require a resolvable product per line — a line with no
+      // product reference cannot be tracked in stock, so we reject it
+      // clearly rather than silently inserting it with product_id = null.
+      let lineErr = false
       const interstate = meta.is_interstate === 'true' || (sellerE.state_code && buyerE.state_code && sellerE.state_code !== buyerE.state_code)
       const invLines = gLines.map((r, i) => {
+        const product = r.product?.trim() ? findProduct(r) : null
+        if (r.product?.trim() && !product) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
+        if (!r.product?.trim()) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
         const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
         const igst = interstate ? Math.round(taxable * gstRate / 100) : 0
         const cgst = !interstate ? Math.round(taxable * half / 100) : 0
-        return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
+        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
+      if (lineErr) continue
       const totals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
       const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
       if (invErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: ${invErr.message}`); continue }
-      await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
+      const { error: invLineErr } = await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
+      if (invLineErr) { errors.push(`Invoice ${invoiceNo}: header created but line items failed to save: ${invLineErr.message}`); continue }
       created++
     }
     setCsvSaving(false); setCsvResult({ created, errors }); load()
@@ -218,6 +342,10 @@ function InvoiceList() {
     { label: 'Amount',  right: true, render: i => <span style={{ fontWeight: 600 }}>{formatINR(i.total_amount)}</span> },
     { label: 'Outstanding', right: true, render: i => <span style={{ fontWeight: 600, color: i.outstanding_amount > 0 ? C.warning : C.success }}>{formatINR(i.outstanding_amount)}</span> },
     { label: 'Status',  render: i => <Badge status={i.status} /> },
+    // CHANGED: separate from payment/document Status — this reflects
+    // whether stock has actually moved yet (E-way Bill gated), which
+    // 'submitted'/'paid' alone doesn't tell you.
+    { label: 'Stock', render: i => { const s = getInvoiceLifecycleStage(i); return <Badge status={s.key} label={s.label} /> } },
   ]
 
   return (
@@ -295,8 +423,8 @@ function InvoiceList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('invoices')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no</code><br /><br />
-            Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice. <code>invoice_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing invoices and other rows in this file).
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no</code><br /><br />
+            Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice. <code>invoice_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing invoices and other rows in this file). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
           <FormRow label='Paste CSV'>
             <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
@@ -326,6 +454,9 @@ function NewInvoice() {
   const [searchParams] = useSearchParams()
   const fromPiId = searchParams.get('from_pi')
 
+  // CHANGED: which entities this user may raise an invoice *as seller* —
+  // master sees all, everyone else only entities they've been granted.
+  const { entities: accessEntities, frozen: sellerEntityFrozen, defaultEntityId } = useEntityAccess()
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
   const [pis, setPIs]           = useState([])
@@ -333,11 +464,21 @@ function NewInvoice() {
   const [legs, setLegs]         = useState([])
   const [lines, setLines]       = useState([])
   const [hsnMap, setHsnMap]     = useState(new Map())
+  // CHANGED: the existing product catalog — feeds LineItemsEditor's product
+  // dropdown so lines reference an existing product_id (the same one stock was
+  // created under) instead of leaving product_id blank / forcing a new one.
+  const [products, setProducts] = useState([])
   const [form, setForm]         = useState({ ...EMPTY_FORM, pi_id: fromPiId || '' })
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
   // CHANGED: TDS/TCS entries
   const [tdsEntries, setTdsEntries] = useState([])  // [{type,section,rate,base_amount}]
+  // CHANGED: available stock for the seller entity — feeds LineItemsEditor's
+  // stockMap so the seller can see (and be warned about) overselling past
+  // what they actually have on hand. Was previously never wired in at all.
+  const [stockMap, setStockMap] = useState({})
+  const [stockWarning, setStockWarning] = useState(null)
+  const [linesLoading, setLinesLoading] = useState(false)  // CHANGED: PI/PO line-item fetch in progress
 
   function addTdsRow(type) {
     setTdsEntries(rows => [...rows, { _id: Date.now(), type, section: type === 'tcs' ? '206C' : '194C', rate: type === 'tcs' ? 0.1 : 1, base_amount: '' }])
@@ -353,15 +494,17 @@ function NewInvoice() {
     Promise.all([
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
-      supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,total_amount').eq('is_deleted', false).order('pi_date', { ascending: false }),
-      supabase.from('purchase_orders').select('id,po_no,buyer_entity_id,seller_entity_id').eq('is_deleted', false).order('po_date', { ascending: false }),
+      supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,total_amount,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
+      supabase.from('purchase_orders').select('id,po_no,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
-    ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }]) => {
+      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name'),
+    ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }, { data: prods }]) => {
       setEntities(es || [])
       setOrders(os || [])
       setPIs(piData || [])
       setPOs(poData || [])
       setHsnMap(buildHSNMap(hsnRows || []))
+      setProducts(prods || [])
     })
   }, [])
 
@@ -377,6 +520,19 @@ function NewInvoice() {
       if (data) setLines(data.map(l => ({ ...l, _id: l.id })))
     })
   }, [fromPiId, pis])
+
+  // CHANGED: refresh available stock whenever the seller entity changes.
+  useEffect(() => {
+    if (!form.seller_entity_id) { setStockMap({}); return }
+    fetchEntityAvailableStock(form.seller_entity_id).then(setStockMap)
+  }, [form.seller_entity_id])
+
+  // CHANGED: once we know which single entity this user is restricted to,
+  // default the seller field to it (unless already set, e.g. from a PI
+  // conversion) so a single-entity user doesn't have to pick from a list of one.
+  useEffect(() => {
+    if (defaultEntityId && !form.seller_entity_id) setF('seller_entity_id', defaultEntityId)
+  }, [defaultEntityId])
 
   function setF(k, v) {
     setForm(f => {
@@ -401,9 +557,114 @@ function NewInvoice() {
     setLegs(data || [])
   }
 
-  async function handleSave() {
+  // CHANGED: picking a Linked PI/PO from the manual dropdown (as opposed to
+  // arriving via the "Convert to Invoice" button, which already had this)
+  // previously only prefilled seller/buyer — the planned line items never
+  // carried over. Mirrors the same fix in PO/index.jsx. Only overwrites
+  // `lines` when it's empty so it won't clobber lines already being edited.
+  async function handlePISelect(piId) {
+    const pi = pis.find(p => p.id === piId)
+    setForm(f => ({
+      ...f,
+      pi_id: piId,
+      seller_entity_id: f.seller_entity_id || pi?.from_entity_id || '',
+      buyer_entity_id:  f.buyer_entity_id  || pi?.to_entity_id   || '',
+      order_id:         f.order_id         || pi?.order_id       || '',
+      order_leg_id:     f.order_leg_id     || pi?.order_leg_id   || '',
+    }))
+    if (pi?.order_id && !form.order_id) loadLegs(pi.order_id)
+    if (!piId || lines.length > 0) return
+    setLinesLoading(true)
+    try {
+      const { data: piLines, error } = await withTimeout(
+        supabase.from('proforma_invoice_lines')
+          .select('product_id,description,hsn_code,qty,unit,rate,gst_rate,line_no')
+          .eq('pi_id', piId).order('line_no'),
+        20000, 'Loading PI line items',
+      )
+      if (error) { setToast({ message: `Could not load PI lines: ${error.message}`, type: 'error' }); return }
+      if (piLines?.length) {
+        // computeLine() is normally only run by LineItemsEditor's own onChange
+        // handlers — lines injected directly via setLines skip it, leaving
+        // taxable_amount/total_amount at 0. Run it up front so the preview is
+        // correct immediately.
+        setLines(piLines.map((l, i) => computeLine({
+          _id: Date.now() + i, line_no: i + 1,
+          product_id: l.product_id || '', description: l.description,
+          hsn_code: l.hsn_code, qty: l.qty, unit: l.unit,
+          rate: l.rate, gst_rate: l.gst_rate,
+          _hsn_resolved_rate: null, _hsn_override: false, _cost_rate: null, _margin_pct: '',
+        }, form.is_interstate)))
+      } else {
+        setToast({ message: `${pi?.pi_no || 'This PI'} has no line items saved — add lines manually below, or open the PI to check it.`, type: 'info' })
+      }
+    } catch (e) {
+      setToast({ message: `Could not load PI lines: ${e.message}`, type: 'error' })
+    } finally {
+      setLinesLoading(false)
+    }
+  }
+
+  async function handlePOSelect(poId) {
+    const po = pos.find(p => p.id === poId)
+    setForm(f => ({
+      ...f,
+      po_id: poId,
+      seller_entity_id: f.seller_entity_id || po?.seller_entity_id || '',
+      buyer_entity_id:  f.buyer_entity_id  || po?.buyer_entity_id  || '',
+      order_id:         f.order_id         || po?.order_id         || '',
+      order_leg_id:     f.order_leg_id     || po?.order_leg_id     || '',
+    }))
+    if (po?.order_id && !form.order_id) loadLegs(po.order_id)
+    if (!poId || lines.length > 0) return
+    setLinesLoading(true)
+    try {
+      const { data: poLines, error } = await withTimeout(
+        supabase.from('purchase_order_lines')
+          .select('product_id,description,hsn_code,qty,unit,rate,gst_rate,line_no')
+          .eq('po_id', poId).order('line_no'),
+        20000, 'Loading PO line items',
+      )
+      if (error) { setToast({ message: `Could not load PO lines: ${error.message}`, type: 'error' }); return }
+      if (poLines?.length) {
+        setLines(poLines.map((l, i) => computeLine({
+          _id: Date.now() + i, line_no: i + 1,
+          product_id: l.product_id || '', description: l.description,
+          hsn_code: l.hsn_code, qty: l.qty, unit: l.unit,
+          rate: l.rate, gst_rate: l.gst_rate,
+          _hsn_resolved_rate: null, _hsn_override: false, _cost_rate: null, _margin_pct: '',
+        }, form.is_interstate)))
+      } else {
+        setToast({ message: `${po?.po_no || 'This PO'} has no line items saved — add lines manually below, or open the PO to check it.`, type: 'info' })
+      }
+    } catch (e) {
+      setToast({ message: `Could not load PO lines: ${e.message}`, type: 'error' })
+    } finally {
+      setLinesLoading(false)
+    }
+  }
+
+  async function handleSave(skipStockCheck = false) {
     if (!form.seller_entity_id || !form.buyer_entity_id) return setToast({ message: 'Seller and Buyer are required', type: 'error' })
     if (lines.length === 0) return setToast({ message: 'At least one line item is required', type: 'error' })
+
+    // CHANGED: every stock-affecting line must carry a product_id — otherwise
+    // it's invisible to Actual Stock / Stock Position. Hard block.
+    const missing = findLinesMissingProductId(lines)
+    if (missing.length > 0) {
+      return setToast({ message: `Line ${missing.map(l => l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`, type: 'error' })
+    }
+
+    // CHANGED: billing more than the seller actually has on hand is a
+    // warning, not a hard block (they may dispatch from a fresh purchase
+    // before the E-way Bill goes out) — same pattern as PI's stock check.
+    if (!skipStockCheck) {
+      const exceeding = findLinesExceedingStock(lines, stockMap)
+      if (exceeding.length > 0) {
+        setStockWarning(`${exceeding.length} line(s) bill more quantity than ${entities.find(e => e.id === form.seller_entity_id)?.short_name || 'the seller'} currently has in stock. Create this invoice anyway?`)
+        return
+      }
+    }
 
     const computedLines = lines.map(l => computeLine(l, form.is_interstate))
     const totals = computeTotals(computedLines)
@@ -432,24 +693,31 @@ function NewInvoice() {
       outstanding_amount: totals.total_amount,
       paid_amount: 0,
     }
-    if (!payload.order_id)      delete payload.order_id
-    if (!payload.order_leg_id)  delete payload.order_leg_id
-    if (!payload.pi_id)         delete payload.pi_id
-    if (!payload.po_id)         delete payload.po_id
-    if (!payload.due_date)      delete payload.due_date
-    if (!payload.einvoice_ack_date) delete payload.einvoice_ack_date
+    // CHANGED: drop every optional FK/date field that's blank. A blank date
+    // ('') is invalid for a Postgres date column ("invalid input syntax for
+    // type date") — blank means "not set", so omit it and let the column
+    // default to NULL. eway_bill_date in particular was previously left in the
+    // payload as '' on every create (E-way Bill is filled in later), which is
+    // what caused this save to fail.
+    for (const k of ['order_id', 'order_leg_id', 'pi_id', 'po_id', 'due_date', 'eway_bill_date', 'einvoice_ack_date']) {
+      if (!payload[k]) delete payload[k]
+    }
     if (!payload.tds_amount)    delete payload.tds_amount
     if (!payload.tcs_amount)    delete payload.tcs_amount
 
     const { data: inv, error } = await supabase.from('invoices').insert(payload).select().single()
     if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
 
-    // Insert lines
-    const linesPayload = computedLines.map((l, i) => ({
-      ...l, invoice_id: inv.id, line_no: i + 1,
-      _id: undefined,
-    }))
-    await supabase.from('invoice_lines').insert(linesPayload)
+    // Insert lines — strip UI-only helper fields (_id etc.) that aren't real
+    // columns; sending them was making this insert fail. Its result was also
+    // never checked before, so the invoice header would exist with zero lines
+    // and nobody would know — that's exactly why stock never moved.
+    const linesPayload = computedLines.map((l, i) => toInvoiceLinePayload(l, inv.id, i + 1))
+    const { error: linesErr } = await supabase.from('invoice_lines').insert(linesPayload)
+    if (linesErr) {
+      setSaving(false)
+      return setToast({ message: `Invoice ${invoiceNo} was created, but its line items failed to save: ${linesErr.message}. Delete this invoice and try again.`, type: 'error' })
+    }
 
     // CHANGED: Insert TDS/TCS entries
     if (tdsEntries.length > 0) {
@@ -470,7 +738,10 @@ function NewInvoice() {
             amount,
           }
         })
-      if (tdsPayload.length > 0) await supabase.from('tds_tcs_entries').insert(tdsPayload)
+      if (tdsPayload.length > 0) {
+        const { error: tdsErr } = await supabase.from('tds_tcs_entries').insert(tdsPayload)
+        if (tdsErr) setToast({ message: `Invoice ${invoiceNo} saved, but TDS/TCS entries failed to save: ${tdsErr.message}`, type: 'error' })
+      }
     }
 
     // Mark PI as converted if applicable
@@ -478,41 +749,13 @@ function NewInvoice() {
       await supabase.from('proforma_invoices').update({ status: 'converted', converted_to_invoice_id: inv.id }).eq('id', form.pi_id)
     }
 
-    // CHANGED: auto-create a draft purchase invoice for the buyer when this
-    // sales invoice is linked to a PO. Mirrors the same lines/totals so the
-    // buyer can review, edit (add/remove lines), and confirm it themselves —
-    // it does not post as final on its own. Applies to any entity pair with
-    // a linked PO, not just specific entities.
-    if (form.po_id) {
-      const { data: purchaseInv, error: purchaseErr } = await supabase.from('invoices').insert({
-        invoice_date: form.invoice_date,
-        due_date: form.due_date || null,
-        invoice_type: 'purchase',
-        status: 'draft',
-        seller_entity_id: form.seller_entity_id,
-        buyer_entity_id: form.buyer_entity_id,
-        source_invoice_id: inv.id,
-        pi_id: form.pi_id || null,
-        po_id: form.po_id || null,
-        is_interstate: form.is_interstate,
-        outstanding_amount: totals.total_amount,
-        paid_amount: 0,
-        notes: `Auto-created from ${inv.invoice_no || 'linked sales invoice'} — pending buyer confirmation`,
-        ...totals,
-      }).select().single()
-
-      if (purchaseErr) {
-        // Don't fail the whole save over this — the sales invoice is already
-        // committed. Surface it so it doesn't silently go missing.
-        setToast({ message: `Invoice created, but the auto purchase entry failed: ${purchaseErr.message}`, type: 'error' })
-      } else {
-        const purchaseLines = computedLines.map((l, i) => ({
-          ...l, invoice_id: purchaseInv.id, line_no: i + 1,
-          _id: undefined,
-        }))
-        await supabase.from('invoice_lines').insert(purchaseLines)
-      }
-    }
+    // CHANGED: no buyer-side purchase entry is created here anymore. Goods
+    // haven't moved yet at submit time (physical movement only happens once
+    // an E-way Bill is generated — see the E-way Bill save handler in
+    // InvoiceDetail), so creating the buyer's purchase-register mirror this
+    // early would record it before the transaction is real. It's now
+    // auto-created (and posted, not draft) the moment the E-way Bill is
+    // saved on this invoice.
 
     setSaving(false)
     navigate(`/invoices/${inv.id}`)
@@ -522,7 +765,7 @@ function NewInvoice() {
     <div>
       <button onClick={() => navigate('/invoices')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '13px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', marginBottom: '4px' }}>← Invoices</button>
       <PageHeader title={fromPiId ? 'Convert PI to Invoice' : 'New Invoice'} />
-      <div style={{background:'#e8f3ec',border:'1px solid #b8dfca',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#1a5c30',marginBottom:'16px'}}>📅 Will be created under <strong>{currentFYLabel()}</strong> — stock movements recorded automatically. Internal buyers get an auto-created purchase entry.</div>
+      <div style={{background:'#e8f3ec',border:'1px solid #b8dfca',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#1a5c30',marginBottom:'16px'}}>📅 Will be created under <strong>{currentFYLabel()}</strong> — stock stays with the seller until an E-way Bill is generated on this invoice. Once it is, stock moves to the buyer and (for internal buyers) their purchase entry is created automatically — no manual entry needed.</div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '100%' }}>
         <Card style={{ padding: '20px' }}>
@@ -543,10 +786,10 @@ function NewInvoice() {
                 <option value='purchase'>Purchase Invoice</option>
               </Select>
             </FormRow>
-            <FormRow label='Seller Entity' required>
-              <Select value={form.seller_entity_id} onChange={e => setF('seller_entity_id', e.target.value)}>
+            <FormRow label='Seller Entity' required hint={sellerEntityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.seller_entity_id} onChange={e => setF('seller_entity_id', e.target.value)} disabled={sellerEntityFrozen}>
                 <option value=''>Select seller</option>
-                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Buyer Entity' required>
@@ -562,13 +805,13 @@ function NewInvoice() {
               </Select>
             </FormRow>
             <FormRow label='Linked PI'>
-              <Select value={form.pi_id} onChange={e => setF('pi_id', e.target.value)}>
+              <Select value={form.pi_id} onChange={e => handlePISelect(e.target.value)}>
                 <option value=''>No PI</option>
                 {pis.map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Linked PO'>
-              <Select value={form.po_id} onChange={e => setF('po_id', e.target.value)}>
+              <Select value={form.po_id} onChange={e => handlePOSelect(e.target.value)}>
                 <option value=''>No PO</option>
                 {pos.map(p => <option key={p.id} value={p.id}>{p.po_no || p.id.slice(0,8)}</option>)}
               </Select>
@@ -584,8 +827,14 @@ function NewInvoice() {
 
         <Card style={{ padding: '20px' }}>
           <SectionDivider label='Line Items' />
+          {linesLoading && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', background: '#fff8e6', border: '1px solid #e6c877', borderRadius: '6px', padding: '10px 14px', fontSize: '13px', color: '#7a5000', marginTop: '12px' }}>
+              <span style={{ width: 16, height: 16, border: '2px solid #d9b24d', borderTopColor: 'transparent', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+              Loading line items from the linked PI/PO…
+            </div>
+          )}
           <div style={{ marginTop: '12px' }}>
-            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} />
+            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} stockMap={stockMap} products={products} />
           </div>
         </Card>
 
@@ -673,9 +922,13 @@ function NewInvoice() {
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
           <Btn variant='ghost' onClick={() => navigate('/invoices')}>Cancel</Btn>
-          <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Create Invoice'}</Btn>
+          <Btn onClick={() => handleSave(false)} disabled={saving}>{saving ? 'Saving…' : 'Create Invoice'}</Btn>
         </div>
       </div>
+
+      <ConfirmModal open={!!stockWarning} onClose={() => setStockWarning(null)}
+        onConfirm={() => { setStockWarning(null); handleSave(true) }}
+        title='Billed Quantity Exceeds Stock' message={stockWarning || ''} danger />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
@@ -707,7 +960,11 @@ function InvoiceDetail() {
     setLoading(true)
     const [{ data: i }, { data: ls }, { data: tds }] = await Promise.all([
       supabase.from('invoices')
-        .select('*, seller:seller_entity_id(name,short_name,gstin,state_code,address,city), buyer:buyer_entity_id(name,short_name,gstin,state_code,address,city), orders(name)')
+        // CHANGED: `type` on buyer/seller is needed to decide whether an
+        // auto purchase-mirror entry should be created when the E-way Bill
+        // is saved (only for internal group/associate entities, not
+        // external customers/vendors).
+        .select('*, seller:seller_entity_id(name,short_name,gstin,state_code,address,city,type), buyer:buyer_entity_id(name,short_name,gstin,state_code,address,city,type), orders(name)')
         .eq('id', id).single(),
       supabase.from('invoice_lines').select('*').eq('invoice_id', id).order('line_no'),
       supabase.from('tds_tcs_entries').select('*').eq('invoice_id', id),  // CHANGED
@@ -721,7 +978,34 @@ function InvoiceDetail() {
   useEffect(() => { load() }, [load])
 
   async function updateStatus(status) {
-    await supabase.from('invoices').update({ status, updated_at: new Date() }).eq('id', id)
+    // CHANGED: if this invoice's E-way Bill was already generated, cancelling
+    // it now needs to reverse the buyer-side purchase mirror too, and leave
+    // a visible trail — the goods have physically moved already, so this
+    // needs a human to notice and reconcile, not just quietly disappear.
+    // Actual stock itself reverses automatically: the live stock calc
+    // excludes any 'cancelled' invoice regardless of E-way Bill status, so
+    // no separate stock reversal step is needed here.
+    const cancellingAfterEway = status === 'cancelled' && !!inv.eway_bill_no
+    const { error } = await supabase.from('invoices').update({ status, updated_at: new Date() }).eq('id', id)
+    if (error) return setToast({ message: error.message, type: 'error' })
+
+    if (cancellingAfterEway) {
+      await supabase.from('invoices').update({ status: 'cancelled', updated_at: new Date() })
+        .eq('source_invoice_id', id).eq('invoice_type', 'purchase')
+      const { data: { user } } = await supabase.auth.getUser()
+      if (user) {
+        await supabase.from('notifications').insert({
+          user_id:           user.id,
+          title:             'Invoice cancelled after E-way Bill',
+          message:           `${inv.invoice_no || id.slice(0,8)} was cancelled after its E-way Bill (${inv.eway_bill_no}) was already generated — stock reverses from ${inv.buyer?.name || 'buyer'} back to ${inv.seller?.name || 'seller'}. Verify the physical goods movement matches.`,
+          notification_type: 'invoice_cancelled_after_eway',
+          source_type:       'invoices',
+          source_id:         id,
+          entity_id:         inv.seller_entity_id,
+        })
+      }
+    }
+
     setToast({ message: `Invoice ${status}`, type: 'success' })
     load()
   }
@@ -747,6 +1031,7 @@ function InvoiceDetail() {
   }
   async function saveEwbForm() {
     setSectSaving(true)
+    const wasEwaySet = !!inv.eway_bill_no
     const { error } = await supabase.from('invoices').update({
       eway_bill_no:     ewbForm.eway_bill_no     || null,
       eway_bill_date:   ewbForm.eway_bill_date   || null,
@@ -755,8 +1040,19 @@ function InvoiceDetail() {
       transporter_name: ewbForm.transporter_name || null,
       updated_at:       new Date(),
     }).eq('id', id)
+    if (error) { setSectSaving(false); return setToast({ message: error.message, type: 'error' }) }
+
+    // CHANGED: this is the actual physical-movement event — stock moves from
+    // seller to buyer from here on (see stock.js), and for internal buyers
+    // their purchase-register entry is auto-completed right now too, with
+    // zero manual entry required on their side.
+    if (!wasEwaySet && ewbForm.eway_bill_no) {
+      const updatedInv = { ...inv, eway_bill_no: ewbForm.eway_bill_no, eway_bill_date: ewbForm.eway_bill_date || null }
+      const { error: mirrorErr } = await autoCompletePurchaseMirror(updatedInv, lines)
+      if (mirrorErr) setToast({ message: `E-way Bill saved, but the buyer purchase entry failed: ${mirrorErr.message}`, type: 'error' })
+    }
+
     setSectSaving(false)
-    if (error) return setToast({ message: error.message, type: 'error' })
     setEwbEdit(false)
     setToast({ message: 'E-way Bill & Challan saved', type: 'success' })
     load()
@@ -805,6 +1101,7 @@ function InvoiceDetail() {
             {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={inv.invoice_type} label={inv.invoice_type === 'sales' ? 'Sales Invoice' : 'Purchase Invoice'} />
             <Badge status={inv.status} />
+            {(() => { const s = getInvoiceLifecycleStage(inv); return <Badge status={s.key} label={s.label} /> })()}
           </div>
         }
       />
@@ -879,6 +1176,15 @@ function InvoiceDetail() {
         </div>
         {ewbEdit ? (
           <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            {!inv.eway_bill_no && inv.invoice_type === 'sales' && (
+              <div style={{background:'#fff3cc',border:'1px solid #e6c040',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#7a5000'}}>
+                📦 Saving an E-way Bill number here moves stock now: {lines.length} line item(s) totalling{' '}
+                <strong>{lines.reduce((s,l)=>s+Number(l.qty||0),0).toLocaleString('en-IN')}</strong> unit(s) leave{' '}
+                <strong>{inv.seller?.short_name || inv.seller?.name}</strong> and land with{' '}
+                <strong>{inv.buyer?.short_name || inv.buyer?.name}</strong>
+                {inv.buyer?.type !== 'external' && <> — {inv.buyer?.short_name || inv.buyer?.name}'s purchase entry is auto-completed too</>}.
+              </div>
+            )}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
               <FormRow label='EWB Number'>
                 <Input value={ewbForm.eway_bill_no} onChange={e => setEwbForm(f => ({...f, eway_bill_no: e.target.value}))} placeholder='e.g. 421234567890' />
@@ -1045,7 +1351,11 @@ function InvoiceDetail() {
       </div>
 
       <ConfirmModal open={confirmCancel} onClose={() => setConfirmCancel(false)} onConfirm={() => { updateStatus('cancelled'); setConfirmCancel(false) }}
-        title='Cancel Invoice' message='Cancel this invoice? All GL entries will be reversed.' danger />
+        title='Cancel Invoice'
+        message={inv.eway_bill_no
+          ? `Cancel this invoice? Its E-way Bill (${inv.eway_bill_no}) was already generated — stock will reverse from ${inv.buyer?.name || 'the buyer'} back to ${inv.seller?.name || 'the seller'}, and the buyer's auto-created purchase entry will be cancelled too.`
+          : 'Cancel this invoice? No E-way Bill has been generated yet, so no stock has moved — nothing to reverse.'}
+        danger />
       <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
         title='Delete Invoice' message={`Delete ${inv.invoice_no || 'this invoice'}? This cannot be undone.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}

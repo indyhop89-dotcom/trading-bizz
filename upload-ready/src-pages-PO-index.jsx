@@ -11,7 +11,7 @@ import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
-import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
 
 const PO_STATUSES = ['open', 'partial', 'completed', 'cancelled']
@@ -38,6 +38,10 @@ function POList() {
   const [entities, setEntities] = useState([])
   const [orders, setOrders] = useState([])
   const [pis, setPIs]       = useState([])
+  // CHANGED: needed to resolve/auto-create products for CSV-uploaded lines —
+  // same product_id=null gap found in PI and Invoice CSV upload also existed
+  // here.
+  const [products, setProducts] = useState([])
   const [hsnMap, setHsnMap] = useState(new Map())
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
@@ -57,7 +61,7 @@ function POList() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: ps }, { data: es }, { data: os }, { data: piData }, { data: hsnRows }] = await Promise.all([
+    const [{ data: ps }, { data: es }, { data: os }, { data: piData }, { data: hsnRows }, { data: prods }] = await Promise.all([
       supabase.from('purchase_orders')
         .select('*, buyer:buyer_entity_id(name,short_name), seller:seller_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('po_date', { ascending: false }),
@@ -65,12 +69,15 @@ function POList() {
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
       supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
+      // CHANGED: for CSV product resolution below
+      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate'),
     ])
     setPOs(ps || [])
     setEntities(es || [])
     setOrders(os || [])
     setPIs(piData || [])
     setHsnMap(buildHSNMap(hsnRows || []))
+    setProducts(prods || [])
     setLoading(false)
   }, [])
 
@@ -150,26 +157,48 @@ function POList() {
   }
 
   // ── CSV handler ───────────────────────────────────────────────────────────────
-  // Format: po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no
+  // Format: po_date,buyer_entity,seller_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no
   // CHANGED: po_no is optional — blank = suggested via suggestNextNo(); if
   // supplied, used as-is after a duplicate check (existing POs + this file).
+  // CHANGED: added a "product" column + resolution step — same product_id=null
+  // gap found and fixed in PI and Invoice CSV upload also existed here.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
     if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'Need header + data rows', type: 'error' }) }
     const delim = detectDelimiter(lines[0])
-    const header = lines[0].split(delim).map(h => h.trim().toLowerCase())
+    // CHANGED: quote-aware parsing — same fix applied to PI/Invoices, plain
+    // split(delim) shredded any product name/description containing a comma
+    // inside quotes.
+    const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
     let created = 0, errors = []
     const usedPoNos = new Set(pos.map(p => p.po_no?.toLowerCase()).filter(Boolean))
     const groups = {}
     for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(delim).map(c => c.trim())
+      const cols = parseCSVLine(lines[i], delim)
       const row  = {}
       header.forEach((h, j) => { row[h] = cols[j] || '' })
       const key = `${row.po_date}__${row.buyer_entity}__${row.seller_entity}`
       if (!groups[key]) groups[key] = { meta: row, lines: [] }
       groups[key].lines.push(row)
     }
+
+    // CHANGED: resolve/auto-create products up front, across all groups —
+    // same approach as Opening Stock / PI / Invoices CSV handlers.
+    const productList = [...products]
+    const findProduct = name => productList.find(p => (p.name || '').trim().toLowerCase() === (name || '').trim().toLowerCase())
+    const allRows = Object.values(groups).flatMap(g => g.lines)
+    const missingNames = [...new Set(allRows.filter(r => r.product?.trim() && !findProduct(r.product)).map(r => r.product.trim()))]
+    if (missingNames.length > 0) {
+      const payloads = missingNames.map(name => {
+        const src = allRows.find(r => r.product?.trim() === name)
+        return { name, hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }
+      })
+      const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
+      if (pErr) errors.push(`Could not auto-create ${missingNames.length} new product(s) — ${pErr.message}`)
+      else productList.push(...(newProducts || []))
+    }
+
     for (const [key, group] of Object.entries(groups)) {
       const { meta, lines: gLines } = group
       const buyerE  = entities.find(e => e.short_name?.toLowerCase() === meta.buyer_entity?.toLowerCase()  || e.name?.toLowerCase() === meta.buyer_entity?.toLowerCase())
@@ -197,14 +226,22 @@ function POList() {
       }
       usedPoNos.add(poNo.toLowerCase())
 
+      // CHANGED: require a resolvable product per line — a line with no
+      // product reference cannot be tracked in stock, so we reject it
+      // clearly rather than silently inserting it with product_id = null.
+      let lineErr = false
       const interstate = meta.is_interstate === 'true' || (buyerE.state_code && sellerE.state_code && buyerE.state_code !== sellerE.state_code)
       const poLines = gLines.map((r, i) => {
+        const product = r.product?.trim() ? findProduct(r.product) : null
+        if (r.product?.trim() && !product) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
+        if (!r.product?.trim()) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
         const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
         const igst = interstate ? Math.round(taxable * gstRate / 100) : 0
         const cgst = !interstate ? Math.round(taxable * half / 100) : 0
-        return { line_no: i+1, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
+        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
       })
+      if (lineErr) continue
       const totals = poLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
       const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, ...totals }).select().single()
       if (poErr) { errors.push(`PO ${meta.po_date}: ${poErr.message}`); continue }
@@ -318,8 +355,8 @@ function POList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('po')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no</code><br /><br />
-            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO. <code>po_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing POs and other rows in this file).
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>po_date,buyer_entity,seller_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,delivery_date,notes,po_no</code><br /><br />
+            Multiple rows with same <strong>po_date + buyer + seller</strong> are grouped into one PO. <code>po_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing POs and other rows in this file). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
