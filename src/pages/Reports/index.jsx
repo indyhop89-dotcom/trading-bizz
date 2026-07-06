@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../../supabaseClient'
+import { fetchAllPages } from '../../utils/query'
 import { C, Card, FormRow, Select, Spinner, StatCard, Badge } from '../../components/UI/index'
 import { formatINR } from '../../utils/money'
 import { fmtDate, fyOptions, today } from '../../utils/dates'
@@ -548,7 +549,7 @@ function ActualStockReport({ entities, defaultEntityId }) {
     setLoading(true)
     const [raw, { data: products }] = await Promise.all([
       fetchStockMovementData(),
-      supabase.from('products').select('id,name,hsn_code,unit,category'),
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,unit,category')),
     ])
     const map = buildActualStockMap(raw)
     const productById = Object.fromEntries((products || []).map(p => [p.id, p]))
@@ -629,10 +630,10 @@ function StockMovementReport({ entities }) {
   async function runReport() {
     setLoading(true)
     const [{ data: invLines }, { data: products }] = await Promise.all([
-      supabase.from('invoice_lines')
+      fetchAllPages(() => supabase.from('invoice_lines')
         .select('qty, product_id, invoice:invoice_id(invoice_no, eway_bill_no, eway_bill_date, status, invoice_type, seller_entity_id, buyer_entity_id, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name))')
-        .not('invoice', 'is', null),
-      supabase.from('products').select('id,name'),
+        .not('invoice', 'is', null)),
+      fetchAllPages(() => supabase.from('products').select('id,name')),
     ])
     const productById = Object.fromEntries((products || []).map(p => [p.id, p]))
     const result = (invLines || [])

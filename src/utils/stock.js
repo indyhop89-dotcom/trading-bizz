@@ -1,5 +1,6 @@
 import { supabase } from '../supabaseClient'
 import { toNum } from './money'
+import { fetchAllPages } from './query'
 
 // Invoice statuses that are never real movements regardless of dispatch —
 // 'draft' invoices haven't been sent yet, 'cancelled' invoices never
@@ -11,11 +12,14 @@ const MOVEMENT_STATUSES_EXCLUDED = ['draft', 'cancelled']
 // Raw data fetch — shared by both consumers below so we only hit the DB once
 // per page load rather than once per entity.
 export async function fetchStockMovementData() {
+  // CHANGED: both tables can exceed PostgREST's default 1000-row response
+  // cap — a plain .select() silently truncates rather than erroring, which
+  // undercounts opening/actual stock once either table grows past 1000 rows.
   const [{ data: opening }, { data: invLines }] = await Promise.all([
-    supabase.from('stock_opening_balance').select('entity_id, product_id, qty'),
-    supabase.from('invoice_lines')
+    fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_id, qty')),
+    fetchAllPages(() => supabase.from('invoice_lines')
       .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, invoice_type)')
-      .not('invoice', 'is', null),
+      .not('invoice', 'is', null)),
   ])
   return {
     opening: opening || [],

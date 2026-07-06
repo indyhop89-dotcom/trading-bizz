@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import { fetchAllPages } from '../../utils/query'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
@@ -148,8 +149,10 @@ function InvoiceList() {
         .eq('is_deleted', false).neq('invoice_type', 'intercompany')
         .order('invoice_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
-      // CHANGED: for CSV product resolution below
-      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate'),
+      // CHANGED: for CSV product resolution below. Paginated — products can
+      // exceed PostgREST's default 1000-row cap, which would otherwise
+      // silently drop products past that point from CSV matching.
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
     setInvoices(invs || [])
     setEntities(es || [])
@@ -497,7 +500,7 @@ function NewInvoice() {
       supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,total_amount,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('purchase_orders').select('id,po_no,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
-      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name'),
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name')),
     ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }, { data: prods }]) => {
       setEntities(es || [])
       setOrders(os || [])

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import { fetchAllPages } from '../../utils/query'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop,
@@ -95,8 +96,10 @@ function PIList() {
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
       supabase.from('hsn_master').select('*').eq('is_active', true),
-      // CHANGED: for CSV product resolution below
-      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate'),
+      // CHANGED: for CSV product resolution below. Paginated — products can
+      // exceed PostgREST's default 1000-row cap, which would otherwise
+      // silently drop products past that point from CSV matching.
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
     setPIs(ps||[]); setEntities(es||[]); setOrders(os||[]); setHsnMap(buildHSNMap(hsnRows||[]))
     setProducts(prods||[])

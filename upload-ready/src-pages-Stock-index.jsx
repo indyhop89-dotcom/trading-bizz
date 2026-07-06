@@ -13,6 +13,7 @@ import { fetchStockMovementData, buildActualStockMap } from '../../utils/stock'
 import { cleanProductName, productMatchKey } from '../../utils/products'
 // CHANGED: needed to know the current user's role/id for entity-access scoping
 import { useAuth } from '../../hooks/useAuth'
+import { fetchAllPages } from '../../utils/query'
 
 const UNITS = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
 const TABS  = ['Opening Stock', 'Stock Position', 'Products']
@@ -61,14 +62,19 @@ function OpeningStock() {
   const [csvSaving, setCsvSaving] = useState(false)
   const [csvProgress, setCsvProgress] = useState('')
 
+  // CHANGED: stock_opening_balance and products can both exceed PostgREST's
+  // default 1000-row response cap now that the catalog has grown past that —
+  // a plain .select() silently truncates instead of erroring, which is what
+  // made the Stock page's totals undercount actual value/qty. Page through
+  // with fetchAllPages so every row is loaded regardless of table size.
   const load = useCallback(async () => {
     setLoading(true)
     const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }] = await Promise.all([
-      supabase.from('stock_opening_balance')
+      fetchAllPages(() => supabase.from('stock_opening_balance')
         .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit), fy:financial_year_id(name)')
-        .order('created_at', { ascending: false }),
+        .order('created_at', { ascending: false })),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name'),
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name')),
       supabase.from('financial_years').select('*').order('start_date', { ascending: false }),
     ])
     setRows(rs || [])
@@ -132,8 +138,10 @@ function OpeningStock() {
   // existing rows by comparing against the currently-loaded list, but that list
   // is capped at Supabase's default 1000 rows, so anything past 1000 slipped
   // through and hit the DB unique constraint.) This makes "re-upload to fix the
-  // numbers" work reliably. Duplicate keys WITHIN one file are collapsed too
-  // (last row wins), since a single upsert can't touch the same key twice.
+  // numbers" work reliably. Duplicate keys WITHIN one file are combined too
+  // (quantities summed), since a single upsert can't touch the same key twice
+  // and source files legitimately list the same product's stock across
+  // multiple lots/batches on separate rows.
   // Runs in batches (not one row at a time) so large files (1000+ rows) don't take minutes,
   // and every row is accounted for in the result.
   async function handleCSV() {
@@ -208,8 +216,14 @@ function OpeningStock() {
       }
     }
 
-    // Phase 3 — resolve each row's product; collapse duplicate keys within the
-    // file (last row wins) since one upsert can't touch the same key twice.
+    // Phase 3 — resolve each row's product; SUM quantities for duplicate
+    // entity+product+fy keys within the file since one upsert can't touch the
+    // same key twice. Source files legitimately list the same product more
+    // than once (separate stock lots/batches received at the same rate) and
+    // those quantities are meant to add up, not overwrite one another — a
+    // product's rate/HSN/GST are already part of what makes it "the same
+    // product" (see productMatchKey), so colliding rows always share those
+    // values and only qty needs combining.
     // Note: two rows with the same product NAME but different HSN/rate/GST
     // resolve to different products here, so they land in different
     // entity+product+fy keys and do NOT collapse into each other.
@@ -221,15 +235,20 @@ function OpeningStock() {
       if (!product) { errors.push(`Row ${p.rowNum}: product "${p.productName}" could not be created`); continue }
       const label = `${p.row.entity} — ${p.productName} — ${p.row.fy}`
       const key = `${p.entity.id}__${product.id}__${p.fy.id}`
-      if (byKey.has(key)) skippedItems.push(`${label} — listed more than once in this file; last value used`)
-      byKey.set(key, {
-        entity_id: p.entity.id, product_id: product.id, financial_year_id: p.fy.id,
-        qty: toNum(p.row.qty), unit: p.row.unit || product.unit || null, rate: toNum(p.row.rate),
-        hsn_code: p.row.hsn_code || product.hsn_code || null,
-        gst_rate: p.row.gst_rate ? toNum(p.row.gst_rate) : (product.gst_rate != null ? product.gst_rate : null),
-        as_of_date: p.row.as_of_date || today(),
-        _label: label,
-      })
+      const qty = toNum(p.row.qty)
+      if (byKey.has(key)) {
+        byKey.get(key).qty += qty
+        skippedItems.push(`${label} — listed more than once in this file; quantities combined`)
+      } else {
+        byKey.set(key, {
+          entity_id: p.entity.id, product_id: product.id, financial_year_id: p.fy.id,
+          qty, unit: p.row.unit || product.unit || null, rate: toNum(p.row.rate),
+          hsn_code: p.row.hsn_code || product.hsn_code || null,
+          gst_rate: p.row.gst_rate ? toNum(p.row.gst_rate) : (product.gst_rate != null ? product.gst_rate : null),
+          as_of_date: p.row.as_of_date || today(),
+          _label: label,
+        })
+      }
     }
     const toUpsert = [...byKey.values()]
 
@@ -406,7 +425,7 @@ function OpeningStock() {
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>
                 {csvResult.totalDataRows} rows in file — {csvResult.added} added/updated,
-                {` `}{csvResult.skipped} in-file duplicate{csvResult.skipped === 1 ? '' : 's'}, {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}.
+                {` `}{csvResult.skipped} combined into an earlier row (same product listed twice), {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}.
                 {csvResult.productsCreated > 0 ? ` ${csvResult.productsCreated} new product${csvResult.productsCreated === 1 ? '' : 's'} auto-created.` : ''}
               </strong>
               {csvResult.added + csvResult.skipped + csvResult.errors.length !== csvResult.totalDataRows && (
@@ -422,7 +441,7 @@ function OpeningStock() {
               )}
               {csvResult.skippedItems?.length > 0 && (
                 <details style={{ marginTop: '6px' }}>
-                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.skippedItems.length} skipped row{csvResult.skippedItems.length === 1 ? '' : 's'}</summary>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.skippedItems.length} combined row{csvResult.skippedItems.length === 1 ? '' : 's'}</summary>
                   <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
                     {csvResult.skippedItems.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
                   </div>
