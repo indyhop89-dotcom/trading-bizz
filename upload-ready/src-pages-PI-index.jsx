@@ -21,6 +21,25 @@ import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedin
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 
+// CHANGED: LineItemsEditor's computeLine() spreads calcLineTax()'s return
+// (which includes `total_tax`, a combined figure used for computing
+// total_amount) onto the line, plus UI-only helper fields (_id, _cost_rate,
+// _margin_pct, _hsn_*) — none of these are columns on
+// proforma_invoice_lines. The previous approach explicitly destructured out
+// only the known UI-only fields, which missed `total_tax` and made every
+// save fail with "Could not find the 'total_tax' column…". Allow-listing
+// real DB columns (as PO/Invoices already do) can't miss a field this way.
+const PI_LINE_COLUMNS = [
+  'product_id', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
+  'taxable_amount', 'cgst_rate', 'cgst_amount', 'sgst_rate', 'sgst_amount',
+  'igst_rate', 'igst_amount', 'total_amount',
+]
+function toPILinePayload(computedLine, piId, lineNo) {
+  const out = { pi_id: piId, line_no: lineNo }
+  for (const col of PI_LINE_COLUMNS) if (computedLine[col] !== undefined) out[col] = computedLine[col]
+  return out
+}
+
 const EMPTY_FORM = {
   pi_date: today(), valid_upto: '', status: 'draft',
   from_entity_id: '', to_entity_id: '',
@@ -193,11 +212,7 @@ function PIList() {
     const { data: pi, error: piErr } = await supabase.from('proforma_invoices').insert(payload).select().single()
     if (piErr) { setSaving(false); return setToast({ message: piErr.message, type: 'error' }) }
     if (piLines.length > 0) {
-      const linesPayload = piLines.map((l, i) => {
-        const cl = computeLine(l, form.is_interstate)
-        const { _id, _cost_rate, _margin_pct, _hsn_resolved_rate, _hsn_override, _hsn_manually_set, _hsn_source, ...rest } = cl
-        return { ...rest, pi_id: pi.id, line_no: i + 1 }
-      })
+      const linesPayload = piLines.map((l, i) => toPILinePayload(computeLine(l, form.is_interstate), pi.id, i + 1))
       const { error: lErr } = await supabase.from('proforma_invoice_lines').insert(linesPayload)
       if (lErr) { setSaving(false); return setToast({ message: lErr.message, type: 'error' }) }
       await writeStockMovementsForPI(pi, linesPayload)
@@ -734,10 +749,7 @@ function PIDetail() {
     // we never insert on top of lines that weren't actually cleared.
     const { error: delErr } = await supabase.from('proforma_invoice_lines').delete().eq('pi_id',id)
     if (delErr) { setSaving(false); return setToast({message:`Could not clear old line items: ${delErr.message}. PI header was updated but lines were left unchanged to avoid duplicates.`,type:'error'}) }
-    const linesPayload = computedLines.map((l,i)=>{
-      const {_id,_cost_rate,_margin_pct,_hsn_resolved_rate,_hsn_override,_hsn_manually_set,_hsn_source,...rest}=l
-      return {...rest,pi_id:id,line_no:i+1}
-    })
+    const linesPayload = computedLines.map((l,i)=>toPILinePayload(l,id,i+1))
     if (linesPayload.length) {
       const { error: lErr } = await supabase.from('proforma_invoice_lines').insert(linesPayload)
       if (lErr) { setSaving(false); return setToast({message:lErr.message,type:'error'}) }
