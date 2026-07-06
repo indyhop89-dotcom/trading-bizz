@@ -493,6 +493,11 @@ function StockPosition() {
   // CHANGED: category filter + group-by-category summary toggle
   const [categoryFilter, setCategoryFilter] = useState('')
   const [groupByCategory, setGroupByCategory] = useState(false)
+  // CHANGED: sold-out products (actual stock exactly 0 — everything on hand
+  // has moved out, nothing wrong) clutter the table once a business has been
+  // running a while. Hidden by default; doesn't touch negative-stock rows,
+  // which stay visible since those indicate a real shortfall to investigate.
+  const [hideSoldOut, setHideSoldOut] = useState(true)
   // CHANGED: click-to-filter from the Shortfalls / Billed Beyond Stock StatCards
   const [statusFilter, setStatusFilter] = useState(null) // null | 'shortfall' | 'billed_beyond'
   // CHANGED: tracks invoice lines with no product_id (known CSV-upload data
@@ -662,9 +667,9 @@ function StockPosition() {
   // CHANGED: category filter applied client-side (product.category comes
   // through the join, not filterable server-side without a second query)
   const categories = [...new Set(position.map(r => r.product?.category).filter(Boolean))].sort()
-  const categoryOnlyFiltered = categoryFilter
-    ? position.filter(r => r.product?.category === categoryFilter)
-    : position
+  const categoryOnlyFiltered = position
+    .filter(r => !categoryFilter || r.product?.category === categoryFilter)
+    .filter(r => !hideSoldOut || r.actual_qty !== 0)
 
   // CHANGED: counts always reflect the category filter only, never the status
   // toggle itself — otherwise clicking "Shortfalls" would make its own count
@@ -797,6 +802,11 @@ function StockPosition() {
         {/* CHANGED: group-by-category summary toggle */}
         <Btn size='sm' variant={groupByCategory ? 'primary' : 'ghost'} onClick={() => setGroupByCategory(g => !g)}>
           {groupByCategory ? '✓ ' : ''}Group by category
+        </Btn>
+        {/* CHANGED: sold-out products (0 actual stock) hidden by default to
+            cut clutter — toggle back on for a full audit view. */}
+        <Btn size='sm' variant={hideSoldOut ? 'ghost' : 'primary'} onClick={() => setHideSoldOut(h => !h)}>
+          {hideSoldOut ? 'Show sold-out products' : '✓ Showing sold-out products'}
         </Btn>
         <Btn size='sm' variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
       </div>
