@@ -707,14 +707,17 @@ function PIDetail() {
 
   // CHANGED: a past bug (failed line-delete not checked before re-insert on
   // save — see handleSaveEdit below) let a handful of old PIs accumulate
-  // thousands of duplicate line rows. Rendering that many rows in the
-  // editable grid (each with live HSN/margin computation) freezes the tab
-  // solid with no error — nothing to catch, just an unusably large render.
-  // Block edit mode on those and point at the fix instead of freezing.
-  const MAX_EDITABLE_LINES = 300
+  // thousands of duplicate line rows, and editing one froze the tab by
+  // mounting every line's inputs at once. LineItemsEditor now virtualizes
+  // rows above its own threshold, so large *legitimate* PIs (a full-catalog
+  // transfer can genuinely have 1000+ distinct products) no longer need to
+  // be blocked. This ceiling is now just a last-resort circuit breaker for
+  // truly pathological counts a virtualized grid still shouldn't be asked
+  // to hold in memory/state at once.
+  const MAX_EDITABLE_LINES = 5000
   function startEdit() {
     if (lines.length > MAX_EDITABLE_LINES) {
-      return setToast({message:`This PI has ${lines.length} line items — likely duplicated by a past bug. Editing is blocked to avoid freezing the page; run supabase/maintenance/dedupe_line_items.sql to clean it up first.`,type:'error'})
+      return setToast({message:`This PI has ${lines.length} line items, above the ${MAX_EDITABLE_LINES} safety limit. If this isn't expected, it's likely duplicated by a past bug — run supabase/maintenance/dedupe_line_items.sql to clean it up.`,type:'error'})
     }
     setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||'',order_id:pi.order_id||'',order_leg_id:pi.order_leg_id||''})
     setEditLines(lines.map(l=>({...l,_id:l.id,_hsn_resolved_rate:null,_hsn_override:false,_hsn_manually_set:false,_cost_rate:null,_margin_pct:''})))

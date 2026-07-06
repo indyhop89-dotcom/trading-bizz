@@ -72,9 +72,26 @@ function TotalsBar({ totals, interstate }) {
  *   rate        = computed sell price = _cost_rate × (1 + _margin_pct/100).
  *                 Supports negative margin (selling below cost).
  */
+// CHANGED: large real documents (a PI moving an entire ~1000-product catalog
+// in one go, for example) used to freeze the tab solid when edited — every
+// line renders several controlled inputs plus live HSN/margin computation,
+// and mounting 1000+ of those at once is more synchronous render work than
+// a browser tab can do without blocking. Above VIRTUALIZE_THRESHOLD lines,
+// only the rows actually scrolled into view (plus a small overscan buffer)
+// are mounted; the rest are represented by two spacer rows so the scrollbar
+// still reflects the true list length. Below the threshold, rendering is
+// completely unchanged. ROW_HEIGHT is an estimate (real rows vary slightly
+// with badges like the stock-shortfall/HSN-override warnings) — good enough
+// for scroll math, not pixel-perfect.
+const VIRTUALIZE_THRESHOLD = 100
+const ROW_HEIGHT = 56
+const OVERSCAN = 15
+const VIEWPORT_HEIGHT = 600
+
 export default function LineItemsEditor({ lines, setLines, interstate, products = [], hsnMap, readOnly, showMargin = false, stockMap }) {
 
   const [applyMarginPct, setApplyMarginPct] = useState('')
+  const [scrollTop, setScrollTop] = useState(0)
 
   function addLine() {
     setLines(prev => [...prev, {
@@ -264,6 +281,12 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
   const td  = { padding: '6px 8px', borderBottom: `1px solid #f0e8d8`, verticalAlign: 'top' }
   const inp = { padding: '5px 7px', border: `1px solid ${C.border}`, borderRadius: '4px', background: '#fffdf6', fontSize: '12px', width: '100%', fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box' }
 
+  const isVirtualized = !readOnly && lines.length > VIRTUALIZE_THRESHOLD
+  const startIdx = isVirtualized ? Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN) : 0
+  const endIdx   = isVirtualized ? Math.min(lines.length, Math.ceil((scrollTop + VIEWPORT_HEIGHT) / ROW_HEIGHT) + OVERSCAN) : lines.length
+  const visibleLines = isVirtualized ? lines.slice(startIdx, endIdx) : lines
+  const colCount = 10 + (showMargin ? 1 : 0) + (!readOnly ? 1 : 0)
+
   return (
     <div>
       {lines.length > 0 && (
@@ -289,7 +312,18 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
         </div>
       )}
 
-      <div style={{ overflowX: 'auto', border: `1px solid ${C.border}`, borderRadius: '8px' }}>
+      {isVirtualized && (
+        <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '6px' }}>
+          {lines.length} lines — scrolling renders rows on demand to keep this responsive.
+        </div>
+      )}
+      <div
+        style={{
+          overflowX: 'auto', border: `1px solid ${C.border}`, borderRadius: '8px',
+          ...(isVirtualized ? { overflowY: 'auto', maxHeight: `${VIEWPORT_HEIGHT}px` } : {}),
+        }}
+        onScroll={isVirtualized ? e => setScrollTop(e.currentTarget.scrollTop) : undefined}
+      >
         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', minWidth: showMargin ? '1040px' : '860px' }}>
           <thead>
             <tr>
@@ -316,7 +350,11 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
             </tr>
           </thead>
           <tbody>
-            {lines.map((line, idx) => {
+            {isVirtualized && startIdx > 0 && (
+              <tr><td colSpan={colCount} style={{ padding: 0, border: 'none', height: `${startIdx * ROW_HEIGHT}px` }} /></tr>
+            )}
+            {visibleLines.map((line, i) => {
+              const idx = startIdx + i
               const isOverride = line._hsn_override
               const lineQty    = toNum(line.qty)
               const availQty   = stockMap && line.product_id ? (stockMap[line.product_id] ?? null) : null
@@ -475,6 +513,9 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
                 </tr>
               )
             })}
+            {isVirtualized && endIdx < lines.length && (
+              <tr><td colSpan={colCount} style={{ padding: 0, border: 'none', height: `${(lines.length - endIdx) * ROW_HEIGHT}px` }} /></tr>
+            )}
           </tbody>
         </table>
       </div>
