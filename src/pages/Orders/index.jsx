@@ -76,7 +76,7 @@ function OrderSummaryTable({ legs, piMap, invMap }) {
       <table style={{width:'100%',borderCollapse:'collapse',fontSize:'12px',whiteSpace:'nowrap'}}>
         <thead>
           <tr>
-            <th style={th}>Leg</th><th style={th}>Route</th><th style={th}>PI No</th><th style={th}>PI Status</th>
+            <th style={th}>Leg</th><th style={th}>Route</th><th style={th}>PI No</th><th style={th}>PI Date</th><th style={th}>PI Status</th>
             <th style={th}>Invoice No</th><th style={th}>Inv Date</th>
             <th style={{...th,textAlign:'right'}}>PI Value</th>
             <th style={{...th,textAlign:'right'}}>Inv Value</th>
@@ -97,6 +97,7 @@ function OrderSummaryTable({ legs, piMap, invMap }) {
                 <td style={td}><div style={{width:22,height:22,borderRadius:'50%',background:C.accent,color:'#f5f0e8',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'11px',fontWeight:700}}>{leg.leg_no}</div></td>
                 <td style={td}><span style={{fontWeight:600}}>{en(leg.from_entity)}</span><span style={{color:C.textMuted,margin:'0 4px'}}>→</span><span style={{fontWeight:600}}>{en(leg.to_entity)}</span></td>
                 <td style={{...td,fontFamily:'monospace'}}>{pi?.pi_no||<span style={{color:C.textMuted}}>—</span>}</td>
+                <td style={{...td,color:C.textSoft}}>{pi?fmtDate(pi.pi_date):'—'}</td>
                 <td style={td}>{pi?<Badge status={pi.status}/>:<span style={{color:C.textMuted,fontSize:'11px'}}>No PI</span>}</td>
                 <td style={{...td,fontFamily:'monospace'}}>{inv?.invoice_no||<span style={{color:C.textMuted}}>—</span>}</td>
                 <td style={{...td,color:C.textSoft}}>{inv?fmtDate(inv.invoice_date):'—'}</td>

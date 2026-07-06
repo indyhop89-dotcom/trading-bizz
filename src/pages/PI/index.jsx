@@ -662,6 +662,8 @@ function PIDetail() {
   const [editing, setEditing]     = useState(false)
   const [editForm, setEditForm]   = useState({})
   const [hsnMap, setHsnMap]       = useState(new Map())
+  const [orders, setOrders]       = useState([])
+  const [legs, setLegs]           = useState([])
   const [loading, setLoading]     = useState(true)
   const [saving, setSaving]       = useState(false)
   const [toast, setToast]         = useState(null)
@@ -669,19 +671,29 @@ function PIDetail() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: p }, { data: ls }, { data: hsnRows }] = await Promise.all([
+    const [{ data: p }, { data: ls }, { data: hsnRows }, { data: os }] = await Promise.all([
       supabase.from('proforma_invoices').select('*, from_entity:from_entity_id(name,short_name,gstin,state_code,address,city), to_entity:to_entity_id(name,short_name,gstin,state_code,address,city), orders(name), order_legs(leg_no)').eq('id',id).single(),
       supabase.from('proforma_invoice_lines').select('*').eq('pi_id',id).order('line_no'),
       supabase.from('hsn_master').select('*').eq('is_active',true),
+      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
     ])
-    setPI(p); setLines(ls||[]); setHsnMap(buildHSNMap(hsnRows||[])); setLoading(false)
+    setPI(p); setLines(ls||[]); setHsnMap(buildHSNMap(hsnRows||[])); setOrders(os||[]); setLoading(false)
   }, [id])
 
   useEffect(() => { load() }, [load])
 
+  async function loadLegs(orderId) {
+    if (!orderId) { setLegs([]); return }
+    const { data } = await supabase.from('order_legs')
+      .select('id, leg_no, from_entity:from_entity_id(name,short_name), to_entity:to_entity_id(name,short_name)')
+      .eq('order_id', orderId).order('leg_no')
+    setLegs(data || [])
+  }
+
   function startEdit() {
-    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||''})
+    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||'',order_id:pi.order_id||'',order_leg_id:pi.order_leg_id||''})
     setEditLines(lines.map(l=>({...l,_id:l.id,_hsn_resolved_rate:null,_hsn_override:false,_hsn_manually_set:false,_cost_rate:null,_margin_pct:''})))
+    if (pi.order_id) loadLegs(pi.order_id)
     setEditing(true)
   }
 
@@ -701,7 +713,9 @@ function PIDetail() {
     }
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
     const totals = computeTotals(computedLines)
-    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,...totals,updated_at:new Date()}).eq('id',id)
+    // order_id/order_leg_id are uuid columns — an empty string (cleared in the
+    // dropdown) must be sent as null, not '', or the update fails.
+    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,order_id:editForm.order_id||null,order_leg_id:editForm.order_leg_id||null,...totals,updated_at:new Date()}).eq('id',id)
     if (piErr) { setSaving(false); return setToast({message:piErr.message,type:'error'}) }
     // CHANGED: this delete's result was never checked. If it silently failed
     // (RLS/timeout) while the insert below still ran, every re-save stacked
@@ -789,7 +803,7 @@ function PIDetail() {
         <div><span style={{ color: C.textMuted }}>Date:</span> <strong>{fmtDate(pi.pi_date)}</strong></div>
         {pi.valid_upto && <div><span style={{ color: C.textMuted }}>Valid until:</span> <strong>{fmtDate(pi.valid_upto)}</strong></div>}
         <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={pi.is_interstate ? 'export' : 'domestic'} label={pi.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
-        {pi.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{pi.orders.name}</strong></div>}
+        {pi.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{pi.orders.name}{pi.order_legs?.leg_no ? ` — Leg ${pi.order_legs.leg_no}` : ''}</strong></div>}
       </div>
 
       {editing&&(
@@ -801,6 +815,18 @@ function PIDetail() {
             <FormRow label='Valid Upto'><Input type='date' value={editForm.valid_upto} onChange={e=>setEditForm(f=>({...f,valid_upto:e.target.value}))}/></FormRow>
             <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{PI_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
             <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
+            <FormRow label='Order'>
+              <Select value={editForm.order_id} onChange={e=>{setEditForm(f=>({...f,order_id:e.target.value,order_leg_id:''}));loadLegs(e.target.value)}}>
+                <option value=''>No order</option>
+                {orders.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Order Leg'>
+              <Select value={editForm.order_leg_id} onChange={e=>setEditForm(f=>({...f,order_leg_id:e.target.value}))} disabled={!editForm.order_id||!legs.length}>
+                <option value=''>Select leg</option>
+                {legs.map(l=><option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name||l.from_entity?.name} → {l.to_entity?.short_name||l.to_entity?.name}</option>)}
+              </Select>
+            </FormRow>
             <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>
             <FormRow label='Bill To'><Input value={editForm.bill_to} onChange={e=>setEditForm(f=>({...f,bill_to:e.target.value}))}/></FormRow>
           </div>
