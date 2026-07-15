@@ -5,33 +5,33 @@ import { formatINR, toNum, roundRupees, round2 } from '../money.js'
 
 describe('formatINR', () => {
   // Happy path
-  it('formats a whole number with Indian comma style', () => {
-    expect(formatINR(1250)).toBe('₹1,250')
+  it('formats a whole number with Indian comma style and 2dp', () => {
+    expect(formatINR(1250)).toBe('₹1,250.00')
   })
 
   it('formats a large number with crore-level commas', () => {
-    expect(formatINR(10000000)).toBe('₹1,00,00,000')
+    expect(formatINR(10000000)).toBe('₹1,00,00,000.00')
   })
 
-  it('formats zero as ₹0', () => {
-    expect(formatINR(0)).toBe('₹0')
+  it('formats zero as ₹0.00', () => {
+    expect(formatINR(0)).toBe('₹0.00')
   })
 
-  it('rounds a decimal to nearest whole rupee before display', () => {
-    expect(formatINR(1250.60)).toBe('₹1,251')
+  it('displays the exact 2dp value rather than rounding to a whole rupee', () => {
+    expect(formatINR(1250.60)).toBe('₹1,250.60')
   })
 
-  it('rounds down when decimal < 0.5', () => {
-    expect(formatINR(1250.40)).toBe('₹1,250')
+  it('preserves 2dp values under 0.5 as well', () => {
+    expect(formatINR(1250.40)).toBe('₹1,250.40')
   })
 
   it('formats a string number correctly', () => {
-    expect(formatINR('5000')).toBe('₹5,000')
+    expect(formatINR('5000')).toBe('₹5,000.00')
   })
 
-  // NOTE: toLocaleString('en-IN') places ₹ before the minus sign → '₹-500'
+  // NOTE: toLocaleString('en-IN') places ₹ before the minus sign → '₹-500.00'
   it('formats a negative amount (symbol before minus per en-IN locale)', () => {
-    expect(formatINR(-500)).toBe('₹-500')
+    expect(formatINR(-500)).toBe('₹-500.00')
   })
 
   // Edge / null cases → em-dash

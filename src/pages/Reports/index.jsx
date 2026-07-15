@@ -554,7 +554,11 @@ function ActualStockReport({ entities, defaultEntityId }) {
     const map = buildActualStockMap(raw)
     const productById = Object.fromEntries((products || []).map(p => [p.id, p]))
     const entityById  = Object.fromEntries(entities.map(e => [e.id, e]))
-    let result = Object.values(map).filter(r => r.product_id) // unmapped lines covered by the Missing Products report instead
+    // This is a "what do we actually hold right now" ledger, not a full
+    // history — a product an entity once carried but is fully out of no
+    // longer belongs here (same reasoning as Stock Position's hide-sold-out
+    // default, applied unconditionally since this view has no toggle).
+    let result = Object.values(map).filter(r => r.product_id && r.actual_qty !== 0)
     if (entityId) result = result.filter(r => r.entity_id === entityId)
     result = result
       .map(r => ({ ...r, entity: entityById[r.entity_id], product: productById[r.product_id] }))

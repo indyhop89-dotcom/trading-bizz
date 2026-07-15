@@ -11,6 +11,7 @@ const DOMESTIC_DOCS = [
   { slot: 'invoice',      label: 'Invoice' },
   { slot: 'packing_list', label: 'Packing List' },
   { slot: 'pi',           label: 'PI (Proforma Invoice)' },
+  { slot: 'po',           label: 'PO (Purchase Order)' },
   { slot: 'eway_bill',    label: 'E-way Bill' },
   { slot: 'einvoice',     label: 'E-invoice' },
   { slot: 'lr',           label: 'LR (Lorry Receipt)' },
@@ -288,13 +289,20 @@ export default function DocumentChecklist({
     }
   }
 
-  async function handleDeleteOther() {
+  async function handleDeleteDoc() {
     try {
       await deleteFileFromDrive(confirmDelete.drive_file_id)
     } catch (err) {
       console.error('Storage delete error:', err)
     }
     await supabase.from('documents').delete().eq('id', confirmDelete.id)
+    // Checklist-slot documents keep their slot row — clear it back to
+    // Pending instead of deleting the row, since the slot itself still applies.
+    if (confirmDelete.checklistRowId) {
+      await supabase.from('leg_document_checklist')
+        .update({ document_id: null, status: 'pending', updated_at: new Date().toISOString() })
+        .eq('id', confirmDelete.checklistRowId)
+    }
     setConfirmDelete(null)
     setToast({ message: 'Document removed', type: 'success' })
     load()
@@ -376,12 +384,17 @@ export default function DocumentChecklist({
       ) : (
         <>
           {/* ── Checklist rows ── */}
+          {/* CHANGED: N/A docs sink to the bottom of the list, keeping the
+              still-actionable (Pending/Uploaded) rows together at the top. */}
           <div>
-            {docList.map((doc, i) => {
+            {[...docList]
+              .sort((a, b) => (dbToDisplay(rowFor(a.slot)?.status) === 'N/A') - (dbToDisplay(rowFor(b.slot)?.status) === 'N/A'))
+              .map((doc, i, sorted) => {
               const row = rowFor(doc.slot)
               const status = dbToDisplay(row?.status)
               const isUploading = uploading === doc.slot
               const linkedDoc = row?.document   // joined document record
+              const isNA = status === 'N/A'
 
               return (
                 <div
@@ -389,8 +402,9 @@ export default function DocumentChecklist({
                   style={{
                     display: 'flex', alignItems: 'center', gap: '10px',
                     padding: '9px 14px',
-                    borderBottom: i < docList.length - 1 ? `1px solid #f0e8d8` : 'none',
+                    borderBottom: i < sorted.length - 1 ? `1px solid #f0e8d8` : 'none',
                     background: i % 2 === 0 ? C.surface : '#faf6ed',
+                    opacity: isNA ? 0.6 : 1,
                   }}
                 >
                   {/* Doc label */}
@@ -465,10 +479,25 @@ export default function DocumentChecklist({
                         >
                           ↓ Save
                         </button>
+                        {!readOnly && (
+                          <button
+                            onClick={() => setConfirmDelete({ ...linkedDoc, checklistRowId: row.id })}
+                            title='Delete file'
+                            style={{
+                              padding: '4px 8px', borderRadius: '4px',
+                              fontSize: '12px', fontWeight: 600,
+                              background: 'none', color: C.danger,
+                              border: `1px solid ${C.border}`,
+                              cursor: 'pointer', fontFamily: 'inherit',
+                            }}
+                          >
+                            ×
+                          </button>
+                        )}
                       </>
                     )}
 
-                    {!readOnly && (
+                    {!readOnly && !isNA && (
                       <>
                         <button
                           onClick={() => fileRefs.current[doc.slot]?.click()}
@@ -655,7 +684,7 @@ export default function DocumentChecklist({
       <ConfirmModal
         open={!!confirmDelete}
         onClose={() => setConfirmDelete(null)}
-        onConfirm={handleDeleteOther}
+        onConfirm={handleDeleteDoc}
         title='Remove Document'
         message={`Remove "${confirmDelete?.file_name}"? This deletes the file permanently.`}
         danger

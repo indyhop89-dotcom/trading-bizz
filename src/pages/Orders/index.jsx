@@ -7,11 +7,12 @@ import {
 } from '../../components/UI/index'
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
-import { formatINR } from '../../utils/money'
+import { formatINR, toNum } from '../../utils/money'
 import { suggestNextNo } from '../../utils/numbering'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master-only delete, matches PI/PO/Invoices pattern
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { getInvoiceLifecycleStage } from '../../utils/stock'
+import { getDriveViewUrl } from '../../utils/drive'
 
 const MOVEMENT_TYPES    = ['domestic', 'export', 'blended']
 const ORDER_STATUSES    = ['open', 'in_progress', 'completed', 'cancelled']
@@ -66,7 +67,72 @@ function LegPipeline({ pi, inv }) {
   )
 }
 
-function OrderSummaryTable({ legs, piMap, invMap }) {
+// CHANGED: single cascading status per leg — PI → PO → Invoice → Movement,
+// showing whichever stage is furthest along instead of four separate status
+// columns that could silently disagree with each other (e.g. Invoice showing
+// "submitted" while Stock already says "Stock Moved").
+function getLegStatus(pi, po, inv) {
+  if (inv) {
+    const stock = getInvoiceLifecycleStage(inv)
+    if (inv.status === 'cancelled') return { key: stock.key, label: stock.key === 'overdue' ? 'Cancelled — Reversed' : 'Invoice Cancelled' }
+    if (inv.status === 'draft') return { key: 'draft', label: 'Invoice Drafted' }
+    if (stock.key === 'completed') return { key: 'completed', label: 'Stock Moved' }
+    return { key: inv.status, label: `Invoice ${inv.status} — Awaiting Movement` }
+  }
+  if (po) return { key: po.status, label: `PO ${po.status}` }
+  if (pi) return { key: pi.status, label: `PI ${pi.status}` }
+  return { key: 'pending', label: 'Not Started' }
+}
+
+// CHANGED: real trading margin, not PI-vs-Invoice-of-the-same-leg (a leg's PI
+// and Invoice are the same sale — quote vs final bill — so that comparison
+// is always ~0% and was never a margin at all). The first leg's margin is
+// this entity's actual stock cost vs what it billed out, sourced from
+// Opening Stock (stock_opening_balance.rate) since the system went live
+// mid-flow and the entity's own original purchase was never recorded as an
+// invoice here. Every leg after that is priced off what the entity actually
+// paid to acquire the goods — the previous leg's Invoice value.
+function computeLegMargin(leg, legs, invMap, costBasisMap) {
+  const inv = invMap[leg.id]
+  if (!inv?.taxable_amount) return null
+  let cost
+  if (leg.leg_no === 1) {
+    cost = costBasisMap?.[leg.id]
+  } else {
+    const prevLeg = legs.find(l => l.leg_no === leg.leg_no - 1)
+    cost = prevLeg ? invMap[prevLeg.id]?.taxable_amount : null
+  }
+  if (!(cost > 0)) return null
+  return (inv.taxable_amount - cost) / cost * 100
+}
+
+// CHANGED: PI/PO/Invoice numbers link straight through to whatever's been
+// uploaded for that doc slot (leg_document_checklist → documents), so a
+// number in this table is one click from the actual file instead of just
+// being a label you then have to go find in the Documents panel.
+function DocLink({ doc, children }) {
+  if (!doc?.drive_file_id) return children
+  return (
+    <a
+      href='#'
+      onClick={async e => {
+        e.preventDefault()
+        try {
+          const url = await getDriveViewUrl(doc.drive_file_id, doc.drive_url)
+          window.open(url, '_blank', 'noopener,noreferrer')
+          setTimeout(() => URL.revokeObjectURL(url), 60000)
+        } catch (err) {
+          console.error('Could not open document:', err)
+        }
+      }}
+      style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }}
+    >
+      {children}
+    </a>
+  )
+}
+
+function OrderSummaryTable({ legs, piMap, poMap, invMap, docMap, costBasisMap }) {
   if (!legs.length) return null
   const en = e=>e?.short_name||e?.name||'—'
   const td = {padding:'8px 10px',borderBottom:`1px solid ${C.border}`}
@@ -76,37 +142,41 @@ function OrderSummaryTable({ legs, piMap, invMap }) {
       <table style={{width:'100%',borderCollapse:'collapse',fontSize:'12px',whiteSpace:'nowrap'}}>
         <thead>
           <tr>
-            <th style={th}>Leg</th><th style={th}>Route</th><th style={th}>PI No</th><th style={th}>PI Date</th><th style={th}>PI Status</th>
+            <th style={th}>Leg</th><th style={th}>Route</th><th style={th}>PI No</th><th style={th}>PI Date</th>
+            <th style={th}>PO No</th>
             <th style={th}>Invoice No</th><th style={th}>Inv Date</th>
+            <th style={{...th,textAlign:'right'}}>PI Qty</th>
+            <th style={{...th,textAlign:'right'}}>Inv Qty</th>
             <th style={{...th,textAlign:'right'}}>PI Value</th>
             <th style={{...th,textAlign:'right'}}>Inv Value</th>
             <th style={{...th,textAlign:'right'}}>Margin</th>
-            <th style={th}>Inv Status</th><th style={th}>Stock</th><th style={th}>Movement</th>
+            <th style={th}>Status</th>
             <th style={{...th,textAlign:'right'}}>Payment</th>
           </tr>
         </thead>
         <tbody>
           {legs.map((leg,ri)=>{
-            const pi=piMap[leg.id], inv=invMap[leg.id]
+            const pi=piMap[leg.id], po=poMap?.[leg.id], inv=invMap[leg.id]
+            const legDocs=docMap?.[leg.id]
             const payStatus=!inv?'—':inv.status==='paid'?'Paid':inv.status==='partial'?'Partial':inv.outstanding_amount>0?'Outstanding':'—'
             const payColor=payStatus==='Paid'?C.success:payStatus==='Partial'?C.warning:payStatus==='Outstanding'?C.danger:C.textMuted
-            const piTax=pi?.taxable_amount||0, invTax=inv?.taxable_amount||0
-            const margin=piTax>0&&invTax>0?((invTax-piTax)/piTax*100):null
+            const margin=computeLegMargin(leg,legs,invMap,costBasisMap)
+            const status=getLegStatus(pi,po,inv)
             return (
               <tr key={leg.id} style={{background:ri%2===0?C.surface:'#faf6ed'}}>
                 <td style={td}><div style={{width:22,height:22,borderRadius:'50%',background:C.accent,color:'#f5f0e8',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'11px',fontWeight:700}}>{leg.leg_no}</div></td>
                 <td style={td}><span style={{fontWeight:600}}>{en(leg.from_entity)}</span><span style={{color:C.textMuted,margin:'0 4px'}}>→</span><span style={{fontWeight:600}}>{en(leg.to_entity)}</span></td>
-                <td style={{...td,fontFamily:'monospace'}}>{pi?.pi_no||<span style={{color:C.textMuted}}>—</span>}</td>
+                <td style={{...td,fontFamily:'monospace'}}>{pi?.pi_no?<DocLink doc={legDocs?.pi}>{pi.pi_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
                 <td style={{...td,color:C.textSoft}}>{pi?fmtDate(pi.pi_date):'—'}</td>
-                <td style={td}>{pi?<Badge status={pi.status}/>:<span style={{color:C.textMuted,fontSize:'11px'}}>No PI</span>}</td>
-                <td style={{...td,fontFamily:'monospace'}}>{inv?.invoice_no||<span style={{color:C.textMuted}}>—</span>}</td>
+                <td style={{...td,fontFamily:'monospace'}}>{po?.po_no?<DocLink doc={legDocs?.po}>{po.po_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
+                <td style={{...td,fontFamily:'monospace'}}>{inv?.invoice_no?<DocLink doc={legDocs?.invoice}>{inv.invoice_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
                 <td style={{...td,color:C.textSoft}}>{inv?fmtDate(inv.invoice_date):'—'}</td>
+                <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{pi?.total_qty>0?pi.total_qty:'—'}</td>
+                <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{inv?.total_qty>0?inv.total_qty:'—'}</td>
                 <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{pi?.total_amount>0?formatINR(pi.total_amount):'—'}</td>
                 <td style={{...td,textAlign:'right',fontWeight:600,fontVariantNumeric:'tabular-nums'}}>{inv?.total_amount>0?formatINR(inv.total_amount):'—'}</td>
                 <td style={{...td,textAlign:'right',fontWeight:700,color:margin===null?C.textMuted:margin>=0?'#1a5c30':C.danger}}>{margin!==null?`${margin>=0?'+':''}${margin.toFixed(1)}%`:'—'}</td>
-                <td style={td}>{inv?<Badge status={inv.status}/>:<span style={{color:C.textMuted,fontSize:'11px'}}>—</span>}</td>
-                <td style={td}>{inv?(()=>{const s=getInvoiceLifecycleStage(inv);return <Badge status={s.key} label={s.label}/>})():pi?<Badge status='pending' label='Planned'/>:<span style={{color:C.textMuted,fontSize:'11px'}}>—</span>}</td>
-                <td style={td}><Badge status={leg.movement_status}/></td>
+                <td style={td}><Badge status={status.key} label={status.label}/></td>
                 <td style={{...td,textAlign:'right',fontWeight:600,color:payColor}}>{payStatus}</td>
               </tr>
             )
@@ -363,7 +433,10 @@ function OrderDetail() {
   const [orderForm, setOrderForm] = useState({})
   const [toast, setToast]       = useState(null)
   const [piMap, setPiMap]       = useState({})
+  const [poMap, setPoMap]       = useState({})
   const [invMap, setInvMap]     = useState({})
+  const [docMap, setDocMap]     = useState({})
+  const [costBasisMap, setCostBasisMap] = useState({}) // CHANGED: leg-1's real acquisition cost, keyed by leg id — see computeLegMargin
   const [docsOpen, setDocsOpen] = useState({})
   // CHANGED: order-wide document completeness — sums each leg's checklist
   // instead of only showing completeness one leg at a time.
@@ -379,21 +452,59 @@ function OrderDetail() {
     setOrder(o); setLegs(ls||[]); setEntities(es||[]); setLoading(false)
     if (ls?.length) {
       const legIds = ls.map(l=>l.id)
-      const [{ data: piRows },{ data: invRows },{ data: checklistRows }] = await Promise.all([
+      const [{ data: piRows },{ data: poRows },{ data: invRows },{ data: checklistRows }] = await Promise.all([
         // CHANGED: was querying/filtering on `leg_id`, but proforma_invoices/
         // invoices reference a leg via `order_leg_id` (see PI/Invoices save
         // payloads) — `leg_id` doesn't exist on these two tables, so both
         // queries errored and this map silently stayed empty for every leg.
-        supabase.from('proforma_invoices').select('id,pi_no,status,total_amount,taxable_amount,order_leg_id,pi_date').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
-        supabase.from('invoices').select('id,invoice_no,status,total_amount,taxable_amount,outstanding_amount,order_leg_id,invoice_date,eway_bill_no,invoice_type').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
-        supabase.from('leg_document_checklist').select('leg_id,status').in('leg_id',legIds),
+        supabase.from('proforma_invoices').select('id,pi_no,status,total_amount,total_qty,taxable_amount,order_leg_id,pi_date').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+        // CHANGED: PO feeds the cascading leg Status column (PI → PO → Invoice → Movement)
+        supabase.from('purchase_orders').select('id,po_no,status,order_leg_id').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+        supabase.from('invoices').select('id,invoice_no,status,total_amount,total_qty,taxable_amount,outstanding_amount,order_leg_id,invoice_date,eway_bill_no,invoice_type').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+        // CHANGED: joined document (drive_file_id/drive_url) so PI/PO/Invoice
+        // numbers in the summary table can link straight to the uploaded file.
+        supabase.from('leg_document_checklist').select('leg_id,doc_slot,status,document:document_id(drive_file_id,drive_url)').in('leg_id',legIds),
       ])
-      const pMap={}, iMap={}
+      const pMap={}, poM={}, iMap={}
       for (const pi of (piRows||[])){ if(!pMap[pi.order_leg_id]) pMap[pi.order_leg_id]=pi }
+      for (const po of (poRows||[])){ if(!poM[po.order_leg_id]) poM[po.order_leg_id]=po }
       for (const inv of (invRows||[])){ if(!iMap[inv.order_leg_id]) iMap[inv.order_leg_id]=inv }
-      setPiMap(pMap); setInvMap(iMap)
+      setPiMap(pMap); setPoMap(poM); setInvMap(iMap)
+      const dMap={}
+      for (const c of (checklistRows||[])){
+        if (c.status==='uploaded' && c.document){
+          if (!dMap[c.leg_id]) dMap[c.leg_id]={}
+          dMap[c.leg_id][c.doc_slot]=c.document
+        }
+      }
+      setDocMap(dMap)
       const relevant = (checklistRows||[]).filter(c=>c.status!=='na')
       setDocCompleteness({ uploaded: relevant.filter(c=>c.status==='uploaded').length, total: relevant.length })
+
+      // CHANGED: leg-1's cost basis for margin — the real rate this entity's
+      // stock was carried at (Opening Stock), not a purchase invoice, since
+      // no such invoice exists for stock the entity already held when this
+      // system went live. Only computed for leg 1; every later leg's margin
+      // uses the previous leg's own Invoice value instead (see computeLegMargin).
+      const leg1 = ls.find(l => l.leg_no === 1)
+      const leg1Inv = leg1 ? iMap[leg1.id] : null
+      const cbMap = {}
+      if (leg1Inv) {
+        const [{ data: invLines }, { data: obRows }] = await Promise.all([
+          supabase.from('invoice_lines').select('product_id,qty').eq('invoice_id', leg1Inv.id),
+          supabase.from('stock_opening_balance').select('product_id,rate').eq('entity_id', leg1.from_entity_id).eq('financial_year_id', o.financial_year_id),
+        ])
+        const rateByProduct = {}
+        for (const ob of (obRows||[])) rateByProduct[ob.product_id] = toNum(ob.rate)
+        let cost = 0, known = true
+        for (const line of (invLines||[])) {
+          const r = rateByProduct[line.product_id]
+          if (!(r > 0)) { known = false; break }
+          cost += toNum(line.qty) * r
+        }
+        cbMap[leg1.id] = (known && cost > 0) ? cost : null
+      }
+      setCostBasisMap(cbMap)
     }
   }, [id])
 
@@ -443,9 +554,14 @@ function OrderDetail() {
   if (!order)  return <div style={{padding:'48px',textAlign:'center',color:C.danger}}>Order not found.</div>
 
   const en = e=>e?.short_name||e?.name||'—'
-  const piVal=legs.reduce((s,l)=>s+(piMap[l.id]?.taxable_amount||0),0)
-  const invVal=legs.reduce((s,l)=>s+(invMap[l.id]?.taxable_amount||0),0)
-  const bm=piVal>0&&invVal>0?((invVal-piVal)/piVal*100):null
+  // CHANGED: true end-to-end margin — final leg's Invoice value against
+  // leg-1's real acquisition cost (Opening Stock), not a sum of per-leg
+  // PI-vs-Invoice differences (which was always ~0, see computeLegMargin).
+  const leg1 = legs.find(l=>l.leg_no===1)
+  const lastLeg = legs.reduce((max,l)=>!max||l.leg_no>max.leg_no?l:max,null)
+  const lastInv = lastLeg ? invMap[lastLeg.id] : null
+  const leg1Cost = leg1 ? costBasisMap[leg1.id] : null
+  const bm = (lastInv?.taxable_amount>0 && leg1Cost>0) ? ((lastInv.taxable_amount-leg1Cost)/leg1Cost*100) : null
 
   return (
     <div>
@@ -477,7 +593,7 @@ function OrderDetail() {
             <span style={{fontSize:'11px',color:C.textMuted}}>Live — updates as PIs and Invoices are created</span>
           </div>
           <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px',overflow:'hidden'}}>
-            <OrderSummaryTable legs={legs} piMap={piMap} invMap={invMap}/>
+            <OrderSummaryTable legs={legs} piMap={piMap} poMap={poMap} invMap={invMap} docMap={docMap} costBasisMap={costBasisMap}/>
           </div>
         </div>
       )}
@@ -502,7 +618,7 @@ function OrderDetail() {
         ? <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px'}}><EmptyState icon='↗' title='No legs yet' message='Add the first leg to this order.' action={<Btn onClick={openNewLeg}>+ Add Leg</Btn>}/></div>
         : legs.map(leg=>{
           const pi=piMap[leg.id], inv=invMap[leg.id]
-          const legM=pi?.taxable_amount&&inv?.taxable_amount?((inv.taxable_amount-pi.taxable_amount)/pi.taxable_amount*100):null
+          const legM=computeLegMargin(leg,legs,invMap,costBasisMap)
           return (
             <div key={leg.id} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px',marginBottom:'12px',overflow:'hidden'}}>
               <div style={{padding:'14px 18px',borderBottom:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:'8px'}}>

@@ -4,7 +4,8 @@
 -- Removes duplicate line rows that piled up on invoices / PIs / POs during the
 -- earlier line-duplication + product-merge cascade. Keeps ONE line per
 -- (parent, product), renumbers line_no, and recomputes each parent header's
--- tax/total amounts from the cleaned lines so the totals match reality.
+-- tax/total amounts and total_qty from the cleaned lines so the totals match
+-- reality.
 --
 -- Dedup key is (parent_id, product_id) with product_id NOT NULL — a product
 -- should appear at most once per document, and every surviving copy of the
@@ -35,11 +36,11 @@ update invoice_lines il set line_no = r.rn from r where r.id = il.id;
 
 update invoices i set
   taxable_amount=t.taxable, cgst_amount=t.cgst, sgst_amount=t.sgst, igst_amount=t.igst,
-  total_amount=t.total, outstanding_amount=greatest(0, t.total - coalesce(i.paid_amount,0))
+  total_amount=t.total, total_qty=t.qty, outstanding_amount=greatest(0, t.total - coalesce(i.paid_amount,0))
 from (select invoice_id,
         coalesce(sum(taxable_amount),0) taxable, coalesce(sum(cgst_amount),0) cgst,
         coalesce(sum(sgst_amount),0) sgst, coalesce(sum(igst_amount),0) igst,
-        coalesce(sum(total_amount),0) total
+        coalesce(sum(total_amount),0) total, coalesce(sum(qty),0) qty
       from invoice_lines group by invoice_id) t
 where i.id = t.invoice_id;
 
@@ -51,11 +52,11 @@ with r as (select id, row_number() over (partition by pi_id order by line_no, id
 update proforma_invoice_lines pil set line_no = r.rn from r where r.id = pil.id;
 
 update proforma_invoices p set
-  taxable_amount=t.taxable, cgst_amount=t.cgst, sgst_amount=t.sgst, igst_amount=t.igst, total_amount=t.total
+  taxable_amount=t.taxable, cgst_amount=t.cgst, sgst_amount=t.sgst, igst_amount=t.igst, total_amount=t.total, total_qty=t.qty
 from (select pi_id,
         coalesce(sum(taxable_amount),0) taxable, coalesce(sum(cgst_amount),0) cgst,
         coalesce(sum(sgst_amount),0) sgst, coalesce(sum(igst_amount),0) igst,
-        coalesce(sum(total_amount),0) total
+        coalesce(sum(total_amount),0) total, coalesce(sum(qty),0) qty
       from proforma_invoice_lines group by pi_id) t
 where p.id = t.pi_id;
 
@@ -67,11 +68,11 @@ with r as (select id, row_number() over (partition by po_id order by line_no, id
 update purchase_order_lines pol set line_no = r.rn from r where r.id = pol.id;
 
 update purchase_orders p set
-  taxable_amount=t.taxable, cgst_amount=t.cgst, sgst_amount=t.sgst, igst_amount=t.igst, total_amount=t.total
+  taxable_amount=t.taxable, cgst_amount=t.cgst, sgst_amount=t.sgst, igst_amount=t.igst, total_amount=t.total, total_qty=t.qty
 from (select po_id,
         coalesce(sum(taxable_amount),0) taxable, coalesce(sum(cgst_amount),0) cgst,
         coalesce(sum(sgst_amount),0) sgst, coalesce(sum(igst_amount),0) igst,
-        coalesce(sum(total_amount),0) total
+        coalesce(sum(total_amount),0) total, coalesce(sum(qty),0) qty
       from purchase_order_lines group by po_id) t
 where p.id = t.po_id;
 

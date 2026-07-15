@@ -191,6 +191,26 @@ export const TEMPLATES = {
     ],
   },
 
+  stock_adjustments: {
+    filename: 'stock_adjustments_template.csv',
+    headers:  ['entity', 'product', 'qty', 'reason', 'adjustment_date', 'notes'],
+    rows: [
+      { entity: 'Siddi',  product: 'T-Shirt Basic Round Neck', qty: -5,  reason: 'shortfall', adjustment_date: '2025-04-30', notes: 'Physical count came up short vs system' },
+      { entity: 'Siddi',  product: 'Polo T-Shirt',             qty: -3,  reason: 'damage',    adjustment_date: '2025-04-30', notes: 'Water damage in warehouse' },
+      { entity: 'Retail', product: 'Cotton Woven Fabric',      qty: 10,  reason: 'found',     adjustment_date: '2025-04-30', notes: 'Found unbilled stock from an old lot' },
+      { entity: 'Retail', product: 'T-Shirt Basic Round Neck', qty: -2,  reason: 'recount',   adjustment_date: '2025-04-30', notes: 'Annual stock recount correction' },
+      { entity: 'MVL',    product: 'Polo T-Shirt',             qty: 1,   reason: 'other',     adjustment_date: '2025-04-30', notes: 'Sample piece returned to stock' },
+    ],
+    notes: [
+      '# entity  = short name or full name exactly as in Entities module',
+      '# product = must match an existing Product name exactly (Stock > Products) — not auto-created',
+      '# qty     = signed number. Positive = stock increase (found/recount-up). Negative = stock decrease (shortfall/damage/recount-down)',
+      '# reason  = shortfall | damage | found | recount | other',
+      '# adjustment_date = YYYY-MM-DD format',
+      '# notes   = optional free text',
+    ],
+  },
+
   entities: {
     filename: 'entities_template.csv',
     headers:  ['name', 'short_name', 'type', 'gstin', 'pan', 'state_code', 'state_name', 'city', 'pincode', 'email', 'phone', 'bank_name', 'bank_account_no', 'bank_ifsc'],

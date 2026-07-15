@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { cleanProductName, productKey, productMatchKey } from '../products'
+import { cleanProductName, productKey, productMatchKey, findMergeSuggestionGroups } from '../products'
 
 describe('cleanProductName', () => {
   it('strips trailing ) and )) junk', () => {
@@ -58,5 +58,45 @@ describe('productMatchKey', () => {
     const a = { name: 'Widget', hsn_code: '1111', rate: '410.7', gst_rate: '18.00' }
     const b = { name: 'Widget', hsn_code: '1111', rate: 410.70, gst_rate: 18 }
     expect(productMatchKey(a)).toBe(productMatchKey(b))
+  })
+})
+
+describe('findMergeSuggestionGroups', () => {
+  it('flags same name + HSN at different rates as a merge candidate', () => {
+    const products = [
+      { id: '1', name: 'Cushion Cover', hsn_code: '6304', default_rate: 410, is_active: true },
+      { id: '2', name: 'Cushion Cover', hsn_code: '6304', default_rate: 412, is_active: true },
+    ]
+    const groups = findMergeSuggestionGroups(products)
+    expect(groups).toHaveLength(1)
+    expect(groups[0].products.map(p => p.id).sort()).toEqual(['1', '2'])
+  })
+  it('matches junk-stripped name variants together', () => {
+    const products = [
+      { id: '1', name: 'Placemat Set of 4', hsn_code: '6304', default_rate: 100, is_active: true },
+      { id: '2', name: 'Placemat Set of 4))', hsn_code: '6304', default_rate: 105, is_active: true },
+    ]
+    expect(findMergeSuggestionGroups(products)).toHaveLength(1)
+  })
+  it('does not flag identical rate as a duplicate (same product, not a merge candidate)', () => {
+    const products = [
+      { id: '1', name: 'Cushion Cover', hsn_code: '6304', default_rate: 410, is_active: true },
+      { id: '2', name: 'Cushion Cover', hsn_code: '6304', default_rate: 410, is_active: true },
+    ]
+    expect(findMergeSuggestionGroups(products)).toHaveLength(0)
+  })
+  it('does not flag same name but different HSN', () => {
+    const products = [
+      { id: '1', name: 'Cushion Cover', hsn_code: '6304', default_rate: 410, is_active: true },
+      { id: '2', name: 'Cushion Cover', hsn_code: '9999', default_rate: 412, is_active: true },
+    ]
+    expect(findMergeSuggestionGroups(products)).toHaveLength(0)
+  })
+  it('ignores inactive products', () => {
+    const products = [
+      { id: '1', name: 'Cushion Cover', hsn_code: '6304', default_rate: 410, is_active: true },
+      { id: '2', name: 'Cushion Cover', hsn_code: '6304', default_rate: 412, is_active: false },
+    ]
+    expect(findMergeSuggestionGroups(products)).toHaveLength(0)
   })
 })

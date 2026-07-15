@@ -9,14 +9,21 @@ import { fmtDate, today } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
 // LineItemsEditor's stockMap) instead of duplicating it here.
-import { fetchStockMovementData, buildActualStockMap } from '../../utils/stock'
-import { cleanProductName, productMatchKey } from '../../utils/products'
+import { fetchStockMovementData, buildActualStockMap, fetchEntityAvailableStock } from '../../utils/stock'
+import { cleanProductName, productMatchKey, findNearMatchProduct, findMergeSuggestionGroups } from '../../utils/products'
 // CHANGED: needed to know the current user's role/id for entity-access scoping
 import { useAuth } from '../../hooks/useAuth'
 import { fetchAllPages } from '../../utils/query'
 
 const UNITS = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
-const TABS  = ['Opening Stock', 'Stock Position', 'Products']
+const TABS  = ['Opening Stock', 'Stock Position', 'Adjustments', 'Products']
+const ADJUSTMENT_REASONS = [
+  { value: 'shortfall', label: 'Shortfall (found less than expected)' },
+  { value: 'damage',    label: 'Damage / write-off' },
+  { value: 'found',     label: 'Found stock (found more than expected)' },
+  { value: 'recount',   label: 'Physical recount correction' },
+  { value: 'other',     label: 'Other' },
+]
 // CHANGED: parseCSVLine moved to utils/csvTemplate.js so PI/PO/Invoices CSV
 // upload can reuse the same quote-aware parsing — it was previously private
 // to this file only.
@@ -194,9 +201,20 @@ function OpeningStock() {
     const findProduct = row => productMap.get(rowMatchKey(row))
     const missingRowKeys = new Set()
     const missingRows = []
+    const nearMatchNotes = []
     for (const p of parsed) {
       const k = rowMatchKey(p.row)
       if (productMap.has(k) || missingRowKeys.has(k)) continue
+      // CHANGED: before treating this as a genuinely new product, check for
+      // an existing one with the same name+HSN+GST at a near-identical rate
+      // (see findNearMatchProduct) — reuse it instead of creating a phantom
+      // duplicate that silently starts at zero stock.
+      const near = findNearMatchProduct(products, { name: p.productName, hsn_code: p.row.hsn_code, rate: p.row.rate, gst_rate: p.row.gst_rate })
+      if (near) {
+        productMap.set(k, near)
+        nearMatchNotes.push(`${p.productName} @ ₹${p.row.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
+        continue
+      }
       missingRowKeys.add(k)
       missingRows.push(p)
     }
@@ -277,7 +295,7 @@ function OpeningStock() {
       }
     }
 
-    setCsvResult({ totalDataRows, added, skipped: skippedItems.length, productsCreated, errors, addedItems, skippedItems, createdProductNames })
+    setCsvResult({ totalDataRows, added, skipped: skippedItems.length, productsCreated, errors, addedItems, skippedItems, createdProductNames, nearMatchNotes })
     setCsvProgress('')
     await load()
     setCsvSaving(false)
@@ -455,6 +473,14 @@ function OpeningStock() {
                   </div>
                 </details>
               )}
+              {csvResult.nearMatchNotes?.length > 0 && (
+                <details style={{ marginTop: '6px' }}>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.nearMatchNotes.length} row{csvResult.nearMatchNotes.length === 1 ? '' : 's'} matched to an existing product at a near-identical rate (no duplicate created)</summary>
+                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.nearMatchNotes.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
+                  </div>
+                </details>
+              )}
               {csvResult.errors.length > 0 && (
                 <details style={{ marginTop: '6px' }} open>
                   <summary style={{ cursor: 'pointer', color: '#7a5000' }}>Show {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}</summary>
@@ -479,6 +505,346 @@ function OpeningStock() {
   )
 }
 
+// ─── Adjustments Tab ────────────────────────────────────────────────────────
+// Manual corrections for stock that PI/PO/Invoice flows can't explain —
+// shortfalls found on a physical count, damaged goods written off, stock
+// found that wasn't on the books, etc. Each row is a signed qty_delta folded
+// straight into buildActualStockMap() (see utils/stock.js) alongside opening
+// balance and invoice movements — same "record the event, recompute live"
+// philosophy the E-way-Bill-driven stock movement already uses, rather than
+// maintaining a separately-updated running total that could drift.
+const EMPTY_ADJUSTMENT = {
+  entity_id: '', product_id: '', direction: 'decrease', qty: '',
+  reason: 'shortfall', notes: '', adjustment_date: today(),
+}
+
+function StockAdjustments() {
+  const { profile } = useAuth()
+
+  // CHANGED: "Merge Duplicates" lives as a sub-view here rather than its own
+  // top-level Stock tab — it's a specific kind of stock adjustment (folding
+  // one product's stock into another), not a separate module.
+  const [subTab, setSubTab] = useState('list') // 'list' | 'merge'
+
+  const [rows, setRows]         = useState([])
+  const [entities, setEntities] = useState([])
+  const [products, setProducts] = useState([])
+  const [entityFilter, setEntityFilter] = useState('')
+  const [loading, setLoading]   = useState(true)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [editing, setEditing]   = useState(null)
+  const [form, setForm]         = useState(EMPTY_ADJUSTMENT)
+  const [saving, setSaving]     = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [toast, setToast]       = useState(null)
+  // CHANGED: live "current stock" preview in the modal so whoever is raising
+  // the adjustment can see what they're correcting against before saving.
+  const [currentStock, setCurrentStock] = useState(null)
+  // CSV
+  const [csvModal, setCsvModal]   = useState(false)
+  const [csvText, setCsvText]     = useState('')
+  const [csvResult, setCsvResult] = useState(null)
+  const [csvSaving, setCsvSaving] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    const [{ data: rs }, { data: ps }] = await Promise.all([
+      fetchAllPages(() => supabase.from('stock_adjustments')
+        .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit), creator:created_by(full_name)')
+        .order('adjustment_date', { ascending: false })
+        .order('created_at', { ascending: false })),
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,unit').eq('is_active', true).order('name')),
+    ])
+    setRows(rs || [])
+    setProducts(ps || [])
+    setLoading(false)
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  // Entity list scoped the same way as Stock Position — master sees every
+  // active entity, everyone else only what they've been granted.
+  useEffect(() => {
+    if (!profile) return
+    async function loadEntities() {
+      if (profile.role === 'master') {
+        const { data: es } = await supabase.from('entities')
+          .select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name')
+        setEntities(es || [])
+      } else {
+        const { data: grants } = await supabase.from('user_entity_access')
+          .select('entity:entity_id(id,name,short_name)').eq('user_id', profile.id)
+        const granted = (grants || []).map(g => g.entity).filter(Boolean).sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+        setEntities(granted)
+      }
+    }
+    loadEntities()
+  }, [profile])
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadCurrentStock() {
+      if (!form.entity_id || !form.product_id) { setCurrentStock(null); return }
+      const map = await fetchEntityAvailableStock(form.entity_id)
+      if (!cancelled) setCurrentStock(map[form.product_id] ?? 0)
+    }
+    loadCurrentStock()
+    return () => { cancelled = true }
+  }, [form.entity_id, form.product_id])
+
+  function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
+  function openNew()  { setEditing(null); setForm(EMPTY_ADJUSTMENT); setModalOpen(true) }
+  function openEdit(r) {
+    setEditing(r)
+    setForm({
+      entity_id: r.entity_id, product_id: r.product_id,
+      direction: toNum(r.qty_delta) < 0 ? 'decrease' : 'increase',
+      qty: String(Math.abs(toNum(r.qty_delta))),
+      reason: r.reason, notes: r.notes || '', adjustment_date: r.adjustment_date || today(),
+    })
+    setModalOpen(true)
+  }
+
+  async function handleSave() {
+    if (!form.entity_id || !form.product_id) return setToast({ message: 'Entity and Product are required', type: 'error' })
+    const qty = toNum(form.qty)
+    if (qty <= 0) return setToast({ message: 'Quantity must be greater than zero', type: 'error' })
+    setSaving(true)
+    const qty_delta = form.direction === 'decrease' ? -qty : qty
+    const payload = {
+      entity_id: form.entity_id, product_id: form.product_id, qty_delta,
+      reason: form.reason, notes: form.notes || null, adjustment_date: form.adjustment_date,
+    }
+    const res = editing
+      ? await supabase.from('stock_adjustments').update(payload).eq('id', editing.id)
+      : await supabase.from('stock_adjustments').insert({ ...payload, created_by: profile?.id || null })
+    setSaving(false)
+    if (res.error) return setToast({ message: res.error.message, type: 'error' })
+    setToast({ message: editing ? 'Adjustment updated' : 'Adjustment recorded', type: 'success' })
+    setModalOpen(false)
+    load()
+  }
+
+  async function handleDelete() {
+    await supabase.from('stock_adjustments').delete().eq('id', confirmDelete.id)
+    setConfirmDelete(null)
+    load()
+  }
+
+  // CSV: entity,product,qty,reason,adjustment_date,notes — see TEMPLATES.stock_adjustments.
+  // Unlike Opening Stock/Products upload, product must already exist (a typo'd
+  // product name here should be an error, not silently create a new phantom
+  // product) and rows are plain inserts, not upserts — each row is a distinct
+  // correction event, so re-uploading the same file intentionally creates
+  // duplicate adjustment rows rather than overwriting a prior one.
+  async function handleCSV() {
+    setCsvSaving(true)
+    const lines = csvText.trim().split('\n').filter(l => l.trim())
+    if (lines.length < 2) { setCsvSaving(false); return setToast({ message: 'CSV needs header + data rows', type: 'error' }) }
+    const delim = detectDelimiter(lines[0])
+    const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
+    const validReasons = ADJUSTMENT_REASONS.map(r => r.value)
+    const payloads = []
+    const errors = []
+    for (let i = 1; i < lines.length; i++) {
+      const cols = parseCSVLine(lines[i], delim)
+      const row  = {}
+      header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
+      const rowNum = i + 1
+      const entity = entities.find(e => e.short_name?.toLowerCase() === row.entity?.toLowerCase() || e.name?.toLowerCase() === row.entity?.toLowerCase())
+      const product = products.find(p => p.name?.toLowerCase() === row.product?.toLowerCase())
+      const qty = toNum(row.qty)
+      const reason = (row.reason || '').toLowerCase()
+      if (!entity)  { errors.push(`Row ${rowNum}: entity "${row.entity}" not found or not accessible to you`); continue }
+      if (!product) { errors.push(`Row ${rowNum}: product "${row.product}" not found — add it under Stock > Products first`); continue }
+      if (!qty)     { errors.push(`Row ${rowNum}: qty must be a non-zero number`); continue }
+      if (!validReasons.includes(reason)) { errors.push(`Row ${rowNum}: reason must be one of ${validReasons.join(', ')}`); continue }
+      payloads.push({
+        entity_id: entity.id, product_id: product.id, qty_delta: qty, reason,
+        adjustment_date: row.adjustment_date || today(), notes: row.notes || null,
+        created_by: profile?.id || null,
+      })
+    }
+    let added = 0
+    if (payloads.length > 0) {
+      const { error } = await supabase.from('stock_adjustments').insert(payloads)
+      if (error) errors.push(`Insert failed: ${error.message}`)
+      else added = payloads.length
+    }
+    setCsvResult({ added, errors })
+    await load()
+    setCsvSaving(false)
+  }
+
+  const filtered = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
+
+  function reasonLabel(reason) {
+    return ADJUSTMENT_REASONS.find(r => r.value === reason)?.label.split(' (')[0] || reason
+  }
+
+  const columns = [
+    { label: 'S.No.',   render: (r, i) => <span style={{ color: C.textMuted }}>{i + 1}</span> },
+    { label: 'Date',    render: r => fmtDate(r.adjustment_date) },
+    { label: 'Entity',  render: r => <span style={{ fontWeight: 600 }}>{r.entity?.short_name || r.entity?.name}</span> },
+    { label: 'Product', render: r => <div><div style={{ fontWeight: 600 }}>{r.product?.name}</div><div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>{r.product?.hsn_code}</div></div> },
+    { label: 'Qty Δ',   right: true, render: r => (
+      <span style={{ fontWeight: 700, color: toNum(r.qty_delta) < 0 ? C.danger : C.success }}>
+        {toNum(r.qty_delta) > 0 ? '+' : ''}{Number(r.qty_delta).toLocaleString('en-IN')} {r.product?.unit}
+      </span>
+    )},
+    { label: 'Reason',  render: r => <Badge status={toNum(r.qty_delta) < 0 ? 'pending' : 'active'} label={reasonLabel(r.reason)} /> },
+    { label: 'Notes',   render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{r.notes || '—'}</span> },
+    { label: 'Recorded by', render: r => <span style={{ fontSize: '12px', color: C.textSoft }}>{r.creator?.full_name || '—'}</span> },
+    { label: 'Actions', render: r => (
+      <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
+        <Btn size='sm' variant='ghost' onClick={() => openEdit(r)}>Edit</Btn>
+        <Btn size='sm' variant='ghost' onClick={() => setConfirmDelete(r)} style={{ color: C.danger }}>Delete</Btn>
+      </div>
+    )},
+  ]
+
+  return (
+    <div>
+      {/* CHANGED: sub-tabs — "Merge Duplicates" is a specific flavour of stock
+          adjustment (folding one product's stock into another), not a
+          separate Stock module tab. */}
+      <div style={{ display: 'flex', gap: '4px', marginBottom: '16px' }}>
+        {[{ key: 'list', label: 'Adjustments' }, { key: 'merge', label: 'Merge Duplicates' }].map(t => (
+          <button key={t.key} onClick={() => setSubTab(t.key)} style={{
+            padding: '6px 14px', border: `1.5px solid ${C.border}`, cursor: 'pointer', fontFamily: 'inherit',
+            fontWeight: subTab === t.key ? 700 : 500, fontSize: '12px', borderRadius: '6px',
+            color: subTab === t.key ? '#fff' : C.textSoft,
+            background: subTab === t.key ? C.accent : C.surface,
+          }}>{t.label}</button>
+        ))}
+      </div>
+
+      {subTab === 'merge' && <MergeDuplicates />}
+
+      {subTab === 'list' && <>
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center' }}>
+        <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
+          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All entities</option>
+          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <div style={{ flex: 1 }} />
+        <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
+        <Btn onClick={openNew}>+ Add Adjustment</Btn>
+      </div>
+
+      <Card>
+        {loading
+          ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
+          : <Table columns={columns} rows={filtered}
+              emptyState={<EmptyState icon='⚖️' title='No adjustments' message='Record a correction when a physical count finds a shortfall, damage, or stock that was never billed.' action={<Btn onClick={openNew}>+ Add Adjustment</Btn>} />}
+            />
+        }
+      </Card>
+
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? 'Edit Adjustment' : 'Add Stock Adjustment'} width={520}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Entity' required>
+              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)}>
+                <option value=''>Select entity</option>
+                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Product' required>
+              <Select value={form.product_id} onChange={e => setF('product_id', e.target.value)}>
+                <option value=''>Select product</option>
+                {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </Select>
+            </FormRow>
+          </div>
+
+          {currentStock !== null && (
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 14px', fontSize: '13px', display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ color: C.textSoft }}>Current stock on hand</span>
+              <strong style={{ color: currentStock < 0 ? C.danger : C.text }}>{currentStock.toLocaleString('en-IN')}</strong>
+            </div>
+          )}
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Direction' required>
+              <Select value={form.direction} onChange={e => setF('direction', e.target.value)}>
+                <option value='decrease'>Decrease (shortfall / damage)</option>
+                <option value='increase'>Increase (found stock)</option>
+              </Select>
+            </FormRow>
+            <FormRow label='Quantity' required>
+              <Input type='number' value={form.qty} onChange={e => setF('qty', e.target.value)} placeholder='0.000' />
+            </FormRow>
+          </div>
+
+          {currentStock !== null && form.qty && (
+            <div style={{ fontSize: '12px', color: C.textMuted }}>
+              New stock after this adjustment: <strong style={{ color: C.text }}>
+                {(currentStock + (form.direction === 'decrease' ? -toNum(form.qty) : toNum(form.qty))).toLocaleString('en-IN')}
+              </strong>
+            </div>
+          )}
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Reason' required>
+              <Select value={form.reason} onChange={e => setF('reason', e.target.value)}>
+                {ADJUSTMENT_REASONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Adjustment Date' required>
+              <Input type='date' value={form.adjustment_date} onChange={e => setF('adjustment_date', e.target.value)} />
+            </FormRow>
+          </div>
+          <FormRow label='Notes' hint='e.g. which count/audit this came from'>
+            <Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} />
+          </FormRow>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save Changes' : 'Record Adjustment'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={csvModal} onClose={() => setCsvModal(false)} title='Bulk Upload Stock Adjustments' width={580}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px 14px', fontSize: '12px', color: C.textMid, lineHeight: 1.7 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '6px' }}>
+              <strong>CSV Format:</strong>
+              <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('stock_adjustments')}>↓ Download Template</Btn>
+            </div>
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>entity,product,qty,reason,adjustment_date,notes</code><br />
+            <strong>Example:</strong><br />
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>Siddi,T-Shirt Basic Round Neck,-5,shortfall,2025-04-30,Physical count came up short</code><br />
+            Entity = short name or full name. Product must match an existing product exactly — it will NOT be auto-created (add it under Products first if missing). Qty is signed: negative = decrease (shortfall/damage), positive = increase (found stock). Reason = one of <code>shortfall</code>, <code>damage</code>, <code>found</code>, <code>recount</code>, <code>other</code>. Each row is inserted as its own adjustment — re-uploading the same file adds duplicates rather than overwriting.
+          </div>
+          <FormRow label='Upload or Paste CSV'>
+            <CsvFileDrop onText={setCsvText} />
+          </FormRow>
+          <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={8}
+              style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
+          {csvResult && (
+            <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
+              <strong>{csvResult.added} adjustment{csvResult.added === 1 ? '' : 's'} recorded, {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}.</strong>
+              {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setCsvModal(false)}>Close</Btn>
+            <Btn onClick={handleCSV} disabled={csvSaving || !csvText.trim()}>{csvSaving ? 'Uploading…' : 'Upload'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
+        title='Delete Adjustment' message={`Delete this adjustment for ${confirmDelete?.product?.name}? This will change the product's actual stock figure.`} danger />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+      </>}
+    </div>
+  )
+}
+
 // ─── Stock Position Tab ───────────────────────────────────────────────────────
 function StockPosition() {
   const [position, setPosition] = useState([])
@@ -490,9 +856,12 @@ function StockPosition() {
   const [entityFilter, setEntityFilter] = useState('')
   const [fyFilter, setFyFilter]         = useState('')
   const [loading, setLoading]   = useState(false)
-  // CHANGED: category filter + group-by-category summary toggle
+  // CHANGED: category filter + group-by summary. 'none' | 'category' | 'entity'
+  // — a report-style subtotal view (qty + value per group, expandable to the
+  // underlying line items, plus a grand total) so a multi-entity "All
+  // entities" list isn't just one long undifferentiated table.
   const [categoryFilter, setCategoryFilter] = useState('')
-  const [groupByCategory, setGroupByCategory] = useState(false)
+  const [groupBy, setGroupBy] = useState('none')
   // CHANGED: sold-out products (actual stock exactly 0 — everything on hand
   // has moved out, nothing wrong) clutter the table once a business has been
   // running a while. Hidden by default; doesn't touch negative-stock rows,
@@ -503,11 +872,11 @@ function StockPosition() {
   // CHANGED: tracks invoice lines with no product_id (known CSV-upload data
   // gap) so we can warn about them instead of showing blank garbage rows
   const [dataIssues, setDataIssues] = useState({ unresolvedLines: 0, unresolvedQty: 0 })
-  const [expandedCategories, setExpandedCategories] = useState(() => new Set())
-  function toggleCategory(cat) {
-    setExpandedCategories(prev => {
+  const [expandedGroups, setExpandedGroups] = useState(() => new Set())
+  function toggleGroup(key) {
+    setExpandedGroups(prev => {
       const next = new Set(prev)
-      if (next.has(cat)) next.delete(cat); else next.add(cat)
+      if (next.has(key)) next.delete(key); else next.add(key)
       return next
     })
   }
@@ -519,10 +888,15 @@ function StockPosition() {
   useEffect(() => {
     if (!profile) return // wait until we know the role before deciding what to fetch
     async function loadFilters() {
+      // CHANGED: products can exceed PostgREST's default 1000-row response
+      // cap — a plain .select() silently truncated the list past that many
+      // products, so any entity+product combo whose product_id fell outside
+      // the first page resolved to `undefined` here and rendered as a blank
+      // Product/Category/Unit row below despite having real Actual Stock.
+      // Page through with fetchAllPages so every product resolves.
       const [{ data: fyData }, { data: ps }] = await Promise.all([
         supabase.from('financial_years').select('*').order('start_date', { ascending: false }),
-        // CHANGED: product lookup for actual-stock-only rows (see below)
-        supabase.from('products').select('id,name,hsn_code,unit,category'),
+        fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,unit,category,default_rate').order('id')),
       ])
       setFys(fyData || [])
       setProducts(ps || [])
@@ -557,21 +931,36 @@ function StockPosition() {
     setLoading(true)
 
     // Get opening stock
-    let q = supabase.from('stock_opening_balance')
-      .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit,category)')
-      .eq('financial_year_id', fyFilter)
-    if (entityFilter) q = q.eq('entity_id', entityFilter)
-    const { data: opening } = await q
+    // CHANGED: stock_opening_balance can exceed PostgREST's default 1000-row
+    // cap once entities/products are numerous (a plain .select() silently
+    // truncates rather than erroring) — page through with fetchAllPages so
+    // the Opening/Planned columns don't silently drop rows past row 1000,
+    // same fix already applied to the Opening Stock tab's own load().
+    const { data: opening } = await fetchAllPages(() => {
+      let q = supabase.from('stock_opening_balance')
+        .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit,category)')
+        .eq('financial_year_id', fyFilter)
+        .order('id')
+      if (entityFilter) q = q.eq('entity_id', entityFilter)
+      return q
+    })
 
     // Get PIs — incoming and outgoing per entity+product
     // We need proforma_invoice_lines joined with proforma_invoices
     // Planned stock = opening + incoming PI qty - outgoing PI qty
-    // NOTE: this Planned/PI logic is untouched — it's correct as-is.
-    const { data: piLines } = await supabase
+    // CHANGED: same 1000-row cap risk as opening stock above — page through.
+    const { data: piLinesRaw } = await fetchAllPages(() => supabase
       .from('proforma_invoice_lines')
-      .select('qty, product_id, pi:pi_id(from_entity_id, to_entity_id, status)')
+      .select('qty, product_id, pi:pi_id(from_entity_id, to_entity_id, status, is_deleted)')
       .not('pi', 'is', null)
       .neq('pi.status', 'cancelled')
+      .order('id'))
+    // CHANGED: the query above can't filter on a joined column's is_deleted
+    // directly (PostgREST .neq only applies to the joined row shape, not a
+    // second condition on it) — a soft-deleted PI kept counting toward
+    // Planned stock forever since only `status` was checked. Filter it out
+    // client-side same as fetchStockMovementData() already does for invoices.
+    const piLines = (piLinesRaw || []).filter(l => l.pi && !l.pi.is_deleted)
 
     // CHANGED: Actual Stock — the real, invoice-based position per entity.
     // This is deliberately NOT scoped to fyFilter: opening stock is entered
@@ -629,6 +1018,12 @@ function StockPosition() {
       if (entityFilter && row.entity_id !== entityFilter) continue
       const key = `${row.entity_id}__${row.product_id}`
       if (!map[key]) {
+        // CHANGED: these rows have real actual stock but no opening-balance
+        // row for the CURRENTLY SELECTED FY (e.g. the opening entry was made
+        // under a prior FY) — rate defaulted to 0 here, which silently
+        // zeroed out Actual Value for every such row despite a genuinely
+        // nonzero Actual Stock. Fall back to the product's own default_rate
+        // so valuation reflects the real stock instead of vanishing.
         map[key] = {
           entity_id:   row.entity_id,
           entity:      entityById[row.entity_id] || null,
@@ -637,7 +1032,7 @@ function StockPosition() {
           opening_qty: 0,
           incoming:    0,
           outgoing:    0,
-          rate:        0,
+          rate:        toNum(productById[row.product_id]?.default_rate),
         }
       }
     }
@@ -686,20 +1081,49 @@ function StockPosition() {
     : categoryOnlyFiltered
   ).map((r, i) => ({ ...r, sno: i + 1 }))
 
-  // CHANGED: category → totals + line items, for the group-by-category table
-  const categoryGroupMap = {}
-  for (const r of filteredPosition) {
-    const cat = r.product?.category || 'Uncategorised'
-    if (!categoryGroupMap[cat]) categoryGroupMap[cat] = { qty: 0, value: 0, items: [] }
-    categoryGroupMap[cat].qty   += toNum(r.planned_qty)
-    categoryGroupMap[cat].value += toNum(r.opening_qty) * toNum(r.rate)
-    categoryGroupMap[cat].items.push(r)
+  // CHANGED: group → totals (planned qty, opening value, actual value) + line
+  // items, for the report-style group-by view — shared builder so Category
+  // and Entity grouping are the same code path instead of two copies.
+  function buildGroupedRows(rows, keyFn) {
+    const map = {}
+    for (const r of rows) {
+      const key = keyFn(r) || 'Uncategorised'
+      if (!map[key]) map[key] = { key, qty: 0, value: 0, actualValue: 0, items: [] }
+      map[key].qty         += toNum(r.actual_qty)
+      map[key].value       += toNum(r.opening_qty) * toNum(r.rate)
+      map[key].actualValue += toNum(r.actual_qty) * toNum(r.rate)
+      map[key].items.push(r)
+    }
+    return Object.values(map).sort((a, b) => b.value - a.value)
   }
-  const categoryRows = Object.entries(categoryGroupMap)
-    .map(([cat, g]) => ({ cat, qty: g.qty, value: g.value, items: g.items }))
-    .sort((a, b) => b.qty - a.qty)
+  const groupedRows = groupBy === 'category'
+    ? buildGroupedRows(filteredPosition, r => r.product?.category)
+    : groupBy === 'entity'
+    ? buildGroupedRows(filteredPosition, r => r.entity?.short_name || r.entity?.name)
+    : []
+  const groupLabel = groupBy === 'entity' ? 'Entity' : 'Category'
+  const grandTotal = groupedRows.reduce((s, g) => ({
+    products: s.products + g.items.length, qty: s.qty + g.qty, value: s.value + g.value, actualValue: s.actualValue + g.actualValue,
+  }), { products: 0, qty: 0, value: 0, actualValue: 0 })
 
-  const totalValue     = filteredPosition.reduce((s, r) => s + toNum(r.opening_qty) * toNum(r.rate), 0)
+  const totalValue       = filteredPosition.reduce((s, r) => s + toNum(r.opening_qty) * toNum(r.rate), 0)
+  // CHANGED: Actual Stock is the headline number on this page now (see the
+  // Actual Stock column below) — surface its value alongside Opening Value
+  // rather than only showing the opening-based figure.
+  const totalActualValue = filteredPosition.reduce((s, r) => s + toNum(r.actual_qty) * toNum(r.rate), 0)
+  // CHANGED: qty subtotal broken out per unit (Mtrs/Nos/etc.) since summing
+  // raw qty across mixed units is meaningless — same pattern already used on
+  // the Opening Stock tab's StatCard summary. Sums actual_qty (this page's
+  // headline metric, see Actual Stock column) rather than planned_qty — a
+  // row can carry real Actual Stock with planned_qty still at 0 (no PI
+  // movement / no opening row this FY), which made this read "0 Nos" even
+  // when the table plainly showed nonzero Actual Stock on every row.
+  const qtyByUnit = filteredPosition.reduce((m, r) => {
+    const u = r.product?.unit || 'Nos'
+    m[u] = (m[u] || 0) + toNum(r.actual_qty)
+    return m
+  }, {})
+  const qtySummary = Object.entries(qtyByUnit).map(([u, q]) => `${q.toLocaleString('en-IN')} ${u}`).join(' • ') || '0'
 
   const columns = [
     // CHANGED: running row number for reference while editing/cross-checking
@@ -766,6 +1190,11 @@ function StockPosition() {
           sub={statusFilter === 'billed_beyond' ? '● Filtering — click to clear' : 'Click to filter'} />
         <StatCard label='Products'      value={filteredPosition.length} />
         <StatCard label='Opening Value' value={formatINR(totalValue)} />
+        {/* CHANGED: Actual Value + Qty subtotal — report-style totals for the
+            currently filtered line items, always visible (not just when
+            grouped below). */}
+        <StatCard label='Actual Value'  value={formatINR(totalActualValue)} />
+        <StatCard label='Total Qty'     value={qtySummary} />
       </div>
       {/* CHANGED: explicit clear-filter affordance when a status filter is active */}
       {statusFilter && (
@@ -799,9 +1228,14 @@ function StockPosition() {
           <option value=''>All categories</option>
           {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
         </select>
-        {/* CHANGED: group-by-category summary toggle */}
-        <Btn size='sm' variant={groupByCategory ? 'primary' : 'ghost'} onClick={() => setGroupByCategory(g => !g)}>
-          {groupByCategory ? '✓ ' : ''}Group by category
+        {/* CHANGED: group-by summary — report-style subtotals (qty + value)
+            per category or entity, expandable to line items, with a grand
+            total. Mutually exclusive; click the active one again to clear. */}
+        <Btn size='sm' variant={groupBy === 'category' ? 'primary' : 'ghost'} onClick={() => setGroupBy(g => g === 'category' ? 'none' : 'category')}>
+          {groupBy === 'category' ? '✓ ' : ''}Group by category
+        </Btn>
+        <Btn size='sm' variant={groupBy === 'entity' ? 'primary' : 'ghost'} onClick={() => setGroupBy(g => g === 'entity' ? 'none' : 'entity')}>
+          {groupBy === 'entity' ? '✓ ' : ''}Group by entity
         </Btn>
         {/* CHANGED: sold-out products (0 actual stock) hidden by default to
             cut clutter — toggle back on for a full audit view. */}
@@ -811,14 +1245,17 @@ function StockPosition() {
         <Btn size='sm' variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
       </div>
 
-      {/* CHANGED: category totals table — click a category row to expand its line items */}
-      {groupByCategory && (
+      {/* CHANGED: report-style group-by table — click a group row to expand
+          its line items, with a grand total row at the bottom. Works for
+          either Category or Entity grouping (groupLabel/groupedRows switch
+          together above). */}
+      {groupBy !== 'none' && (
         <Card style={{ marginBottom: '16px', padding: 0, overflow: 'hidden' }}>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
               <thead>
                 <tr>
-                  {['', 'Category', 'Products', 'Total Qty', 'Opening Value'].map((h, i) => (
+                  {['', groupLabel, 'Products', 'Total Qty', 'Opening Value', 'Actual Value'].map((h, i) => (
                     <th key={i} style={{
                       padding: '8px 12px', textAlign: i >= 2 ? 'right' : 'left',
                       fontSize: '11px', fontWeight: 700, color: '#9a8a6a',
@@ -830,24 +1267,25 @@ function StockPosition() {
                 </tr>
               </thead>
               <tbody>
-                {categoryRows.map(({ cat, qty, value, items }) => {
-                  const open = expandedCategories.has(cat)
+                {groupedRows.map(({ key, qty, value, actualValue, items }) => {
+                  const open = expandedGroups.has(key)
                   return (
-                    <Fragment key={cat}>
-                      <tr onClick={() => toggleCategory(cat)} style={{ cursor: 'pointer', background: C.surface }}>
+                    <Fragment key={key}>
+                      <tr onClick={() => toggleGroup(key)} style={{ cursor: 'pointer', background: C.surface }}>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, color: C.textMuted, width: '24px' }}>{open ? '▾' : '▸'}</td>
-                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontWeight: 600 }}>{cat}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontWeight: 600 }}>{key}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', color: C.textMid }}>{items.length}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>{qty.toLocaleString('en-IN')}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(value)}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(actualValue)}</td>
                       </tr>
                       {open && (
                         <tr>
-                          <td colSpan={5} style={{ padding: 0, borderBottom: `1px solid ${C.border}`, background: C.bg }}>
+                          <td colSpan={6} style={{ padding: 0, borderBottom: `1px solid ${C.border}`, background: C.bg }}>
                             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
                               <thead>
                                 <tr>
-                                  {['Entity', 'Product', 'HSN', 'Unit', 'Opening Qty', 'Rate', 'Value'].map((h, i) => (
+                                  {[groupBy === 'entity' ? 'Category' : 'Entity', 'Product', 'HSN', 'Unit', 'Opening Qty', 'Actual Qty', 'Rate', 'Value'].map((h, i) => (
                                     <th key={i} style={{
                                       padding: '6px 12px 6px 32px', textAlign: i >= 4 ? 'right' : 'left',
                                       fontSize: '10px', fontWeight: 700, color: C.textMuted,
@@ -860,11 +1298,12 @@ function StockPosition() {
                               <tbody>
                                 {items.map(it => (
                                   <tr key={`${it.entity_id}__${it.product_id}`}>
-                                    <td style={{ padding: '7px 12px 7px 32px' }}>{it.entity?.short_name || it.entity?.name}</td>
+                                    <td style={{ padding: '7px 12px 7px 32px' }}>{groupBy === 'entity' ? (it.product?.category || '—') : (it.entity?.short_name || it.entity?.name)}</td>
                                     <td style={{ padding: '7px 12px' }}>{it.product?.name}</td>
                                     <td style={{ padding: '7px 12px', fontFamily: 'monospace', color: C.textMuted }}>{it.product?.hsn_code}</td>
                                     <td style={{ padding: '7px 12px' }}>{it.product?.unit}</td>
                                     <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.opening_qty).toLocaleString('en-IN')}</td>
+                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.actual_qty).toLocaleString('en-IN')}</td>
                                     <td style={{ padding: '7px 12px', textAlign: 'right' }}>{formatINR(it.rate)}</td>
                                     <td style={{ padding: '7px 12px', textAlign: 'right', fontWeight: 600 }}>{formatINR(toNum(it.opening_qty) * toNum(it.rate))}</td>
                                   </tr>
@@ -878,6 +1317,15 @@ function StockPosition() {
                   )
                 })}
               </tbody>
+              <tfoot>
+                <tr>
+                  <td colSpan={2} style={{ padding: '10px 12px', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>Grand Total</td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{grandTotal.products}</td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{grandTotal.qty.toLocaleString('en-IN')}</td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{formatINR(grandTotal.value)}</td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{formatINR(grandTotal.actualValue)}</td>
+                </tr>
+              </tfoot>
             </table>
           </div>
         </Card>
@@ -891,6 +1339,183 @@ function StockPosition() {
             />
         }
       </Card>
+    </div>
+  )
+}
+
+// ─── Merge Duplicates Tab ───────────────────────────────────────────────────
+// Surfaces product groups that share a name (junk-stripped) and HSN code but
+// differ in rate — the exact signature the dedupe_products.sql /
+// dedupe_rate_markup_products.sql / merge_idle_rounding_duplicates.sql
+// maintenance scripts were hand-run against in the past (see supabase/
+// maintenance/). This turns that one-off SQL review into a standing, repeatable
+// tool: suggest a keeper (the product actually carrying stock/usage), let a
+// master review/override it, then merge via the merge_products() RPC (see
+// migration 022_merge_products.sql) which atomically repoints every
+// referencing table and folds opening-stock quantities before deleting the
+// duplicate — the same repoint-then-delete shape as the maintenance scripts,
+// just parameterized and callable from the UI instead of hand-run once.
+function MergeDuplicates() {
+  const { profile } = useAuth()
+  const canMerge = profile?.role === 'master'
+
+  const [products, setProducts] = useState([])
+  const [totals, setTotals]     = useState({}) // product_id -> { opening, actual }
+  const [loading, setLoading]   = useState(true)
+  const [keeperOverride, setKeeperOverride] = useState({}) // group.key -> product_id
+  const [confirmGroup, setConfirmGroup] = useState(null)
+  const [merging, setMerging]   = useState(false)
+  const [toast, setToast]       = useState(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    const [{ data: ps }, raw] = await Promise.all([
+      fetchAllPages(() => supabase.from('products')
+        .select('id,name,hsn_code,gst_rate,unit,default_rate,is_active,created_at')
+        .eq('is_active', true).order('name')),
+      fetchStockMovementData(),
+    ])
+    setProducts(ps || [])
+    const actualMap = buildActualStockMap(raw)
+    const t = {}
+    for (const row of Object.values(actualMap)) {
+      if (!row.product_id) continue
+      if (!t[row.product_id]) t[row.product_id] = { opening: 0, actual: 0 }
+      t[row.product_id].opening += row.opening_qty
+      t[row.product_id].actual  += row.actual_qty
+    }
+    setTotals(t)
+    setLoading(false)
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  // CHANGED: suggested keeper = the product actually holding the most real
+  // (actual) stock, tie-broken by opening qty then oldest record — the same
+  // "prefer the one already in use" instinct as dedupe_products.sql's
+  // has_opening ranking, just using the richer actual-stock signal already
+  // available here instead of a boolean.
+  const groups = findMergeSuggestionGroups(products).map(g => {
+    const enriched = g.products
+      .map(p => ({ ...p, _opening: totals[p.id]?.opening || 0, _actual: totals[p.id]?.actual || 0 }))
+      .sort((a, b) => b._actual - a._actual || b._opening - a._opening || new Date(a.created_at) - new Date(b.created_at))
+    return { ...g, products: enriched, suggestedKeeperId: enriched[0]?.id }
+  })
+
+  function keeperFor(g) { return keeperOverride[g.key] || g.suggestedKeeperId }
+
+  function handleDownloadSuggestions() {
+    const rows = []
+    for (const g of groups) {
+      const keeperId = keeperFor(g)
+      for (const p of g.products) {
+        rows.push({
+          group: g.name, hsn_code: g.hsn_code, product_id: p.id, product_name: p.name,
+          rate: p.default_rate ?? '', gst_rate: p.gst_rate ?? '', unit: p.unit || '',
+          total_opening_qty: p._opening, total_actual_qty: p._actual,
+          suggestion: p.id === keeperId ? 'KEEP' : 'MERGE INTO KEEPER',
+        })
+      }
+    }
+    downloadCSV(`merge_stock_suggestions_${today()}.csv`,
+      ['group', 'hsn_code', 'product_id', 'product_name', 'rate', 'gst_rate', 'unit', 'total_opening_qty', 'total_actual_qty', 'suggestion'],
+      rows)
+  }
+
+  async function handleMerge(g) {
+    if (!g || merging) return
+    const keeperId = keeperFor(g)
+    const dupIds = g.products.map(p => p.id).filter(id => id !== keeperId)
+    setMerging(true)
+    const errors = []
+    for (const dupId of dupIds) {
+      const { error } = await supabase.rpc('merge_products', { p_keeper_id: keeperId, p_dup_id: dupId })
+      if (error) errors.push(error.message)
+    }
+    setMerging(false)
+    setConfirmGroup(null)
+    if (errors.length) setToast({ message: `${g.name}: ${errors.join(' • ')}`, type: 'error' })
+    else setToast({ message: `Merged ${dupIds.length} duplicate${dupIds.length === 1 ? '' : 's'} into "${g.products.find(p => p.id === keeperId)?.name}"`, type: 'success' })
+    load()
+  }
+
+  const totalDuplicateProducts = groups.reduce((s, g) => s + g.products.length - 1, 0)
+
+  return (
+    <div>
+      {!canMerge && (
+        <div style={{ background: '#fff3cc', border: '1px solid #e6c040', borderRadius: '6px', padding: '10px 14px', fontSize: '12px', color: '#7a5000', marginBottom: '16px' }}>
+          🔒 Only master users can perform a merge. You can still review and download the suggestions below.
+        </div>
+      )}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '16px' }}>
+        <StatCard label='Groups Found' value={groups.length} color={groups.length > 0 ? C.accent : undefined} />
+        <StatCard label='Duplicate Products' value={totalDuplicateProducts} />
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
+        <Btn variant='ghost' onClick={handleDownloadSuggestions} disabled={groups.length === 0}>↓ Download All Suggestions (CSV)</Btn>
+      </div>
+
+      {loading ? (
+        <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Scanning products…</div>
+      ) : groups.length === 0 ? (
+        <Card>
+          <EmptyState icon='✅' title='No merge suggestions' message='No active products currently share a name and HSN code at different rates.' />
+        </Card>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          {groups.map(g => {
+            const keeperId = keeperFor(g)
+            return (
+              <Card key={g.key}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
+                  <div>
+                    <div style={{ fontWeight: 700, fontSize: '14px' }}>{g.name}</div>
+                    <div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>HSN {g.hsn_code} • {g.products.length} product records at different rates</div>
+                  </div>
+                  {canMerge && (
+                    <Btn size='sm' onClick={() => setConfirmGroup(g)} disabled={merging}>Merge {g.products.length - 1} into keeper</Btn>
+                  )}
+                </div>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                    <thead>
+                      <tr>
+                        {['', 'Rate', 'GST %', 'Unit', 'Opening Qty', 'Actual Stock', ''].map((h, i) => (
+                          <th key={i} style={{ padding: '6px 10px', textAlign: (i >= 1 && i <= 4) ? 'right' : 'left', fontSize: '10px', fontWeight: 700, color: '#9a8a6a', textTransform: 'uppercase', letterSpacing: '0.04em', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {g.products.map(p => (
+                        <tr key={p.id} style={{ background: p.id === keeperId ? '#e8f3ec' : 'transparent' }}>
+                          <td style={{ padding: '7px 10px' }}>
+                            <input type='radio' name={`keeper-${g.key}`} checked={p.id === keeperId}
+                              onChange={() => setKeeperOverride(o => ({ ...o, [g.key]: p.id }))}
+                              disabled={!canMerge} />
+                          </td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{formatINR(p.default_rate)}</td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{p.gst_rate}%</td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{p.unit}</td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{Number(p._opening).toLocaleString('en-IN')}</td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: p.id === keeperId ? 700 : 400 }}>{Number(p._actual).toLocaleString('en-IN')}</td>
+                          <td style={{ padding: '7px 10px' }}>{p.id === keeperId && <Badge status='active' label='Suggested keeper' />}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+            )
+          })}
+        </div>
+      )}
+
+      <ConfirmModal open={!!confirmGroup} onClose={() => !merging && setConfirmGroup(null)} onConfirm={() => handleMerge(confirmGroup)}
+        title='Merge Duplicate Products'
+        message={confirmGroup ? `Merge ${confirmGroup.products.length - 1} product record(s) into "${confirmGroup.products.find(p => p.id === keeperFor(confirmGroup))?.name}"? Every PI/PO/Invoice/adjustment line referencing them will be repointed to the keeper, matching opening-stock quantities will be added together, and the duplicate product records will be permanently deleted. This cannot be undone.` : ''}
+        danger />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
 }
@@ -1104,6 +1729,7 @@ export default function Stock() {
       </div>
       {tab === 'Stock Position' && <StockPosition />}
       {tab === 'Opening Stock'  && <OpeningStock />}
+      {tab === 'Adjustments'    && <StockAdjustments />}
       {tab === 'Products'       && <Products />}
     </div>
   )

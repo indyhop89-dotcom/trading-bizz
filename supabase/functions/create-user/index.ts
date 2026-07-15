@@ -45,8 +45,10 @@ Deno.serve(async (req) => {
       .select('role, is_active')
       .eq('id', caller.id)
       .single()
-    if (profileErr || !callerProfile || callerProfile.role !== 'master' || !callerProfile.is_active) {
-      return json({ error: 'Only super admins can create users' }, 403)
+    const callerIsMaster = callerProfile?.role === 'master'
+    const callerIsAdmin = callerProfile?.role === 'admin'
+    if (profileErr || !callerProfile || !callerProfile.is_active || !(callerIsMaster || callerIsAdmin)) {
+      return json({ error: 'Only master or admin users can create users' }, 403)
     }
 
     const body = await req.json()
@@ -55,8 +57,14 @@ Deno.serve(async (req) => {
     if (!email || !full_name) {
       return json({ error: 'email and full_name are required' }, 400)
     }
-    if (!['master', 'entity_user', 'viewer'].includes(role)) {
-      return json({ error: 'role must be master, entity_user, or viewer' }, 400)
+    // Master may hand out any role, including more masters/admins. Admins can
+    // only create entity_user/viewer — never another admin or a master, to
+    // stop an admin from escalating their own or a peer's privileges.
+    const assignableRoles = callerIsMaster
+      ? ['master', 'admin', 'entity_user', 'viewer']
+      : ['entity_user', 'viewer']
+    if (!assignableRoles.includes(role)) {
+      return json({ error: `role must be one of: ${assignableRoles.join(', ')}` }, 400)
     }
     if (role !== 'master' && (!Array.isArray(entity_ids) || entity_ids.length === 0)) {
       return json({ error: 'entity_ids is required for non-master roles' }, 400)
@@ -64,6 +72,20 @@ Deno.serve(async (req) => {
 
     // Admin client — service_role key, server-side only, never sent to the browser.
     const adminClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
+
+    // Admins are scoped to their own entities — they can only grant access to
+    // entities they themselves hold a grant for, never entities outside it.
+    if (callerIsAdmin && entity_ids?.length) {
+      const { data: callerGrants } = await adminClient
+        .from('user_entity_access')
+        .select('entity_id')
+        .eq('user_id', caller.id)
+      const callerEntityIds = new Set((callerGrants || []).map((g) => g.entity_id))
+      const outOfScope = entity_ids.filter((id) => !callerEntityIds.has(id))
+      if (outOfScope.length > 0) {
+        return json({ error: 'You can only grant access to entities you yourself have access to' }, 403)
+      }
+    }
 
     const tempPassword = password || crypto.randomUUID()
 

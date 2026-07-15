@@ -69,15 +69,15 @@ describe('calcLineTax — interstate (IGST)', () => {
     expect(result.total_tax).toBe(180)
   })
 
-  it('rounds IGST to whole rupee (₹100 at 18% = ₹18)', () => {
+  it('calculates IGST on a round taxable amount (₹100 at 18% = ₹18)', () => {
     const result = calcLineTax(100, 18, true)
     expect(result.igst_amount).toBe(18)
   })
 
-  it('rounds IGST on fractional taxable amount', () => {
-    // 1001 * 18% = 180.18 → rounds to 180
+  it('keeps 2dp precision on a fractional taxable amount (no whole-rupee rounding)', () => {
+    // 1001 * 18% = 180.18 — kept at 2dp, not rounded to 180
     const result = calcLineTax(1001, 18, true)
-    expect(result.igst_amount).toBe(180)
+    expect(result.igst_amount).toBe(180.18)
   })
 
   it('returns zero tax on zero taxable amount', () => {
@@ -114,12 +114,12 @@ describe('calcLineTax — local / intrastate (CGST + SGST)', () => {
     expect(result.total_tax).toBe(500)
   })
 
-  it('rounds each component to whole rupee independently', () => {
-    // 1001 * 9% = 90.09 → rounds to 90 each
+  it('keeps 2dp precision on each component independently (no whole-rupee rounding)', () => {
+    // 1001 * 9% = 90.09 — kept at 2dp, not rounded to 90
     const result = calcLineTax(1001, 18, false)
-    expect(result.cgst_amount).toBe(90)
-    expect(result.sgst_amount).toBe(90)
-    expect(result.total_tax).toBe(180)
+    expect(result.cgst_amount).toBe(90.09)
+    expect(result.sgst_amount).toBe(90.09)
+    expect(result.total_tax).toBe(180.18)
   })
 
   it('returns zero tax on zero taxable amount', () => {

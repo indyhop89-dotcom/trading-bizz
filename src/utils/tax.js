@@ -1,4 +1,4 @@
-import { round2, roundRupees } from './money'
+import { round2 } from './money'
 
 /**
  * Detect interstate from two GSTIN state codes (first 2 chars).
@@ -16,14 +16,16 @@ export function isInterstate(sellerGstin, buyerGstin) {
  * @param {boolean} interstate    - true = IGST, false = CGST+SGST
  * @returns {{ cgst_rate, cgst_amount, sgst_rate, sgst_amount, igst_rate, igst_amount, total_tax }}
  *
- * All returned amounts are whole rupees (Math.round applied).
+ * All returned amounts are rounded to 2dp (not whole rupees) — the DB column
+ * is numeric(15,2), and rounding to a whole rupee per line before storage/
+ * summation is what causes header totals to drift from the true value.
  */
 export function calcLineTax(taxableAmount, gstRate, interstate) {
   const rate = Number(gstRate) || 0
   const base = Number(taxableAmount) || 0
 
   if (interstate) {
-    const igst = roundRupees(round2(base * rate / 100))
+    const igst = round2(base * rate / 100)
     return {
       cgst_rate: 0, cgst_amount: 0,
       sgst_rate: 0, sgst_amount: 0,
@@ -32,12 +34,12 @@ export function calcLineTax(taxableAmount, gstRate, interstate) {
     }
   } else {
     const half  = round2(rate / 2)
-    const each  = roundRupees(round2(base * half / 100))
+    const each  = round2(base * half / 100)
     return {
       cgst_rate: half, cgst_amount: each,
       sgst_rate: half, sgst_amount: each,
       igst_rate: 0,    igst_amount: 0,
-      total_tax: each * 2,
+      total_tax: round2(each * 2),
     }
   }
 }
