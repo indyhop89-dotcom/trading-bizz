@@ -16,6 +16,7 @@ import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../u
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock, getInvoiceLifecycleStage } from '../../utils/stock'
 
@@ -118,7 +119,7 @@ function InvoiceList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
@@ -990,7 +991,7 @@ function InvoiceDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
   const { profile } = useAuth()
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [inv, setInv]     = useState(null)
@@ -1114,8 +1115,11 @@ function InvoiceDetail() {
       // sync the leg's movement_status so it doesn't stay stuck on "pending"
       // (previously only updated via a manual edit on the leg that nobody
       // remembered to make, so it drifted out of sync with the Stock column).
+      // cargo_status is the separate field Document Database actually shows —
+      // it was never touched here either, so a leg with an invoice + EWB
+      // already on file could still read "awaiting cargo" forever.
       if (inv.order_leg_id) {
-        await supabase.from('order_legs').update({ movement_status: 'delivered' }).eq('id', inv.order_leg_id)
+        await supabase.from('order_legs').update({ movement_status: 'delivered', cargo_status: 'cargo_dispatched' }).eq('id', inv.order_leg_id)
       }
     }
 
@@ -1153,6 +1157,13 @@ function InvoiceDetail() {
 
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!inv)    return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>Invoice not found.</div>
+
+  // 'paid' wasn't locked before, only 'cancelled' — added here since a paid
+  // invoice's E-way Bill/IRN sections could otherwise still be changed after
+  // settlement, which is a live-data-integrity risk (an EWB save also moves
+  // stock, which shouldn't happen for a settled or cancelled invoice).
+  // Master/admin can still override the lock when a correction is genuinely needed.
+  const isLocked = !hasFullAccess(profile) && ['cancelled', 'paid'].includes(inv.status)
 
   return (
     <div>
@@ -1235,13 +1246,13 @@ function InvoiceDetail() {
               <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
             )}
           </div>
-          {!ewbEdit && (
+          {!ewbEdit && !isLocked && (
             <Btn size='sm' variant='ghost' onClick={openEwbEdit}>
               {(inv.eway_bill_no || inv.challan_no) ? 'Edit' : '+ Add'}
             </Btn>
           )}
         </div>
-        {ewbEdit ? (
+        {ewbEdit && !isLocked ? (
           <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
             {!inv.eway_bill_no && inv.invoice_type === 'sales' && (
               <div style={{background:'#fff3cc',border:'1px solid #e6c040',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#7a5000'}}>
@@ -1291,7 +1302,9 @@ function InvoiceDetail() {
           </div>
         ) : (
           <div style={{ padding: '12px 14px', fontSize: '12px', color: C.textMuted }}>
-            No E-way Bill or Challan details entered. Click <strong>+ Add</strong> to fill in.
+            {isLocked
+              ? `No E-way Bill or Challan details entered. Invoice is ${inv.status} — locked from further edits.`
+              : <>No E-way Bill or Challan details entered. Click <strong>+ Add</strong> to fill in.</>}
           </div>
         )}
       </div>
@@ -1305,13 +1318,13 @@ function InvoiceDetail() {
               <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
             )}
           </div>
-          {!irnEdit && (
+          {!irnEdit && !isLocked && (
             <Btn size='sm' variant='ghost' onClick={openIrnEdit}>
               {(inv.einvoice_irn || inv.einvoice_ack_no) ? 'Edit' : '+ Add'}
             </Btn>
           )}
         </div>
-        {irnEdit ? (
+        {irnEdit && !isLocked ? (
           <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <FormRow label='IRN (Invoice Reference Number)'>
               <Input
@@ -1371,7 +1384,9 @@ function InvoiceDetail() {
           </div>
         ) : (
           <div style={{ padding: '12px 14px', fontSize: '12px', color: C.textMuted }}>
-            No IRN entered yet. Click <strong>+ Add</strong> after generating from GST portal.
+            {isLocked
+              ? `No IRN entered. Invoice is ${inv.status} — locked from further edits.`
+              : <>No IRN entered yet. Click <strong>+ Add</strong> after generating from GST portal.</>}
           </div>
         )}
       </div>

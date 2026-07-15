@@ -9,7 +9,8 @@ import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
 import { formatINR, toNum } from '../../utils/money'
 import { suggestNextNo } from '../../utils/numbering'
-import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master-only delete, matches PI/PO/Invoices pattern
+import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master/admin-only delete, matches PI/PO/Invoices pattern
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { getInvoiceLifecycleStage } from '../../utils/stock'
 import { getDriveViewUrl } from '../../utils/drive'
@@ -191,7 +192,7 @@ function OrdersList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role, same convention as PI/PO/Invoices
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: which entities this user may raise an order *from* — orders_write
   // is gated on has_entity_grant(origin_entity_id).
   const { entities: accessEntities, frozen: originEntityFrozen, defaultEntityId } = useEntityAccess()
@@ -413,7 +414,7 @@ function OrderDetail() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: single-order delete, master-only, same convention as PI/PO/Invoices detail pages
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: orders_write / order_legs_write are both gated on
   // has_entity_grant(origin_entity_id / from_entity_id) — same "creating
   // side" restriction as the New Order form.

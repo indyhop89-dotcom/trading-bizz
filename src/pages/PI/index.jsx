@@ -16,6 +16,7 @@ import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock } from '../../utils/stock'
 
@@ -66,11 +67,9 @@ async function writeStockMovementsForPI(pi, lines) {
 function PIList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
-  // CHANGED: bulk delete — restricted to the 'master' role, which is the only
-  // elevated/full-access role in this app's schema (ROLES = master, entity_user,
-  // viewer — see Settings). This matches the existing `isAdmin` convention used
-  // in Payments (`profile?.role === 'master'`).
-  const canDelete = profile?.role === 'master'
+  // Bulk delete — restricted to 'master'/'admin', the full-access roles
+  // (ROLES = master, admin, entity_user, viewer — see Settings).
+  const canDelete = hasFullAccess(profile)
   // CHANGED: which entities this user may raise a PI *from* — master sees
   // all, everyone else only the entities they've been granted access to.
   const { entities: accessEntities, frozen: fromEntityFrozen, defaultEntityId } = useEntityAccess()
@@ -700,7 +699,7 @@ function PIDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
   const { profile } = useAuth()
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [pi, setPI]         = useState(null)
@@ -826,7 +825,8 @@ function PIDetail() {
   if (!pi)     return <div style={{padding:'48px',textAlign:'center',color:C.danger}}>PI not found.</div>
 
   const canConvert = ['accepted','sent','draft'].includes(pi.status) && !editing
-  const isLocked   = ['converted','cancelled'].includes(pi.status)
+  // Master/admin can still edit/cancel a converted or cancelled PI when a correction is needed.
+  const isLocked   = !hasFullAccess(profile) && ['converted','cancelled'].includes(pi.status)
 
   return (
     <div>

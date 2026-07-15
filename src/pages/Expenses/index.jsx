@@ -7,7 +7,8 @@ import {
 import { formatINR, toNum, roundRupees, round2 } from '../../utils/money'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import DocumentAttachments from '../../components/DocumentAttachments'
-import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces the unconfirmed next_exp_no RPC
 
@@ -31,7 +32,7 @@ async function resolveFY() {
 export default function Expenses() {
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: expenses_write is gated on has_entity_grant(entity_id) — an
   // expense belongs to one entity, no counterparty to worry about.
   const { entities: accessEntities, frozen: entityFrozen, defaultEntityId } = useEntityAccess()

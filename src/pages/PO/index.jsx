@@ -16,6 +16,7 @@ import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../u
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 const PO_STATUSES = ['open', 'partial', 'completed', 'cancelled']
@@ -51,7 +52,7 @@ function POList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: which entities this user may raise a PO *as buyer* — the buyer
   // converts the seller's PI into their own PO, so buyer is the writing side
   // (see 015_fix_po_write_gate.sql — po_write is gated on buyer_entity_id).
@@ -606,7 +607,7 @@ function PODetail() {
   const { id } = useParams()
   const navigate = useNavigate()
   const { profile } = useAuth()
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [po, setPO]     = useState(null)

@@ -9,6 +9,7 @@ import { formatINR, toNum, roundRupees } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { useAuth } from '../../hooks/useAuth'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { hasFullAccess } from '../../utils/roles'
 import { computeInvoiceOutstanding } from '../../utils/payments'
 
 // ─── TDS constants (mirrors Invoices module) ───────────────────────────────────
@@ -177,7 +178,7 @@ function InvoicePaymentTracker() {
   const [toEntityFilter, setToEntityFilter]     = useState('') // buyer
   const [toast, setToast]       = useState(null)
 
-  const isAdmin = profile?.role === 'master'
+  const isAdmin = hasFullAccess(profile)
 
   const load = useCallback(async () => {
     setLoading(true)

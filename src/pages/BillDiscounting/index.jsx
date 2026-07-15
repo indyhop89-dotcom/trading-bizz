@@ -9,7 +9,8 @@ import { formatINR, toNum, roundRupees } from '../../utils/money'
 import { downloadCSV } from '../../utils/csvTemplate'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import DocumentAttachments from '../../components/DocumentAttachments'
-import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -570,7 +571,7 @@ function BDList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: bde_write is gated on has_entity_grant(entity_id) — a bill
   // discounting event belongs to one entity, no counterparty.
   const { entities: accessEntities, frozen: entityFrozen, defaultEntityId } = useEntityAccess()
@@ -943,7 +944,7 @@ function BDDetail() {
   const { id }=useParams(), navigate=useNavigate()
   const { profile } = useAuth()
   // CHANGED: master-only delete, same convention as PI/PO/Invoices detail pages
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [event,setEvent]     = useState(null)

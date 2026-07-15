@@ -10,7 +10,8 @@ import DocumentAttachments from '../../components/DocumentAttachments'
 import { formatINR } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
 import { buildHSNMap } from '../../utils/hsn'
-import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
+import { hasFullAccess } from '../../utils/roles'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces broken next_note_no RPC / undefined resolveFY
 
 const NOTE_TYPES = ['credit_note', 'debit_note']
@@ -22,7 +23,7 @@ function NoteList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
@@ -288,7 +289,7 @@ function NoteDetail() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: master-only delete, same convention as PI/PO/Invoices detail pages
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [note, setNote]   = useState(null)
