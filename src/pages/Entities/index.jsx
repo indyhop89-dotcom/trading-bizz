@@ -6,6 +6,7 @@ import {
 } from '../../components/UI/index'
 import { GST_STATES } from '../../constants/states'
 import { downloadTemplate } from '../../utils/csvTemplate'
+import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl } from '../../utils/drive'
 
 const ENTITY_TYPES = ['group', 'associate', 'external']
 const GST_UNITS    = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
@@ -15,6 +16,7 @@ const EMPTY_FORM = {
   gstin: '', pan: '', state_code: '', state_name: '',
   address: '', city: '', pincode: '', email: '', phone: '',
   bank_name: '', bank_account_no: '', bank_ifsc: '', bank_branch: '',
+  logo_url: '', logo_file_id: '',
   reliance_vendor_id: '', reliance_sales_id: '',
   reliance_onboarded: false, reliance_notes: '',
   is_active: true,
@@ -35,6 +37,9 @@ export default function Entities() {
   // CHANGED: CSV upload state
   const [csvResult, setCsvResult] = useState(null)   // { added, skipped, errors }
   const csvRef                    = useRef(null)
+  const logoRef                   = useRef(null)
+  const [logoPreview, setLogoPreview]   = useState('')
+  const [logoUploading, setLogoUploading] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -55,6 +60,7 @@ export default function Entities() {
   function openNew() {
     setEditing(null)
     setForm(EMPTY_FORM)
+    setLogoPreview('')
     setModalOpen(true)
   }
 
@@ -78,13 +84,45 @@ export default function Entities() {
       bank_account_no:    entity.bank_account_no || '',
       bank_ifsc:          entity.bank_ifsc || '',
       bank_branch:        entity.bank_branch || '',
+      logo_url:           entity.logo_url || '',
+      logo_file_id:       entity.logo_file_id || '',
       reliance_vendor_id: entity.reliance_vendor_id || '',
       reliance_sales_id:  entity.reliance_sales_id || '',
       reliance_onboarded: entity.reliance_onboarded || false,
       reliance_notes:     entity.reliance_notes || '',
       is_active:          entity.is_active !== false,
     })
+    setLogoPreview('')
+    if (entity.logo_file_id) {
+      getDriveViewUrl(entity.logo_file_id).then(setLogoPreview).catch(() => {})
+    }
     setModalOpen(true)
+  }
+
+  // b2-upload's file-serving endpoint requires an auth header, so a raw
+  // <img src={logo_url}> would 401 — resolve to a viewable blob URL the
+  // same way every other document preview in this app already does.
+  async function handleLogoChange(e) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setLogoUploading(true)
+    const oldFileId = form.logo_file_id
+    try {
+      const data = await uploadFileToDrive(file, form.short_name || form.name || 'Entity', 'logo')
+      setForm(f => ({ ...f, logo_url: data.drive_url, logo_file_id: data.drive_file_id }))
+      setLogoPreview(URL.createObjectURL(file))
+      if (oldFileId) deleteFileFromDrive(oldFileId).catch(() => {}) // best-effort — replacing, not blocking on cleanup
+    } catch (err) {
+      setToast({ message: err.message || 'Logo upload failed', type: 'error' })
+    } finally {
+      setLogoUploading(false)
+      e.target.value = ''
+    }
+  }
+
+  function removeLogo() {
+    setForm(f => ({ ...f, logo_url: '', logo_file_id: '' }))
+    setLogoPreview('')
   }
 
   function setF(key, val) {
@@ -285,6 +323,21 @@ export default function Entities() {
               </Select>
             </FormRow>
           </div>
+
+          <FormRow label='Logo' hint='Optional — used on generated Proforma Invoice/Invoice/PO documents. If unset, the document header shows text only.'>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              {logoPreview ? (
+                <img src={logoPreview} alt={`${form.name || 'Entity'} logo`} style={{ height: '48px', maxWidth: '120px', objectFit: 'contain', border: `1px solid ${C.border}`, borderRadius: '6px', background: '#fff', padding: '4px' }} />
+              ) : (
+                <div style={{ height: '48px', width: '96px', display: 'flex', alignItems: 'center', justifyContent: 'center', border: `1px dashed ${C.border}`, borderRadius: '6px', color: C.textMuted, fontSize: '11px' }}>
+                  No logo
+                </div>
+              )}
+              <Btn size='sm' variant='ghost' onClick={() => logoRef.current?.click()} disabled={logoUploading}>{logoUploading ? 'Uploading…' : logoPreview ? 'Replace' : 'Upload'}</Btn>
+              <input ref={logoRef} type='file' accept='image/*' onChange={handleLogoChange} disabled={logoUploading} style={{ display: 'none' }} />
+              {logoPreview && <Btn size='sm' variant='ghost' onClick={removeLogo} disabled={logoUploading} style={{ color: C.danger }}>Remove</Btn>}
+            </div>
+          </FormRow>
 
           <SectionDivider label='Tax & Compliance' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>

@@ -248,7 +248,7 @@ function EntityGroups() {
 }
 
 // ─── HSN Master Tab ─────────────────────────────────────────────────────────────
-const EMPTY_HSN = { hsn_code: '', description: '', rate_type: 'fixed', fixed_rate: '18', slabs: [{ max_rate: '', gst_rate: '' }], is_active: true }
+const EMPTY_HSN = { hsn_code: '', description: '', rate_type: 'fixed', fixed_rate: '18', slabs: [{ max_rate: '', gst_rate: '' }], effective_from: '' }
 
 // "1000:5|null:12" → [{max_rate:1000,gst_rate:5},{max_rate:null,gst_rate:12}]
 // Matches the format already defined in csvTemplate.js's hsn_master template.
@@ -274,10 +274,15 @@ function HsnMaster() {
   const [csvText, setCsvText]     = useState('')
   const [csvResult, setCsvResult] = useState(null)
   const [csvSaving, setCsvSaving] = useState(false)
+  const [historyFor, setHistoryFor]     = useState(null) // hsn_code currently shown, or null
+  const [historyRows, setHistoryRows]   = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
 
+  // Only the current (open-ended) version of each code shows in the main
+  // table — past versions are versioned history, viewed via "History".
   const load = useCallback(async () => {
     setLoading(true)
-    const { data } = await supabase.from('hsn_master').select('*').order('hsn_code')
+    const { data } = await supabase.from('hsn_master').select('*').is('effective_to', null).order('hsn_code')
     setRows(data || [])
     setLoading(false)
   }, [])
@@ -285,41 +290,57 @@ function HsnMaster() {
   useEffect(() => { load() }, [load])
 
   function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
-  function openNew()  { setEditing(null); setForm(EMPTY_HSN); setModalOpen(true) }
+  function openNew()  { setEditing(null); setForm({ ...EMPTY_HSN, effective_from: today() }); setModalOpen(true) }
   function openEdit(r) {
     setEditing(r)
     setForm({
       hsn_code: r.hsn_code || '', description: r.description || '', rate_type: r.rate_type || 'fixed',
       fixed_rate: r.fixed_rate != null ? String(r.fixed_rate) : '18',
       slabs: Array.isArray(r.slabs) && r.slabs.length ? r.slabs.map(s => ({ max_rate: s.max_rate ?? '', gst_rate: s.gst_rate ?? '' })) : [{ max_rate: '', gst_rate: '' }],
-      is_active: r.is_active !== false,
+      effective_from: today(), // date the NEW version starts — not the old row's date
     })
     setModalOpen(true)
+  }
+
+  async function openHistory(hsnCode) {
+    setHistoryFor(hsnCode)
+    setHistoryLoading(true)
+    const { data } = await supabase.from('hsn_master').select('*').eq('hsn_code', hsnCode).order('effective_from', { ascending: false })
+    setHistoryRows(data || [])
+    setHistoryLoading(false)
   }
 
   function setSlab(i, k, v) { setForm(f => ({ ...f, slabs: f.slabs.map((s, si) => si === i ? { ...s, [k]: v } : s) })) }
   function addSlab()        { setForm(f => ({ ...f, slabs: [...f.slabs, { max_rate: '', gst_rate: '' }] })) }
   function removeSlab(i)    { setForm(f => ({ ...f, slabs: f.slabs.filter((_, si) => si !== i) })) }
 
+  // Every save (new code or editing an existing one) goes through the same
+  // hsn_master_insert_version RPC: it closes out whatever version is
+  // currently open for that code (if any) and inserts the new one dated
+  // from effective_from, atomically. This is what makes past documents
+  // immune to future rate edits — they resolve against whichever version
+  // was open on their own date, not the latest one. The old direct
+  // UPDATE-in-place is gone entirely; there is no way to silently rewrite
+  // history through this form anymore.
   async function handleSave() {
     if (!form.hsn_code.trim()) return setToast({ message: 'HSN code is required', type: 'error' })
     if (form.rate_type === 'fixed' && !form.fixed_rate) return setToast({ message: 'Fixed rate is required', type: 'error' })
+    if (!form.effective_from) return setToast({ message: 'Effective from date is required', type: 'error' })
     setSaving(true)
-    const payload = {
-      hsn_code: form.hsn_code.trim(), description: form.description || null, rate_type: form.rate_type,
-      fixed_rate: form.rate_type === 'fixed' ? toNum(form.fixed_rate) : null,
-      slabs: form.rate_type === 'slab'
+    const { error } = await supabase.rpc('hsn_master_insert_version', {
+      p_hsn_code: form.hsn_code.trim(),
+      p_description: form.description || null,
+      p_rate_type: form.rate_type,
+      p_fixed_rate: form.rate_type === 'fixed' ? toNum(form.fixed_rate) : null,
+      p_slabs: form.rate_type === 'slab'
         ? form.slabs.filter(s => s.gst_rate !== '').map(s => ({ max_rate: s.max_rate === '' ? null : toNum(s.max_rate), gst_rate: toNum(s.gst_rate) }))
         : null,
-      is_active: form.is_active, updated_at: new Date(),
-    }
-    const res = editing
-      ? await supabase.from('hsn_master').update(payload).eq('id', editing.id)
-      : await supabase.from('hsn_master').insert(payload)
+      p_effective_from: form.effective_from,
+    })
     setSaving(false)
-    if (res.error) return setToast({ message: res.error.message, type: 'error' })
+    if (error) return setToast({ message: error.message, type: 'error' })
     setModalOpen(false)
-    setToast({ message: editing ? 'HSN entry updated' : 'HSN entry added', type: 'success' })
+    setToast({ message: editing ? 'New rate version saved' : 'HSN entry added', type: 'success' })
     load()
   }
 
@@ -331,9 +352,14 @@ function HsnMaster() {
     load()
   }
 
-  // CSV: hsn_code,description,rate_type,fixed_rate,slabs — matches the
-  // downloadable template in csvTemplate.js exactly (slabs as
-  // "threshold:gst_rate|threshold:gst_rate|null:gst_rate").
+  // CSV: hsn_code,description,rate_type,fixed_rate,slabs,effective_from —
+  // matches the downloadable template in csvTemplate.js exactly (slabs as
+  // "threshold:gst_rate|threshold:gst_rate|null:gst_rate"). Routes through
+  // the same hsn_master_insert_version RPC as the single-entry form — plain
+  // upsert-by-hsn_code no longer works now that a code can have several
+  // dated versions, and this keeps CSV imports subject to the same
+  // effective-dating (each re-upload of a code adds a new version instead
+  // of overwriting its history).
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -348,12 +374,14 @@ function HsnMaster() {
       if (!row.hsn_code) { errors.push(`Row ${i + 1}: hsn_code is required`); continue }
       const rateType = (row.rate_type || 'fixed').toLowerCase()
       if (!['fixed', 'slab'].includes(rateType)) { errors.push(`Row ${i + 1}: rate_type must be "fixed" or "slab"`); continue }
-      const { error } = await supabase.from('hsn_master').upsert({
-        hsn_code: row.hsn_code, description: row.description || null, rate_type: rateType,
-        fixed_rate: rateType === 'fixed' ? (toNum(row.fixed_rate) || null) : null,
-        slabs: rateType === 'slab' ? parseSlabsString(row.slabs) : null,
-        is_active: true, updated_at: new Date(),
-      }, { onConflict: 'hsn_code' })
+      const { error } = await supabase.rpc('hsn_master_insert_version', {
+        p_hsn_code: row.hsn_code,
+        p_description: row.description || null,
+        p_rate_type: rateType,
+        p_fixed_rate: rateType === 'fixed' ? (toNum(row.fixed_rate) || null) : null,
+        p_slabs: rateType === 'slab' ? parseSlabsString(row.slabs) : null,
+        p_effective_from: row.effective_from || today(),
+      })
       if (error) errors.push(`Row ${i + 1} (${row.hsn_code}): ${error.message}`)
       else added++
     }
@@ -373,9 +401,11 @@ function HsnMaster() {
         ? <span style={{ fontWeight: 600 }}>{r.fixed_rate}%</span>
         : <span style={{ fontSize: '11px' }}>{formatSlabSummary(r.slabs)}</span> },
     { label: 'Status',     render: r => <Badge status={r.is_active ? 'active' : 'cancelled'} label={r.is_active ? 'Active' : 'Inactive'} /> },
+    { label: 'Effective From', render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{fmtDate(r.effective_from)}</span> },
     { label: 'Actions', render: r => (
       <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
-        <Btn size='sm' variant='ghost' onClick={() => openEdit(r)}>Edit</Btn>
+        <Btn size='sm' variant='ghost' onClick={() => openEdit(r)}>New Version</Btn>
+        <Btn size='sm' variant='ghost' onClick={() => openHistory(r.hsn_code)}>History</Btn>
         <Btn size='sm' variant='ghost' onClick={() => setConfirmDelete(r)} style={{ color: C.danger }}>Deactivate</Btn>
       </div>
     )},
@@ -399,10 +429,15 @@ function HsnMaster() {
         }
       </Card>
 
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? 'Edit HSN Entry' : 'New HSN Entry'} width={560}>
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? `New Rate Version — ${editing.hsn_code}` : 'New HSN Entry'} width={560}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          {editing && (
+            <div style={{ fontSize: '12px', color: C.textMid, background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '8px 12px' }}>
+              Current version effective since <b>{fmtDate(editing.effective_from)}</b>. Saving below closes that version out and starts a new one — it never overwrites history.
+            </div>
+          )}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='HSN Code' required><Input value={form.hsn_code} onChange={e => setF('hsn_code', e.target.value)} style={{ fontFamily: 'monospace' }} /></FormRow>
+            <FormRow label='HSN Code' required><Input value={form.hsn_code} onChange={e => setF('hsn_code', e.target.value)} disabled={!!editing} style={{ fontFamily: 'monospace' }} /></FormRow>
             <FormRow label='Rate Type'>
               <Select value={form.rate_type} onChange={e => setF('rate_type', e.target.value)}>
                 <option value='fixed'>Fixed</option>
@@ -410,6 +445,9 @@ function HsnMaster() {
               </Select>
             </FormRow>
           </div>
+          <FormRow label='Effective From' required>
+            <Input type='date' value={form.effective_from} onChange={e => setF('effective_from', e.target.value)} />
+          </FormRow>
           <FormRow label='Description'><Textarea value={form.description} onChange={e => setF('description', e.target.value)} rows={2} /></FormRow>
 
           {form.rate_type === 'fixed' ? (
@@ -430,23 +468,40 @@ function HsnMaster() {
             </FormRow>
           )}
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <input type='checkbox' id='hsn_active' checked={form.is_active} onChange={e => setF('is_active', e.target.checked)} style={{ width: '14px', height: '14px' }} />
-            <label htmlFor='hsn_active' style={{ fontSize: '13px', color: C.textMid, cursor: 'pointer' }}>Active</label>
-          </div>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save Changes' : 'Create'}</Btn>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save as New Version' : 'Create'}</Btn>
           </div>
         </div>
+      </Modal>
+
+      <Modal open={!!historyFor} onClose={() => setHistoryFor(null)} title={`Rate History — ${historyFor || ''}`} width={520}>
+        {historyLoading
+          ? <div style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
+          : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {historyRows.map(r => (
+                <div key={r.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', border: `1px solid ${C.border}`, borderRadius: '6px', background: r.effective_to ? C.bg : '#e8f3ec' }}>
+                  <div style={{ fontSize: '12px', color: C.textMid }}>
+                    {fmtDate(r.effective_from)} → {r.effective_to ? fmtDate(r.effective_to) : 'current'}
+                  </div>
+                  <div style={{ fontSize: '13px', fontWeight: 600 }}>
+                    {r.rate_type === 'fixed' ? `${r.fixed_rate}%` : formatSlabSummary(r.slabs)}
+                  </div>
+                </div>
+              ))}
+              {historyRows.length === 0 && <div style={{ color: C.textMuted, fontSize: '13px' }}>No versions found.</div>}
+            </div>
+          )
+        }
       </Modal>
 
       <Modal open={csvModal} onClose={() => setCsvModal(false)} title='CSV Upload — HSN Master' width={560}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <div style={{ fontSize: '12px', color: C.textMid }}>
-            Columns: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>hsn_code,description,rate_type,fixed_rate,slabs</code><br />
-            slabs format for rate_type=slab: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>1000:5|null:12</code> (threshold:gst_rate pairs separated by |, null = open-ended).
-            Re-uploading updates an existing HSN code rather than duplicating it.
+            Columns: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>hsn_code,description,rate_type,fixed_rate,slabs,effective_from</code><br />
+            slabs format for rate_type=slab: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>1000:5|null:12</code> (threshold:gst_rate pairs separated by |, null = open-ended).<br />
+            effective_from is optional (blank = today). Re-uploading an existing HSN code adds a new dated version rather than overwriting its history.
           </div>
           <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('hsn_master')}>↓ Download Template</Btn>
           <CsvFileDrop onText={setCsvText} />

@@ -308,7 +308,7 @@ export function FormRow({ label, required, children, hint, error }) {
 }
 
 // ─── Input ────────────────────────────────────────────────────────────────────
-export function Input({ value, onChange, placeholder, type = 'text', disabled, readOnly, style: extra, onKeyDown }) {
+export function Input({ value, onChange, placeholder, type = 'text', disabled, readOnly, style: extra, onKeyDown, list }) {
   return (
     <input
       type={type}
@@ -318,6 +318,7 @@ export function Input({ value, onChange, placeholder, type = 'text', disabled, r
       placeholder={placeholder}
       disabled={disabled}
       readOnly={readOnly}
+      list={list}
       className='tb-input'
       style={{
         padding: '7px 10px',

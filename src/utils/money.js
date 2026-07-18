@@ -13,6 +13,17 @@
  */
 
 /**
+ * Indian comma-grouped, 2dp number formatting with no currency symbol and
+ * no "—" fallback — the shared primitive behind formatINR below, also used
+ * directly by print/Excel document generation where every cell must always
+ * show a number rather than a dash for null/zero.
+ * 1250 → "1,250.00"
+ */
+export function formatNumberIN(amount) {
+  return (Number(amount) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+/**
  * Format a rupee amount for display.
  * 1250     → "₹1,250.00"
  * 1250.6   → "₹1,250.60"
@@ -23,7 +34,7 @@ export function formatINR(amount) {
   if (amount === null || amount === undefined || amount === '') return '—'
   const n = Number(amount)
   if (isNaN(n)) return '—'
-  return '₹' + n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return '₹' + formatNumberIN(n)
 }
 
 /**

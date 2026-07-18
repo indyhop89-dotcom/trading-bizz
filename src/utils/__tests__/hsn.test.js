@@ -60,9 +60,16 @@ describe('buildHSNMap', () => {
     expect(buildHSNMap(null).size).toBe(0)
   })
 
-  it('stores the full row object as the map value', () => {
+  it('stores an array of version rows as the map value', () => {
     const map = buildHSNMap([fixedRow])
-    expect(map.get('1001')).toEqual(fixedRow)
+    expect(map.get('1001')).toEqual([fixedRow])
+  })
+
+  it('groups multiple versions of the same hsn_code together', () => {
+    const v1 = { ...fixedRow, fixed_rate: 5, effective_from: '2020-01-01', effective_to: '2025-03-31' }
+    const v2 = { ...fixedRow, fixed_rate: 12, effective_from: '2025-04-01', effective_to: null }
+    const map = buildHSNMap([v1, v2])
+    expect(map.get('1001')).toEqual([v1, v2])
   })
 })
 
@@ -154,6 +161,57 @@ describe('resolveGSTRate — not found / edge cases', () => {
     const map = buildHSNMap([fixedRow])
     const result = resolveGSTRate('  1001  ', 500, map)
     expect(result.gst_rate).toBe(5)
+  })
+})
+
+describe('resolveGSTRate — effective-dated versions', () => {
+  const oldRate = { hsn_code: '1001', is_active: true, rate_type: 'fixed', fixed_rate: 5, slabs: null, effective_from: '2020-01-01', effective_to: '2025-03-31' }
+  const newRate = { hsn_code: '1001', is_active: true, rate_type: 'fixed', fixed_rate: 12, slabs: null, effective_from: '2025-04-01', effective_to: null }
+
+  it('resolves the version effective on the given date (old date -> old rate)', () => {
+    const map = buildHSNMap([oldRate, newRate])
+    const result = resolveGSTRate('1001', 500, map, '2024-06-15')
+    expect(result.gst_rate).toBe(5)
+  })
+
+  it('resolves the version effective on the given date (new date -> new rate)', () => {
+    const map = buildHSNMap([oldRate, newRate])
+    const result = resolveGSTRate('1001', 500, map, '2025-06-15')
+    expect(result.gst_rate).toBe(12)
+  })
+
+  it('resolves right at the boundary of the old version', () => {
+    const map = buildHSNMap([oldRate, newRate])
+    expect(resolveGSTRate('1001', 500, map, '2025-03-31').gst_rate).toBe(5)
+    expect(resolveGSTRate('1001', 500, map, '2025-04-01').gst_rate).toBe(12)
+  })
+
+  it('falls back to the earliest version when asOfDate predates all versions', () => {
+    const map = buildHSNMap([oldRate, newRate])
+    const result = resolveGSTRate('1001', 500, map, '2015-01-01')
+    expect(result.gst_rate).toBe(5)
+  })
+
+  it('defaults to resolving as of today when asOfDate is omitted', () => {
+    const map = buildHSNMap([oldRate, newRate])
+    const result = resolveGSTRate('1001', 500, map)
+    expect(result.gst_rate).toBe(12) // "today" is well after 2025-04-01 in any real run
+  })
+
+  it('still works for a single-version code with no effective_from/effective_to at all', () => {
+    const map = buildHSNMap([fixedRow])
+    const result = resolveGSTRate('1001', 500, map, '1999-01-01')
+    expect(result.gst_rate).toBe(5)
+  })
+
+  it('returns no rate (not a stale resurrected one) when the version covering asOfDate was deactivated', () => {
+    // oldRate is still active (is_active:true) — only newRate, the version
+    // that would actually cover 2026-06-01, has been deactivated and so
+    // never reaches buildHSNMap at all (buildHSNMap filters is_active).
+    const map = buildHSNMap([oldRate])
+    const result = resolveGSTRate('1001', 500, map, '2026-06-01')
+    expect(result.gst_rate).toBe(null)
+    expect(result.source).toBe('default')
   })
 })
 

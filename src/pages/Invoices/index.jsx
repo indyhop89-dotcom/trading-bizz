@@ -19,6 +19,35 @@ import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock, getInvoiceLifecycleStage } from '../../utils/stock'
+import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
+import { downloadDocumentExcel } from '../../utils/documentExcel'
+import { getDriveViewUrl } from '../../utils/drive'
+
+// Fetches its own full entity rows (address/bank/logo columns) by id rather
+// than relying on the page's own load() query to embed them — this keeps
+// the wider, newer entity columns (which may not exist yet until migration
+// 025_entity_logo.sql is applied) isolated to document generation, so a
+// missing column here can never break the Invoice detail page itself loading.
+export async function buildInvoiceDoc(inv, lines) {
+  const [{ data: seller }, { data: buyer }] = await Promise.all([
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', inv.seller_entity_id).single(),
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', inv.buyer_entity_id).single(),
+  ])
+  let logoSrc = null
+  if (seller?.logo_file_id) { try { logoSrc = await getDriveViewUrl(seller.logo_file_id) } catch { /* no logo — text-only header */ } }
+  return {
+    docType: 'INVOICE',
+    docNo: inv.invoice_no, docDate: inv.invoice_date, validOrDueDate: inv.due_date,
+    sellerEntity: { ...seller, logoSrc },
+    buyerEntity: buyer,
+    lines,
+    totals: { taxable_amount: inv.taxable_amount, cgst_amount: inv.cgst_amount, sgst_amount: inv.sgst_amount, igst_amount: inv.igst_amount, round_off_amount: inv.round_off_amount, total_amount: inv.total_amount },
+    interstate: inv.is_interstate,
+    bankDetails: seller,
+    notes: inv.notes,
+    ewayBill: { eway_bill_no: inv.eway_bill_no, vehicle_no: inv.vehicle_no, transporter_name: inv.transporter_name, challan_no: inv.challan_no },
+  }
+}
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
 const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
@@ -885,7 +914,7 @@ function NewInvoice() {
             </div>
           )}
           <div style={{ marginTop: '12px' }}>
-            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} stockMap={stockMap} products={products} />
+            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.invoice_date} stockMap={stockMap} products={products} />
           </div>
         </Card>
 
@@ -1006,6 +1035,7 @@ function InvoiceDetail() {
   const [irnEdit, setIrnEdit]   = useState(false)
   const [irnForm, setIrnForm]   = useState({})
   const [sectSaving, setSectSaving] = useState(false)
+  const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -1077,6 +1107,20 @@ function InvoiceDetail() {
     setDeleting(false); setConfirmDelete(false)
     if (error) return setToast({ message: error.message, type: 'error' })
     navigate('/invoices')
+  }
+
+  async function handleDownloadPDF() {
+    setDocBusy('pdf')
+    try { printDocument(await buildInvoiceDoc(inv, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate PDF', type: 'error' }) }
+    finally { setDocBusy('') }
+  }
+
+  async function handleDownloadExcel() {
+    setDocBusy('excel')
+    try { downloadDocumentExcel(await buildInvoiceDoc(inv, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate Excel', type: 'error' }) }
+    finally { setDocBusy('') }
   }
 
   // CHANGED: save EWB + Challan fields
@@ -1173,6 +1217,8 @@ function InvoiceDetail() {
         subtitle={`${inv.seller?.name} → ${inv.buyer?.name} · ${fmtDate(inv.invoice_date)}`}
         action={
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             {inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
             {!['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
