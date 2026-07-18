@@ -325,7 +325,8 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
 // (TDS/TCS recognized at payment time — the single source of truth for
 // invoices, per the decision to stop recording it at invoice creation),
 // credit_debit_notes (auto-derived from the linked invoice's payment rate),
-// and expenses (own tds_amount/tcs_amount, always payer-side).
+// and party_payments (expense-side TDS/TCS — also recognized at payment
+// time, not when the expense was booked; we're always the payer here).
 //
 // Direction convention used throughout:
 //   TDS: the payer withholds and owes it to govt (liability); the payee had
@@ -345,15 +346,17 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
     const fyFilter = fys.find(f => f.id === fyId)
     const inRange = d => !fyFilter || !d || (d >= fyFilter.start_date && d <= fyFilter.end_date)
 
-    const [{ data: ips }, { data: cdns }, { data: exps }] = await Promise.all([
+    const [{ data: ips }, { data: cdns }, { data: exps }] = await Promise.all([ // exps = party_payments (expense-side TDS/TCS)
       supabase.from('invoice_payments')
         .select('id,invoice_no,actual_payment_date,entity_id,party_entity_id,tds_section,tds_amount,tcs_section,tcs_amount')
         .eq('is_deleted', false).or(`entity_id.eq.${entityId},party_entity_id.eq.${entityId}`),
       supabase.from('credit_debit_notes')
         .select('id,note_no,note_type,note_date,issuer_entity_id,receiver_entity_id,tds_amount,tcs_amount')
         .eq('is_deleted', false).or(`issuer_entity_id.eq.${entityId},receiver_entity_id.eq.${entityId}`),
-      supabase.from('expenses')
-        .select('id,expense_no,expense_date,entity_id,tds_section,tds_amount,tcs_section,tcs_amount')
+      // CHANGED: expense-side TDS/TCS now lives on party_payments — recognized
+      // at payment time, same as invoices, not when the expense was booked.
+      supabase.from('party_payments')
+        .select('id,payment_date,entity_id,tds_section,tds_amount,tcs_section,tcs_amount,expense:expense_id(expense_no)')
         .eq('entity_id', entityId).eq('is_deleted', false),
     ])
 
@@ -389,15 +392,16 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
       }
     }
 
-    for (const e of (exps || [])) {
-      if (!inRange(e.expense_date)) continue
-      if (toNum(e.tds_amount) > 0) {
-        tdsDeducted += e.tds_amount
-        rows.push({ source: 'Expense', doc: e.expense_no, date: e.expense_date, section: e.tds_section, kind: 'TDS', direction: 'Liability', amount: e.tds_amount })
+    for (const p of (exps || [])) {
+      if (!inRange(p.payment_date)) continue
+      const doc = p.expense?.expense_no || '—' // general/on-account payments have no linked expense
+      if (toNum(p.tds_amount) > 0) {
+        tdsDeducted += p.tds_amount
+        rows.push({ source: 'Party Payment', doc, date: p.payment_date, section: p.tds_section, kind: 'TDS', direction: 'Liability', amount: p.tds_amount })
       }
-      if (toNum(e.tcs_amount) > 0) {
-        tcsCredit += e.tcs_amount
-        rows.push({ source: 'Expense', doc: e.expense_no, date: e.expense_date, section: e.tcs_section, kind: 'TCS', direction: 'Credit', amount: e.tcs_amount })
+      if (toNum(p.tcs_amount) > 0) {
+        tcsCredit += p.tcs_amount
+        rows.push({ source: 'Party Payment', doc, date: p.payment_date, section: p.tcs_section, kind: 'TCS', direction: 'Credit', amount: p.tcs_amount })
       }
     }
 
@@ -1112,7 +1116,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
       .select('id,expense_no,expense_date,description,total_amount,net_payable')
       .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
     let payQ = supabase.from('party_payments')
-      .select('id,payment_date,amount,reference,mode')
+      .select('id,payment_date,amount,tds_amount,reference,mode')
       .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
     if (fyFilter) {
       expQ = expQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
@@ -1122,7 +1126,12 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
 
     const ledger = [
       ...(exps || []).map(e => ({ date: e.expense_date, doc: e.expense_no, type: 'Expense', desc: e.description, bill: (e.net_payable ?? e.total_amount) || 0, paid: 0 })),
-      ...(pays || []).map(p => ({ date: p.payment_date, doc: p.reference || '—', type: 'Payment', desc: p.mode || '', bill: 0, paid: p.amount || 0 })),
+      // CHANGED: "paid" (what settles the bill) = cash actually paid + TDS withheld —
+      // the TDS portion still settles the expense (paid to govt on the party's
+      // behalf), same convention as computeInvoiceOutstanding in utils/payments.js.
+      // Without this, a TDS-withheld payment would leave the ledger permanently
+      // short by the withheld amount.
+      ...(pays || []).map(p => ({ date: p.payment_date, doc: p.reference || '—', type: 'Payment', desc: p.mode || '', bill: 0, paid: (p.amount || 0) + (p.tds_amount || 0) })),
     ].sort((a, b) => new Date(a.date) - new Date(b.date))
 
     let bal = 0

@@ -14,7 +14,9 @@ import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces the u
 
 const GST_RATES = [0, 5, 12, 18, 28]
 
-// CHANGED: auto-suggest a TDS section + rate from the expense category. Payments
+// CHANGED: auto-suggest a TDS section + rate from an expense's category. Used
+// only at PAYMENT time (PartyPayments below) — withholding is decided when
+// the vendor is actually paid, not when the expense is first booked. Payments
 // to parties for these services attract withholding tax the payer must deduct
 // (freight/transport → §194C, brokerage → §194H, professional → §194J). Always
 // overridable, and thresholds (§194C ₹30k/₹1L) are NOT auto-enforced — this is
@@ -35,7 +37,6 @@ const EMPTY = {
   description: '', amount: '', gst_rate: 0,
   vendor_entity_id: '', vendor_name: '', vendor_gstin: '',
   party_id: '', due_date: '',
-  tds_section: '', tds_rate: '', tcs_section: '', tcs_rate: '',
   order_id: '', order_leg_id: '', invoice_id: '', status: 'unpaid', notes: '',
 }
 
@@ -135,17 +136,6 @@ export default function Expenses() {
   // order — clear it so we never persist an invoice that belongs elsewhere.
   function setOrder(v) { setForm(f => ({ ...f, order_id: v, invoice_id: '' })) }
 
-  // CHANGED: picking a category auto-suggests a TDS section/rate, but only when
-  // the user hasn't already set one — never clobbers a manual override.
-  function setCategory(v) {
-    setForm(f => {
-      const next = { ...f, expense_type: v }
-      const s = suggestTds(v)
-      if (s && !f.tds_section && !f.tds_rate) { next.tds_section = s.section; next.tds_rate = String(s.rate) }
-      return next
-    })
-  }
-
   // CHANGED: selecting a party auto-fills vendor GSTIN/name and derives the
   // payment due date from the party's default payment_days.
   function selectParty(id) {
@@ -226,11 +216,6 @@ export default function Expenses() {
   const previewAmount  = toNum(form.amount)
   const previewGST     = roundRupees(round2(previewAmount * Number(form.gst_rate) / 100))
   const previewTotal   = previewAmount + previewGST
-  // CHANGED: TDS is withheld on the base amount (not on GST); net payable to the
-  // party = total incl GST − TDS + any TCS the vendor collects from us.
-  const previewTDS     = roundRupees(round2(previewAmount * (Number(form.tds_rate) || 0) / 100))
-  const previewTCS     = roundRupees(round2(previewAmount * (Number(form.tcs_rate) || 0) / 100))
-  const previewNet     = previewTotal - previewTDS + previewTCS
 
   async function handleSave() {
     if (!form.entity_id || !form.description) return setToast({ message: 'Entity and description are required', type: 'error' })
@@ -250,11 +235,6 @@ export default function Expenses() {
     const expNo = await suggestNextNo({ table: 'expenses', noCol: 'expense_no', entityShort: entity?.short_name || entity?.name, fyCode: fy.code })
     const gst_amount   = roundRupees(round2(amount * Number(form.gst_rate) / 100))
     const total_amount = amount + gst_amount
-    const tds_rate     = Number(form.tds_rate) || 0
-    const tcs_rate     = Number(form.tcs_rate) || 0
-    const tds_amount   = roundRupees(round2(amount * tds_rate / 100))
-    const tcs_amount   = roundRupees(round2(amount * tcs_rate / 100))
-    const net_payable  = total_amount - tds_amount + tcs_amount
     const payload = {
       expense_no:      expNo,
       financial_year_id: fy.id,
@@ -273,13 +253,9 @@ export default function Expenses() {
       invoice_id:      form.invoice_id || null, // CHANGED: optional invoice tag under the linked order
       party_id:        form.party_id || null,   // CHANGED: tagged party from the global master
       due_date:        form.due_date || null,   // CHANGED: payment due date (from party terms, editable)
-      tds_section:     form.tds_section || null, // CHANGED: withholding tax on the party payment
-      tds_rate:        tds_rate || null,
-      tds_amount,
-      tcs_section:     form.tcs_section || null,
-      tcs_rate:        tcs_rate || null,
-      tcs_amount,
-      net_payable,
+      // TDS/TCS is no longer recorded at booking time — it's decided when the
+      // party is actually paid (Party Payments tab), mirroring how invoice
+      // TDS/TCS moved to payment time. See PartyPayments below.
       status:          form.status,
       notes:           form.notes || null,
     }
@@ -430,7 +406,7 @@ export default function Expenses() {
                 ? <button type='button' onClick={() => setCatModalOpen(true)}
                     style={{ background: 'none', border: 'none', color: C.accent, fontSize: '11px', cursor: 'pointer', padding: 0, fontFamily: 'inherit' }}>Manage</button>
                 : undefined}>
-              <Select value={form.expense_type} onChange={e => setCategory(e.target.value)}>
+              <Select value={form.expense_type} onChange={e => setF('expense_type', e.target.value)}>
                 <option value=''>Select category</option>
                 {categories.map(t => <option key={t} value={t}>{t}</option>)}
                 {/* CHANGED: keep a custom value visible even if it was later retired from the master list */}
@@ -461,32 +437,6 @@ export default function Expenses() {
             <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 14px', fontSize: '13px', display: 'flex', justifyContent: 'space-between' }}>
               <span style={{ color: C.textSoft }}>Total incl. GST</span>
               <span style={{ fontWeight: 700 }}>{formatINR(previewTotal)}</span>
-            </div>
-          )}
-          <SectionDivider label='TDS / TCS (withholding)' />
-          {/* CHANGED: auto-suggested from category, editable. TDS reduces what we
-              pay the party; TCS (if the vendor collects it) increases it. */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: '12px' }}>
-            <FormRow label='TDS Section'>
-              <Input value={form.tds_section} onChange={e => setF('tds_section', e.target.value)} placeholder='e.g. 194C' />
-            </FormRow>
-            <FormRow label='TDS %'>
-              <Input type='number' value={form.tds_rate} onChange={e => setF('tds_rate', e.target.value)} placeholder='0' />
-            </FormRow>
-            <FormRow label='TCS Section'>
-              <Input value={form.tcs_section} onChange={e => setF('tcs_section', e.target.value)} placeholder='e.g. 206C' />
-            </FormRow>
-            <FormRow label='TCS %'>
-              <Input type='number' value={form.tcs_rate} onChange={e => setF('tcs_rate', e.target.value)} placeholder='0' />
-            </FormRow>
-          </div>
-          {previewAmount > 0 && (previewTDS > 0 || previewTCS > 0) && (
-            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 14px', fontSize: '13px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
-              {previewTDS > 0 && <div style={{ display: 'flex', justifyContent: 'space-between', color: C.textSoft }}><span>Less TDS withheld</span><span>− {formatINR(previewTDS)}</span></div>}
-              {previewTCS > 0 && <div style={{ display: 'flex', justifyContent: 'space-between', color: C.textSoft }}><span>Add TCS collected</span><span>+ {formatINR(previewTCS)}</span></div>}
-              <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, borderTop: `1px solid ${C.border}`, paddingTop: '4px' }}>
-                <span>Net payable to party</span><span>{formatINR(previewNet)}</span>
-              </div>
             </div>
           )}
           <SectionDivider label='Party / Vendor' />
@@ -620,7 +570,14 @@ export default function Expenses() {
 // ─── Party Payments tab ─────────────────────────────────────────────────────────
 // Settlements actually paid to a party, entity-scoped (RLS: has_entity_grant).
 // Feeds the Reports → Party Ledger credit side.
-const EMPTY_PP = { entity_id: '', party_id: '', expense_id: '', payment_date: today(), amount: '', mode: 'bank', reference: '', notes: '' }
+const EMPTY_PP = {
+  entity_id: '', party_id: '', expense_id: '', payment_date: today(),
+  basis: '', mode: 'bank', reference: '', notes: '',
+  // CHANGED: TDS/TCS now lives here — decided when the party is actually
+  // paid, not when the expense was booked (see CATEGORY_TDS/suggestTds above).
+  apply_tds: false, tds_section: '', tds_rate: '',
+  apply_tcs: false, tcs_section: '', tcs_rate: '',
+}
 
 function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId }) {
   const [rows, setRows]         = useState([])
@@ -646,26 +603,65 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
   function openNew()  { setEditing(null); setForm({ ...EMPTY_PP, entity_id: defaultEntityId || '' }); setModalOpen(true) }
   function openEdit(r) {
     setEditing(r)
-    setForm({ entity_id: r.entity_id || '', party_id: r.party_id || '', expense_id: r.expense_id || '',
-      payment_date: r.payment_date || today(), amount: String(r.amount ?? ''), mode: r.mode || 'bank',
-      reference: r.reference || '', notes: r.notes || '' })
+    setForm({
+      entity_id: r.entity_id || '', party_id: r.party_id || '', expense_id: r.expense_id || '',
+      payment_date: r.payment_date || today(),
+      basis: String(toNum(r.amount) + toNum(r.tds_amount)), // reconstruct the gross settle amount, same as invoice_payments
+      mode: r.mode || 'bank', reference: r.reference || '', notes: r.notes || '',
+      apply_tds: !!toNum(r.tds_amount), tds_section: r.tds_section || '', tds_rate: r.tds_rate != null ? String(r.tds_rate) : '',
+      apply_tcs: !!toNum(r.tcs_amount), tcs_section: r.tcs_section || '', tcs_rate: r.tcs_rate != null ? String(r.tcs_rate) : '',
+    })
     setModalOpen(true)
   }
 
   // Only the expenses for the chosen entity+party can be settled here.
   const linkableExpenses = expenses.filter(e => e.entity_id === form.entity_id && e.party_id === form.party_id)
 
+  // CHANGED: selecting an expense to settle prefills the gross settle amount
+  // and auto-suggests TDS from that expense's category — the same suggestion
+  // that used to fire on the expense form itself, just triggered at the
+  // moment it should actually apply (payment time).
+  function selectExpense(id) {
+    const ex = linkableExpenses.find(e => e.id === id)
+    setForm(f => {
+      const next = { ...f, expense_id: id }
+      if (ex) {
+        next.basis = String(ex.total_amount || '')
+        const s = suggestTds(ex.category)
+        if (s && !f.tds_section && !f.tds_rate) { next.apply_tds = true; next.tds_section = s.section; next.tds_rate = String(s.rate) }
+      }
+      return next
+    })
+  }
+
+  const basisAmount = toNum(form.basis)
+  const tdsAmount   = form.apply_tds ? roundRupees(round2(basisAmount * (Number(form.tds_rate) || 0) / 100)) : 0
+  const tcsAmount   = form.apply_tcs ? roundRupees(round2(basisAmount * (Number(form.tcs_rate) || 0) / 100)) : 0
+  // CHANGED: same correctness rule as invoice_payments — TDS reduces what's
+  // actually paid (still "settles" the expense, withheld on the vendor's
+  // behalf); TCS is a separate collection on top, tracked in its own column,
+  // never folded into the persisted `amount`.
+  const cashAmount  = Math.max(0, roundRupees(basisAmount - tdsAmount))
+  const totalCashThisTranche = cashAmount + tcsAmount
+
   async function handleSave() {
     if (!form.entity_id || !form.party_id) return setToast({ message: 'Entity and party are required', type: 'error' })
-    const amount = roundRupees(toNum(form.amount))
-    if (!amount) return setToast({ message: 'Amount is required', type: 'error' })
+    if (!basisAmount) return setToast({ message: 'Settle amount is required', type: 'error' })
     setSaving(true)
     const fy = await resolveFY()
     const payload = {
       entity_id: form.entity_id, party_id: form.party_id,
       expense_id: form.expense_id || null, financial_year_id: fy?.id || null,
-      payment_date: form.payment_date, amount, mode: form.mode || null,
+      payment_date: form.payment_date, amount: cashAmount, mode: form.mode || null,
       reference: form.reference || null, notes: form.notes || null,
+      tds_section: form.apply_tds ? (form.tds_section || null) : null,
+      tds_rate: form.apply_tds ? (toNum(form.tds_rate) || 0) : 0,
+      tds_base_amount: form.apply_tds ? basisAmount : 0,
+      tds_amount: tdsAmount,
+      tcs_section: form.apply_tcs ? (form.tcs_section || null) : null,
+      tcs_rate: form.apply_tcs ? (toNum(form.tcs_rate) || 0) : 0,
+      tcs_base_amount: form.apply_tcs ? basisAmount : 0,
+      tcs_amount: tcsAmount,
     }
     const res = editing
       ? await supabase.from('party_payments').update(payload).eq('id', editing.id)
@@ -692,6 +688,9 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
     { label: 'Entity', render: r => <span style={{ fontSize: '12px' }}>{r.entity?.short_name || r.entity?.name || '—'}</span> },
     { label: 'Party',  render: r => <span style={{ fontSize: '12px', fontWeight: 600 }}>{r.party?.name || '—'}</span> },
     { label: 'Amount', right: true, render: r => <span style={{ fontWeight: 600 }}>{formatINR(r.amount)}</span> },
+    { label: 'TDS/TCS', right: true, render: r => (r.tds_amount || r.tcs_amount)
+        ? <span style={{ fontSize: '12px', color: C.textSoft }}>{r.tds_amount ? `TDS ${formatINR(r.tds_amount)}` : ''}{r.tds_amount && r.tcs_amount ? ' / ' : ''}{r.tcs_amount ? `TCS ${formatINR(r.tcs_amount)}` : ''}</span>
+        : <span style={{ color: C.textMuted }}>—</span> },
     { label: 'Mode',   render: r => <span style={{ fontSize: '12px', color: C.textSoft, textTransform: 'capitalize' }}>{r.mode || '—'}</span> },
     { label: 'Ref',    render: r => <span style={{ fontSize: '12px', color: C.textSoft }}>{r.reference || '—'}</span> },
     ...(canDelete ? [{ label: 'Actions', render: r => (
@@ -734,8 +733,8 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
             <FormRow label='Payment Date' required>
               <Input type='date' value={form.payment_date} onChange={e => setF('payment_date', e.target.value)} />
             </FormRow>
-            <FormRow label='Amount (₹)' required>
-              <Input type='number' value={form.amount} onChange={e => setF('amount', e.target.value)} placeholder='0' />
+            <FormRow label='Settle Amount (₹)' required hint='Gross amount before any TDS/TCS'>
+              <Input type='number' value={form.basis} onChange={e => setF('basis', e.target.value)} placeholder='0' />
             </FormRow>
             <FormRow label='Mode'>
               <Select value={form.mode} onChange={e => setF('mode', e.target.value)}>
@@ -750,14 +749,66 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
             </FormRow>
           </div>
           {form.entity_id && form.party_id && (
-            <FormRow label='Against Expense' hint={linkableExpenses.length === 0 ? 'No expenses for this entity + party' : 'Optional — settle a specific expense'}>
-              <Select value={form.expense_id} onChange={e => setF('expense_id', e.target.value)} disabled={linkableExpenses.length === 0}>
+            <FormRow label='Against Expense' hint={linkableExpenses.length === 0 ? 'No expenses for this entity + party' : 'Selecting one prefills the settle amount and suggests TDS from its category'}>
+              <Select value={form.expense_id} onChange={e => selectExpense(e.target.value)} disabled={linkableExpenses.length === 0}>
                 <option value=''>General / on account</option>
                 {linkableExpenses.map(ex => (
-                  <option key={ex.id} value={ex.id}>{ex.expense_no || ex.description} · {formatINR(ex.net_payable ?? ex.total_amount)}</option>
+                  <option key={ex.id} value={ex.id}>{ex.expense_no || ex.description} · {formatINR(ex.total_amount)}</option>
                 ))}
               </Select>
             </FormRow>
+          )}
+
+          {/* CHANGED: TDS/TCS decided here, at payment time — not on the expense form. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input type='checkbox' id='pp_apply_tds' checked={form.apply_tds} onChange={e => setF('apply_tds', e.target.checked)} style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+            <label htmlFor='pp_apply_tds' style={{ fontSize: '13px', fontWeight: 600, color: C.text, cursor: 'pointer' }}>Deduct TDS from this payment</label>
+          </div>
+          {form.apply_tds && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px' }}>
+              <FormRow label='TDS Section'><Input value={form.tds_section} onChange={e => setF('tds_section', e.target.value)} placeholder='e.g. 194C' /></FormRow>
+              <FormRow label='TDS Rate %'><Input type='number' step='0.01' value={form.tds_rate} onChange={e => setF('tds_rate', e.target.value)} /></FormRow>
+            </div>
+          )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input type='checkbox' id='pp_apply_tcs' checked={form.apply_tcs} onChange={e => setF('apply_tcs', e.target.checked)} style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+            <label htmlFor='pp_apply_tcs' style={{ fontSize: '13px', fontWeight: 600, color: C.text, cursor: 'pointer' }}>Collect TCS on this payment</label>
+          </div>
+          {form.apply_tcs && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px' }}>
+              <FormRow label='TCS Section'><Input value={form.tcs_section} onChange={e => setF('tcs_section', e.target.value)} placeholder='e.g. 206C' /></FormRow>
+              <FormRow label='TCS Rate %'><Input type='number' step='0.01' value={form.tcs_rate} onChange={e => setF('tcs_rate', e.target.value)} /></FormRow>
+            </div>
+          )}
+          {basisAmount > 0 && (
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px 14px', display: 'grid', gridTemplateColumns: `repeat(${tcsAmount > 0 ? 4 : 2},1fr)`, gap: '8px', fontSize: '13px' }}>
+              <div>
+                <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Settling</div>
+                <strong>{formatINR(basisAmount)}</strong>
+              </div>
+              {tdsAmount > 0 && (
+                <div>
+                  <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>TDS Deducted</div>
+                  <strong style={{ color: C.warning }}>− {formatINR(tdsAmount)}</strong>
+                </div>
+              )}
+              {tcsAmount > 0 && (
+                <div>
+                  <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>TCS Collected</div>
+                  <strong style={{ color: C.warning }}>+ {formatINR(tcsAmount)}</strong>
+                </div>
+              )}
+              <div>
+                <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>{tcsAmount > 0 ? 'Applied to Expense' : 'Amount to be Paid'}</div>
+                <strong style={{ color: C.success }}>{formatINR(cashAmount)}</strong>
+              </div>
+              {tcsAmount > 0 && (
+                <div>
+                  <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Total Cash This Tranche</div>
+                  <strong style={{ color: C.success }}>{formatINR(totalCashThisTranche)}</strong>
+                </div>
+              )}
+            </div>
           )}
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
@@ -775,50 +826,83 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
 }
 
 // ─── Summary tab ────────────────────────────────────────────────────────────────
-// Entity-wise expense summary. Reuses the already-loaded, RLS-scoped `expenses`
-// so a user only ever sees totals for entities they can access.
+// Entity-wise expense summary. `expenses` (booked, gross) is already loaded and
+// RLS-scoped by the parent; TDS/TCS and paid figures now live on party_payments
+// (payment-time, per the same decision made for invoices), so this tab fetches
+// its own copy — same self-contained pattern every Reports tab already uses.
 function ExpenseSummary({ expenses, parties, loading }) {
-  const partyName = Object.fromEntries((parties || []).map(p => [p.id, p.name]))
-  const netOf = e => (e.net_payable ?? e.total_amount) || 0
+  const [payments, setPayments]     = useState([])
+  const [payLoading, setPayLoading] = useState(true)
 
-  const byEntity = new Map()
+  useEffect(() => {
+    setPayLoading(true)
+    supabase.from('party_payments')
+      .select('id,entity_id,party_id,expense_id,amount,tds_amount,tcs_amount,payment_date,entity:entity_id(name,short_name)')
+      .eq('is_deleted', false)
+      .then(({ data }) => { setPayments(data || []); setPayLoading(false) })
+  }, [])
+
+  const partyName = Object.fromEntries((parties || []).map(p => [p.id, p.name]))
+
+  // Booked (gross) side — from expenses.
+  const byEntityBooked = new Map()
   const byCategory = new Map()
-  const byParty = new Map()
   for (const e of (expenses || [])) {
     const ek = e.entity?.short_name || e.entity?.name || '—'
-    const en = byEntity.get(ek) || { count: 0, taxable: 0, gst: 0, tds: 0, total: 0, net: 0 }
-    en.count++; en.taxable += e.amount || 0; en.gst += e.gst_amount || 0; en.tds += e.tds_amount || 0; en.total += e.total_amount || 0; en.net += netOf(e)
-    byEntity.set(ek, en)
+    const en = byEntityBooked.get(ek) || { count: 0, taxable: 0, gst: 0, total: 0 }
+    en.count++; en.taxable += e.amount || 0; en.gst += e.gst_amount || 0; en.total += e.total_amount || 0
+    byEntityBooked.set(ek, en)
 
     const ck = e.category || '—'
-    const cc = byCategory.get(ck) || { count: 0, total: 0, net: 0 }
-    cc.count++; cc.total += e.total_amount || 0; cc.net += netOf(e)
+    const cc = byCategory.get(ck) || { count: 0, total: 0 }
+    cc.count++; cc.total += e.total_amount || 0
     byCategory.set(ck, cc)
-
-    if (e.party_id) {
-      const pk = partyName[e.party_id] || '—'
-      const pp = byParty.get(pk) || { count: 0, total: 0, net: 0 }
-      pp.count++; pp.total += e.total_amount || 0; pp.net += netOf(e)
-      byParty.set(pk, pp)
-    }
   }
-  const entityRows = [...byEntity.entries()].sort((a, b) => b[1].total - a[1].total)
-  const catRows    = [...byCategory.entries()].sort((a, b) => b[1].total - a[1].total)
-  const partyRows  = [...byParty.entries()].sort((a, b) => b[1].total - a[1].total)
-  const grand = entityRows.reduce((s, [, v]) => ({ total: s.total + v.total, tds: s.tds + v.tds, net: s.net + v.net }), { total: 0, tds: 0, net: 0 })
+
+  // Paid / withheld side — from party_payments (payment-time TDS/TCS).
+  const byEntityPaid = new Map()
+  const byParty = new Map()
+  let totalPaid = 0, totalTds = 0
+  for (const p of payments) {
+    totalPaid += p.amount || 0
+    totalTds  += p.tds_amount || 0
+    const ek = p.entity?.short_name || p.entity?.name || '—'
+    const en = byEntityPaid.get(ek) || { paid: 0, tds: 0 }
+    en.paid += p.amount || 0; en.tds += p.tds_amount || 0
+    byEntityPaid.set(ek, en)
+
+    const pk = partyName[p.party_id] || '—'
+    const pp = byParty.get(pk) || { count: 0, paid: 0, tds: 0 }
+    pp.count++; pp.paid += p.amount || 0; pp.tds += p.tds_amount || 0
+    byParty.set(pk, pp)
+  }
+
+  const totalBooked  = (expenses || []).reduce((s, e) => s + (e.total_amount || 0), 0)
+  const outstanding  = totalBooked - totalPaid - totalTds
+
+  const entityKeys = new Set([...byEntityBooked.keys(), ...byEntityPaid.keys()])
+  const entityRows = [...entityKeys].map(k => {
+    const b = byEntityBooked.get(k) || { count: 0, taxable: 0, gst: 0, total: 0 }
+    const p = byEntityPaid.get(k) || { paid: 0, tds: 0 }
+    return [k, { ...b, paid: p.paid, tds: p.tds, outstanding: b.total - p.paid - p.tds }]
+  }).sort((a, b) => b[1].total - a[1].total)
+
+  const catRows   = [...byCategory.entries()].sort((a, b) => b[1].total - a[1].total)
+  const partyRows = [...byParty.entries()].sort((a, b) => b[1].paid - a[1].paid)
 
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
   const td = { padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }
 
-  if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
+  if (loading || payLoading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if ((expenses || []).length === 0) return <EmptyState icon='📊' title='No expenses to summarise' />
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px,1fr))', gap: '12px' }}>
-        <StatCard label='Total Expenses' value={formatINR(grand.total)} />
-        <StatCard label='TDS Withheld' value={formatINR(grand.tds)} color={grand.tds > 0 ? C.warning : C.textMuted} />
-        <StatCard label='Net Payable to Parties' value={formatINR(grand.net)} color={C.accent} />
+        <StatCard label='Total Expenses (booked)' value={formatINR(totalBooked)} />
+        <StatCard label='Total Paid' value={formatINR(totalPaid)} color={C.success} />
+        <StatCard label='TDS Withheld' value={formatINR(totalTds)} color={totalTds > 0 ? C.warning : C.textMuted} />
+        <StatCard label='Outstanding' value={formatINR(outstanding)} color={outstanding > 0 ? C.danger : C.success} />
       </div>
 
       <Card>
@@ -830,9 +914,10 @@ function ExpenseSummary({ expenses, parties, loading }) {
               <th style={{ ...th, textAlign: 'right' }}>Count</th>
               <th style={{ ...th, textAlign: 'right' }}>Taxable</th>
               <th style={{ ...th, textAlign: 'right' }}>GST</th>
+              <th style={{ ...th, textAlign: 'right' }}>Total (booked)</th>
+              <th style={{ ...th, textAlign: 'right' }}>Paid</th>
               <th style={{ ...th, textAlign: 'right' }}>TDS</th>
-              <th style={{ ...th, textAlign: 'right' }}>Total</th>
-              <th style={{ ...th, textAlign: 'right' }}>Net Payable</th>
+              <th style={{ ...th, textAlign: 'right' }}>Outstanding</th>
             </tr></thead>
             <tbody>
               {entityRows.map(([name, v], i) => (
@@ -841,9 +926,10 @@ function ExpenseSummary({ expenses, parties, loading }) {
                   <td style={{ ...td, textAlign: 'right' }}>{v.count}</td>
                   <td style={{ ...td, textAlign: 'right' }}>{formatINR(v.taxable)}</td>
                   <td style={{ ...td, textAlign: 'right' }}>{formatINR(v.gst)}</td>
-                  <td style={{ ...td, textAlign: 'right', color: v.tds > 0 ? C.warning : C.textMuted }}>{formatINR(v.tds)}</td>
                   <td style={{ ...td, textAlign: 'right' }}>{formatINR(v.total)}</td>
-                  <td style={{ ...td, textAlign: 'right', fontWeight: 700 }}>{formatINR(v.net)}</td>
+                  <td style={{ ...td, textAlign: 'right', color: C.success }}>{formatINR(v.paid)}</td>
+                  <td style={{ ...td, textAlign: 'right', color: v.tds > 0 ? C.warning : C.textMuted }}>{formatINR(v.tds)}</td>
+                  <td style={{ ...td, textAlign: 'right', fontWeight: 700, color: v.outstanding > 0 ? C.danger : C.success }}>{formatINR(v.outstanding)}</td>
                 </tr>
               ))}
             </tbody>
@@ -853,7 +939,7 @@ function ExpenseSummary({ expenses, parties, loading }) {
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px,1fr))', gap: '16px' }}>
         <Card>
-          <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>By Category</div>
+          <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>By Category (booked)</div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
               <thead><tr>
@@ -874,22 +960,24 @@ function ExpenseSummary({ expenses, parties, loading }) {
           </div>
         </Card>
         <Card>
-          <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>By Party</div>
+          <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>By Party (paid)</div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
               <thead><tr>
                 <th style={{ ...th, textAlign: 'left' }}>Party</th>
-                <th style={{ ...th, textAlign: 'right' }}>Count</th>
-                <th style={{ ...th, textAlign: 'right' }}>Net Payable</th>
+                <th style={{ ...th, textAlign: 'right' }}>Payments</th>
+                <th style={{ ...th, textAlign: 'right' }}>Paid</th>
+                <th style={{ ...th, textAlign: 'right' }}>TDS Withheld</th>
               </tr></thead>
               <tbody>
                 {partyRows.length === 0
-                  ? <tr><td colSpan={3} style={{ padding: '18px', textAlign: 'center', color: C.textMuted }}>No party-tagged expenses.</td></tr>
+                  ? <tr><td colSpan={4} style={{ padding: '18px', textAlign: 'center', color: C.textMuted }}>No payments recorded yet.</td></tr>
                   : partyRows.map(([name, v], i) => (
                     <tr key={name} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
                       <td style={{ ...td, fontWeight: 600 }}>{name}</td>
                       <td style={{ ...td, textAlign: 'right' }}>{v.count}</td>
-                      <td style={{ ...td, textAlign: 'right', fontWeight: 600 }}>{formatINR(v.net)}</td>
+                      <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: C.success }}>{formatINR(v.paid)}</td>
+                      <td style={{ ...td, textAlign: 'right', color: v.tds > 0 ? C.warning : C.textMuted }}>{formatINR(v.tds)}</td>
                     </tr>
                   ))}
               </tbody>
