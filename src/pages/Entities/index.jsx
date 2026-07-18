@@ -7,6 +7,7 @@ import {
 import { GST_STATES } from '../../constants/states'
 import { downloadTemplate } from '../../utils/csvTemplate'
 import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl } from '../../utils/drive'
+import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
 
 const ENTITY_TYPES = ['group', 'associate', 'external']
 const GST_UNITS    = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
@@ -139,6 +140,8 @@ export default function Entities() {
 
   async function handleSave() {
     if (!form.name.trim()) return setToast({ message: 'Name is required', type: 'error' })
+    if (!isValidGSTIN(form.gstin)) return setToast({ message: GSTIN_ERROR, type: 'error' })
+    if (!isValidPAN(form.pan)) return setToast({ message: PAN_ERROR, type: 'error' })
     setSaving(true)
     const payload = { ...form }
     if (!payload.group_id) delete payload.group_id
@@ -341,10 +344,10 @@ export default function Entities() {
 
           <SectionDivider label='Tax & Compliance' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='GSTIN'>
+            <FormRow label='GSTIN' error={!isValidGSTIN(form.gstin) ? GSTIN_ERROR : undefined}>
               <Input value={form.gstin} onChange={e => setF('gstin', e.target.value.toUpperCase())} placeholder='22AAAAA0000A1Z5' />
             </FormRow>
-            <FormRow label='PAN'>
+            <FormRow label='PAN' error={!isValidPAN(form.pan) ? PAN_ERROR : undefined}>
               <Input value={form.pan} onChange={e => setF('pan', e.target.value.toUpperCase())} placeholder='AAAAA0000A' />
             </FormRow>
             <FormRow label='State'>

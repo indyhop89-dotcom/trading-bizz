@@ -29,9 +29,17 @@ export function useEntityAccess() {
         if (!cancelled) setEntities(data || [])
       } else {
         const { data } = await supabase.from('user_entity_access')
-          .select('entity:entity_id(id,name,short_name,gstin,state_code,type)')
+          .select('expires_at, entity:entity_id(id,name,short_name,gstin,state_code,type)')
           .eq('user_id', profile.id)
-        const granted = (data || []).map(g => g.entity).filter(Boolean)
+        // CHANGED: an expired grant shouldn't show up as a pickable entity —
+        // has_entity_grant() (the actual RLS enforcement) filters the same
+        // way, this is just the matching client-side UX so an expired entity
+        // doesn't linger in a "from"/"seller" dropdown after it's already
+        // stopped working server-side.
+        const now = Date.now()
+        const granted = (data || [])
+          .filter(g => !g.expires_at || new Date(g.expires_at).getTime() > now)
+          .map(g => g.entity).filter(Boolean)
           .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
         if (!cancelled) setEntities(granted)
       }

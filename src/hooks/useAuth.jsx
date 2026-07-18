@@ -64,8 +64,16 @@ export function AuthProvider({ children }) {
     await supabase.auth.signOut()
   }
 
+  // CHANGED: re-fetches the caller's own profile row. `profile` is held once
+  // in this shared context, so calling this after a self-service edit (e.g.
+  // changing full_name) updates every consumer — Sidebar, Settings, etc. —
+  // immediately, no page reload needed.
+  async function refreshProfile() {
+    if (user) await fetchProfile(user.id)
+  }
+
   return (
-    <AuthContext.Provider value={{ user, profile, loading, authError, signIn, signInWithGoogle, signOut }}>
+    <AuthContext.Provider value={{ user, profile, loading, authError, signIn, signInWithGoogle, signOut, refreshProfile }}>
       {children}
     </AuthContext.Provider>
   )

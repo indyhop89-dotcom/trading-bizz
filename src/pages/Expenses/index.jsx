@@ -11,6 +11,7 @@ import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only dele
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces the unconfirmed next_exp_no RPC
+import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
 
 const GST_RATES = [0, 5, 12, 18, 28]
 
@@ -160,6 +161,8 @@ export default function Expenses() {
     if (!partyForm.name.trim()) return setToast({ message: 'Party name is required', type: 'error' })
     const days = partyForm.payment_days === '' ? null : parseInt(partyForm.payment_days, 10)
     if (days !== null && (isNaN(days) || days < 0)) return setToast({ message: 'Payment days must be a positive number', type: 'error' })
+    if (!isValidGSTIN(partyForm.gstin)) return setToast({ message: GSTIN_ERROR, type: 'error' })
+    if (!isValidPAN(partyForm.pan)) return setToast({ message: PAN_ERROR, type: 'error' })
     setSavingParty(true)
     const payload = {
       name: partyForm.name.trim(),
@@ -222,6 +225,7 @@ export default function Expenses() {
     if (!form.expense_type) return setToast({ message: 'Expense type is required', type: 'error' })
     const amount    = roundRupees(toNum(form.amount))
     if (!amount) return setToast({ message: 'Amount is required', type: 'error' })
+    if (!isValidGSTIN(form.vendor_gstin)) return setToast({ message: GSTIN_ERROR, type: 'error' })
     setSaving(true)
     const fy = await resolveFY()
     if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
@@ -473,8 +477,8 @@ export default function Expenses() {
                 <Input value={form.vendor_name} onChange={e => setF('vendor_name', e.target.value)} />
               </FormRow>
             )}
-            <FormRow label='Vendor GSTIN'>
-              <Input value={form.vendor_gstin} onChange={e => setF('vendor_gstin', e.target.value)} />
+            <FormRow label='Vendor GSTIN' error={!isValidGSTIN(form.vendor_gstin) ? GSTIN_ERROR : undefined}>
+              <Input value={form.vendor_gstin} onChange={e => setF('vendor_gstin', e.target.value.toUpperCase())} />
             </FormRow>
           </div>
           <SectionDivider label='Link to Order' />
@@ -542,8 +546,8 @@ export default function Expenses() {
             <Input value={partyForm.name} onChange={e => setPartyForm(f => ({ ...f, name: e.target.value }))} placeholder='Full legal / trade name' />
           </FormRow>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='GSTIN'><Input value={partyForm.gstin} onChange={e => setPartyForm(f => ({ ...f, gstin: e.target.value.toUpperCase() }))} placeholder='22AAAAA0000A1Z5' style={{ fontFamily: 'monospace' }} /></FormRow>
-            <FormRow label='PAN'><Input value={partyForm.pan} onChange={e => setPartyForm(f => ({ ...f, pan: e.target.value.toUpperCase() }))} placeholder='AAAAA0000A' style={{ fontFamily: 'monospace' }} /></FormRow>
+            <FormRow label='GSTIN' error={!isValidGSTIN(partyForm.gstin) ? GSTIN_ERROR : undefined}><Input value={partyForm.gstin} onChange={e => setPartyForm(f => ({ ...f, gstin: e.target.value.toUpperCase() }))} placeholder='22AAAAA0000A1Z5' style={{ fontFamily: 'monospace' }} /></FormRow>
+            <FormRow label='PAN' error={!isValidPAN(partyForm.pan) ? PAN_ERROR : undefined}><Input value={partyForm.pan} onChange={e => setPartyForm(f => ({ ...f, pan: e.target.value.toUpperCase() }))} placeholder='AAAAA0000A' style={{ fontFamily: 'monospace' }} /></FormRow>
             <FormRow label='Phone'><Input value={partyForm.phone} onChange={e => setPartyForm(f => ({ ...f, phone: e.target.value }))} /></FormRow>
             <FormRow label='Payment Days' hint='Days to due date'><Input type='number' value={partyForm.payment_days} onChange={e => setPartyForm(f => ({ ...f, payment_days: e.target.value }))} placeholder='e.g. 30' /></FormRow>
           </div>

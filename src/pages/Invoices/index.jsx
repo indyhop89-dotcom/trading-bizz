@@ -22,6 +22,7 @@ import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedin
 import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
 import { getDriveViewUrl } from '../../utils/drive'
+import { isValidEwayBill, EWAY_BILL_ERROR } from '../../utils/validation'
 
 // Fetches its own full entity rows (address/bank/logo columns) by id rather
 // than relying on the page's own load() query to embed them — this keeps
@@ -702,6 +703,7 @@ function NewInvoice() {
   async function handleSave(skipStockCheck = false) {
     if (!form.seller_entity_id || !form.buyer_entity_id) return setToast({ message: 'Seller and Buyer are required', type: 'error' })
     if (lines.length === 0) return setToast({ message: 'At least one line item is required', type: 'error' })
+    if (!isValidEwayBill(form.eway_bill_no)) return setToast({ message: EWAY_BILL_ERROR, type: 'error' })
 
     // CHANGED: every stock-affecting line must carry a product_id — otherwise
     // it's invisible to Actual Stock / Stock Position. Hard block.
@@ -907,7 +909,7 @@ function NewInvoice() {
             <FormRow label='Ship To'>
               <Input value={form.ship_to} onChange={e => setF('ship_to', e.target.value)} placeholder='Delivery location' />
             </FormRow>
-            <FormRow label='E-way Bill No'>
+            <FormRow label='E-way Bill No' error={!isValidEwayBill(form.eway_bill_no) ? EWAY_BILL_ERROR : undefined}>
               <Input value={form.eway_bill_no} onChange={e => setF('eway_bill_no', e.target.value)} placeholder='EWB number' />
             </FormRow>
             <FormRow label='E-way Bill Date' hint='Can differ from invoice date'>
@@ -1058,6 +1060,7 @@ function InvoiceDetail() {
     setEwbEdit(true)
   }
   async function saveEwbForm() {
+    if (!isValidEwayBill(ewbForm.eway_bill_no)) return setToast({ message: EWAY_BILL_ERROR, type: 'error' })
     setSectSaving(true)
     const wasEwaySet = !!inv.eway_bill_no
     const { error } = await supabase.from('invoices').update({
@@ -1233,7 +1236,7 @@ function InvoiceDetail() {
               </div>
             )}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-              <FormRow label='EWB Number'>
+              <FormRow label='EWB Number' error={!isValidEwayBill(ewbForm.eway_bill_no) ? EWAY_BILL_ERROR : undefined}>
                 <Input value={ewbForm.eway_bill_no} onChange={e => setEwbForm(f => ({...f, eway_bill_no: e.target.value}))} placeholder='e.g. 421234567890' />
               </FormRow>
               <FormRow label='EWB Date'>

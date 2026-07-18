@@ -10,6 +10,7 @@ import { formatSlabSummary } from '../../utils/hsn'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
+import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
 
 // REBUILT — this file was found to contain a copy of the Invoices module
 // (src/pages/Invoices/index.jsx) instead of Settings, which is why /settings
@@ -18,7 +19,56 @@ import { hasFullAccess } from '../../utils/roles'
 // existing hsn_master CSV template format already defined in csvTemplate.js.
 // If a better version turns up in git history, prefer that over this file.
 
-const TABS = ['Financial Years', 'Entity Groups', 'HSN Master', 'Parties', 'Users']
+const TABS = ['My Profile', 'Financial Years', 'Entity Groups', 'HSN Master', 'Parties', 'Users']
+
+// ─── My Profile Tab ─────────────────────────────────────────────────────────────
+// Self-service name/phone editing, available to every role (master included) —
+// RLS already permits a user to update their own profiles row
+// (profiles_update: is_super_admin() OR id = auth.uid()); this is just the
+// missing UI for it. Deliberately scoped to full_name/phone only — role,
+// is_active, and entity grants stay admin-managed (Users tab).
+function MyProfile() {
+  const { profile, refreshProfile } = useAuth()
+  const [fullName, setFullName] = useState('')
+  const [phone, setPhone]       = useState('')
+  const [saving, setSaving]     = useState(false)
+  const [toast, setToast]       = useState(null)
+
+  useEffect(() => {
+    if (profile) { setFullName(profile.full_name || ''); setPhone(profile.phone || '') }
+  }, [profile])
+
+  async function handleSave() {
+    if (!fullName.trim()) return setToast({ message: 'Name is required', type: 'error' })
+    setSaving(true)
+    const { error } = await supabase.from('profiles')
+      .update({ full_name: fullName.trim(), phone: phone.trim() || null, updated_at: new Date() })
+      .eq('id', profile.id)
+    setSaving(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    await refreshProfile()
+    setToast({ message: 'Profile updated', type: 'success' })
+  }
+
+  return (
+    <div style={{ maxWidth: '420px' }}>
+      <Card style={{ padding: '20px' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <FormRow label='Full Name' required>
+            <Input value={fullName} onChange={e => setFullName(e.target.value)} placeholder='Your full name' />
+          </FormRow>
+          <FormRow label='Email'><Input value={profile?.email || ''} disabled /></FormRow>
+          <FormRow label='Phone'><Input value={phone} onChange={e => setPhone(e.target.value)} placeholder='Optional' /></FormRow>
+          <FormRow label='Role' hint='Managed by your administrator'><Input value={profile?.role || ''} disabled /></FormRow>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>
+          </div>
+        </div>
+      </Card>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  )
+}
 
 // ─── Financial Years Tab ───────────────────────────────────────────────────────
 const EMPTY_FY = { name: '', code: '', start_date: '', end_date: '', is_active: false }
@@ -606,17 +656,21 @@ function Users() {
   const [rows, setRows]         = useState([])
   const [entities, setEntities] = useState([])
   const [accessMap, setAccessMap] = useState({}) // user_id -> [entity_id, ...]
+  // CHANGED: separate, additive map for time-bound access — kept apart from
+  // accessMap so grantableEntities/entityLabel/column rendering (all built on
+  // accessMap's array shape) don't need to change at all.
+  const [accessExpiryMap, setAccessExpiryMap] = useState({}) // user_id -> {entity_id: expires_at | null}
   const [loading, setLoading]   = useState(true)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing]   = useState(null)
-  const [form, setForm]         = useState({ role: 'entity_user', is_active: true, entityIds: [] })
+  const [form, setForm]         = useState({ role: 'entity_user', is_active: true, entityIds: [], expiryByEntity: {} })
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
 
   // New-user modal state — separate from the edit modal above since the
   // fields (email, password) and the save path (Edge Function vs. direct
   // table update) are different.
-  const EMPTY_NEW_USER = { full_name: '', email: '', role: 'entity_user', entityIds: [], password: '' }
+  const EMPTY_NEW_USER = { full_name: '', email: '', role: 'entity_user', entityIds: [], expiryByEntity: {}, password: '' }
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [newUser, setNewUser]   = useState(EMPTY_NEW_USER)
   const [adding, setAdding]     = useState(false)
@@ -634,16 +688,20 @@ function Users() {
     const [{ data: profiles }, { data: es }, { data: access }] = await Promise.all([
       supabase.from('profiles').select('*').order('full_name'),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('user_entity_access').select('user_id, entity_id'),
+      supabase.from('user_entity_access').select('user_id, entity_id, expires_at'),
     ])
     setRows(profiles || [])
     setEntities(es || [])
     const map = {}
+    const expiryMap = {}
     for (const a of (access || [])) {
       if (!map[a.user_id]) map[a.user_id] = []
       map[a.user_id].push(a.entity_id)
+      if (!expiryMap[a.user_id]) expiryMap[a.user_id] = {}
+      expiryMap[a.user_id][a.entity_id] = a.expires_at
     }
     setAccessMap(map)
+    setAccessExpiryMap(expiryMap)
     setLoading(false)
   }, [])
 
@@ -651,12 +709,28 @@ function Users() {
 
   function openEdit(r) {
     setEditing(r)
-    setForm({ role: r.role || 'entity_user', is_active: r.is_active !== false, entityIds: accessMap[r.id] || [] })
+    // Prefill each granted entity's expiry as a plain YYYY-MM-DD for the date
+    // input; a still-permanent (null expires_at) entity is simply absent here.
+    const expiryByEntity = {}
+    for (const [entityId, expiresAt] of Object.entries(accessExpiryMap[r.id] || {})) {
+      if (expiresAt) expiryByEntity[entityId] = expiresAt.slice(0, 10)
+    }
+    setForm({ role: r.role || 'entity_user', is_active: r.is_active !== false, entityIds: accessMap[r.id] || [], expiryByEntity })
     setModalOpen(true)
   }
 
   function toggleEntity(id) {
     setForm(f => ({ ...f, entityIds: f.entityIds.includes(id) ? f.entityIds.filter(x => x !== id) : [...f.entityIds, id] }))
+  }
+
+  // CHANGED: optional per-entity expiry — blank means permanent (unchanged
+  // behavior). Stored as end-of-day so access holds through the chosen date.
+  function setExpiry(entityId, dateStr) {
+    setForm(f => {
+      const next = { ...f.expiryByEntity }
+      if (dateStr) next[entityId] = dateStr; else delete next[entityId]
+      return { ...f, expiryByEntity: next }
+    })
   }
 
   async function handleSave() {
@@ -673,7 +747,12 @@ function Users() {
     if (delErr) { setSaving(false); return setToast({ message: `Role saved, but entity access failed: ${delErr.message}`, type: 'error' }) }
     if (form.entityIds.length > 0) {
       const { error: insErr } = await supabase.from('user_entity_access').insert(
-        form.entityIds.map(entity_id => ({ user_id: editing.id, entity_id, access_level: 'full' }))
+        form.entityIds.map(entity_id => ({
+          user_id: editing.id, entity_id, access_level: 'full',
+          // CHANGED: optional time-bound access — end of the chosen day, or
+          // permanent (null) if no expiry was set for this entity.
+          expires_at: form.expiryByEntity[entity_id] ? `${form.expiryByEntity[entity_id]}T23:59:59` : null,
+        }))
       )
       if (insErr) { setSaving(false); return setToast({ message: `Role saved, but entity access failed: ${insErr.message}`, type: 'error' }) }
     }
@@ -712,12 +791,21 @@ function Users() {
   }
 
   function openAddUser() {
-    setNewUser({ full_name: '', email: '', role: 'entity_user', entityIds: [], password: '' })
+    setNewUser(EMPTY_NEW_USER)
     setAddModalOpen(true)
   }
 
   function toggleNewUserEntity(id) {
     setNewUser(f => ({ ...f, entityIds: f.entityIds.includes(id) ? f.entityIds.filter(x => x !== id) : [...f.entityIds, id] }))
+  }
+
+  // CHANGED: optional per-entity expiry for a brand-new user, same idea as setExpiry() above.
+  function setNewUserExpiry(entityId, dateStr) {
+    setNewUser(f => {
+      const next = { ...f.expiryByEntity }
+      if (dateStr) next[entityId] = dateStr; else delete next[entityId]
+      return { ...f, expiryByEntity: next }
+    })
   }
 
   async function handleAddUser() {
@@ -728,12 +816,19 @@ function Users() {
       return setToast({ message: 'Select at least one entity for this role', type: 'error' })
     }
     setAdding(true)
+    // CHANGED: entity_expiries is optional and additive — omitting an entity
+    // id from it (or the whole field) means permanent access, same as before.
+    const entity_expiries = {}
+    for (const [entityId, dateStr] of Object.entries(newUser.expiryByEntity)) {
+      if (dateStr) entity_expiries[entityId] = `${dateStr}T23:59:59`
+    }
     const { data, error } = await supabase.functions.invoke('create-user', {
       body: {
         full_name: newUser.full_name.trim(),
         email: newUser.email.trim(),
         role: newUser.role,
         entity_ids: newUser.entityIds,
+        entity_expiries,
         password: newUser.password.trim() || undefined,
       },
     })
@@ -821,12 +916,22 @@ function Users() {
               border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 12px',
               opacity: newUser.role === 'master' ? 0.5 : 1, pointerEvents: newUser.role === 'master' ? 'none' : 'auto',
             }}>
-              {grantableEntities.map(ent => (
-                <label key={ent.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer' }}>
-                  <input type='checkbox' checked={newUser.entityIds.includes(ent.id)} onChange={() => toggleNewUserEntity(ent.id)} style={{ width: '14px', height: '14px' }} />
-                  {ent.short_name || ent.name}
-                </label>
-              ))}
+              {grantableEntities.map(ent => {
+                const checked = newUser.entityIds.includes(ent.id)
+                return (
+                  <div key={ent.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer', flex: 1 }}>
+                      <input type='checkbox' checked={checked} onChange={() => toggleNewUserEntity(ent.id)} style={{ width: '14px', height: '14px' }} />
+                      {ent.short_name || ent.name}
+                    </label>
+                    {checked && (
+                      <input type='date' value={newUser.expiryByEntity[ent.id] || ''} onChange={e => setNewUserExpiry(ent.id, e.target.value)}
+                        title='Access expires end of this day (blank = permanent)'
+                        style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                    )}
+                  </div>
+                )
+              })}
               {grantableEntities.length === 0 && (
                 <span style={{ fontSize: '12px', color: C.textMuted }}>
                   {iAmAdmin ? 'You have no entity access yourself to grant from.' : 'No active entities found.'}
@@ -862,12 +967,23 @@ function Users() {
               border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 12px',
               opacity: form.role === 'master' ? 0.5 : 1, pointerEvents: form.role === 'master' ? 'none' : 'auto',
             }}>
-              {entities.map(ent => (
-                <label key={ent.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer' }}>
-                  <input type='checkbox' checked={form.entityIds.includes(ent.id)} onChange={() => toggleEntity(ent.id)} style={{ width: '14px', height: '14px' }} />
-                  {ent.short_name || ent.name}
-                </label>
-              ))}
+              {entities.map(ent => {
+                const checked = form.entityIds.includes(ent.id)
+                return (
+                  <div key={ent.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer', flex: 1 }}>
+                      <input type='checkbox' checked={checked} onChange={() => toggleEntity(ent.id)} style={{ width: '14px', height: '14px' }} />
+                      {ent.short_name || ent.name}
+                    </label>
+                    {/* CHANGED: optional per-entity expiry — blank = permanent access, unchanged from today's behavior */}
+                    {checked && (
+                      <input type='date' value={form.expiryByEntity[ent.id] || ''} onChange={e => setExpiry(ent.id, e.target.value)}
+                        title='Access expires end of this day (blank = permanent)'
+                        style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                    )}
+                  </div>
+                )
+              })}
               {entities.length === 0 && <span style={{ fontSize: '12px', color: C.textMuted }}>No active entities found.</span>}
             </div>
           </FormRow>
@@ -940,6 +1056,8 @@ function Parties() {
     if (!form.name.trim()) return setToast({ message: 'Name is required', type: 'error' })
     const days = form.payment_days === '' ? null : parseInt(form.payment_days, 10)
     if (days !== null && (isNaN(days) || days < 0)) return setToast({ message: 'Payment days must be a positive number', type: 'error' })
+    if (!isValidGSTIN(form.gstin)) return setToast({ message: GSTIN_ERROR, type: 'error' })
+    if (!isValidPAN(form.pan)) return setToast({ message: PAN_ERROR, type: 'error' })
     setSaving(true)
     const payload = {
       name: form.name.trim(),
@@ -1019,8 +1137,8 @@ function Parties() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <FormRow label='Name' required><Input value={form.name} onChange={e => setF('name', e.target.value)} placeholder='Full legal / trade name' /></FormRow>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-            <FormRow label='GSTIN'><Input value={form.gstin} onChange={e => setF('gstin', e.target.value.toUpperCase())} placeholder='22AAAAA0000A1Z5' style={{ fontFamily: 'monospace' }} /></FormRow>
-            <FormRow label='PAN'><Input value={form.pan} onChange={e => setF('pan', e.target.value.toUpperCase())} placeholder='AAAAA0000A' style={{ fontFamily: 'monospace' }} /></FormRow>
+            <FormRow label='GSTIN' error={!isValidGSTIN(form.gstin) ? GSTIN_ERROR : undefined}><Input value={form.gstin} onChange={e => setF('gstin', e.target.value.toUpperCase())} placeholder='22AAAAA0000A1Z5' style={{ fontFamily: 'monospace' }} /></FormRow>
+            <FormRow label='PAN' error={!isValidPAN(form.pan) ? PAN_ERROR : undefined}><Input value={form.pan} onChange={e => setF('pan', e.target.value.toUpperCase())} placeholder='AAAAA0000A' style={{ fontFamily: 'monospace' }} /></FormRow>
             <FormRow label='Contact Person'><Input value={form.contact_person} onChange={e => setF('contact_person', e.target.value)} /></FormRow>
             <FormRow label='Phone'><Input value={form.phone} onChange={e => setF('phone', e.target.value)} /></FormRow>
             <FormRow label='Email'><Input type='email' value={form.email} onChange={e => setF('email', e.target.value)} /></FormRow>
@@ -1068,6 +1186,7 @@ export default function Settings() {
           }}>{t}</button>
         ))}
       </div>
+      {tab === 'My Profile'      && <MyProfile />}
       {tab === 'Financial Years' && <FinancialYears />}
       {tab === 'Entity Groups'   && <EntityGroups />}
       {tab === 'HSN Master'      && <HsnMaster />}
