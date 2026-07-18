@@ -278,6 +278,8 @@ function HsnMaster() {
   const [historyFor, setHistoryFor]     = useState(null) // hsn_code currently shown, or null
   const [historyRows, setHistoryRows]   = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [openActionsFor, setOpenActionsFor] = useState(null) // CHANGED: row id whose Actions menu is open
+  const [confirmHardDelete, setConfirmHardDelete] = useState(null) // CHANGED: real delete, distinct from Deactivate
 
   // Only the current (open-ended) version of each code shows in the main
   // table — past versions are versioned history, viewed via "History".
@@ -345,11 +347,30 @@ function HsnMaster() {
     load()
   }
 
+  // CHANGED: this now toggles both ways — Deactivate (is_active=false) for an
+  // active entry, or Reactivate (is_active=true) for one already inactive —
+  // so the same confirm flow serves the "Reactivate" menu item too.
   async function handleDelete() {
     if (!confirmDelete) return
-    const { error } = await supabase.from('hsn_master').update({ is_active: false }).eq('id', confirmDelete.id)
+    const { error } = await supabase.from('hsn_master').update({ is_active: !confirmDelete.is_active }).eq('id', confirmDelete.id)
     if (error) setToast({ message: error.message, type: 'error' })
     setConfirmDelete(null)
+    load()
+  }
+
+  // CHANGED: real delete — removes this rate version permanently, unlike
+  // Deactivate (is_active=false) which just hides it from dropdowns while
+  // keeping the row so historical documents on old dates still resolve
+  // against it. No FK references hsn_master.id (documents store hsn_code as
+  // text via buildHSNMap), so this is safe at the DB level; the warning in
+  // the confirm dialog covers the app-level risk of removing the only
+  // currently-open version for a code.
+  async function handleHardDelete() {
+    if (!confirmHardDelete) return
+    const { error } = await supabase.from('hsn_master').delete().eq('id', confirmHardDelete.id)
+    if (error) { setToast({ message: error.message, type: 'error' }); return }
+    setConfirmHardDelete(null)
+    setToast({ message: 'HSN entry deleted', type: 'success' })
     load()
   }
 
@@ -403,11 +424,39 @@ function HsnMaster() {
         : <span style={{ fontSize: '11px' }}>{formatSlabSummary(r.slabs)}</span> },
     { label: 'Status',     render: r => <Badge status={r.is_active ? 'active' : 'cancelled'} label={r.is_active ? 'Active' : 'Inactive'} /> },
     { label: 'Effective From', render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{fmtDate(r.effective_from)}</span> },
+    // CHANGED: consolidated into a single Actions dropdown (New Version,
+    // History, Deactivate/Reactivate, Delete) instead of four separate buttons.
     { label: 'Actions', render: r => (
-      <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
-        <Btn size='sm' variant='ghost' onClick={() => openEdit(r)}>New Version</Btn>
-        <Btn size='sm' variant='ghost' onClick={() => openHistory(r.hsn_code)}>History</Btn>
-        <Btn size='sm' variant='ghost' onClick={() => setConfirmDelete(r)} style={{ color: C.danger }}>Deactivate</Btn>
+      <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
+        <Btn size='sm' variant='ghost' onClick={() => setOpenActionsFor(id => id === r.id ? null : r.id)}>Actions ▾</Btn>
+        {openActionsFor === r.id && (
+          <>
+            <div style={{ position: 'fixed', inset: 0, zIndex: 10 }} onClick={() => setOpenActionsFor(null)} />
+            <div style={{
+              position: 'absolute', right: 0, top: '100%', marginTop: '4px', zIndex: 11,
+              background: C.surface, border: `1px solid ${C.border}`, borderRadius: '6px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.12)', minWidth: '160px', overflow: 'hidden',
+            }}>
+              {[
+                { label: 'New Version', onClick: () => openEdit(r) },
+                { label: 'History', onClick: () => openHistory(r.hsn_code) },
+                { label: r.is_active ? 'Deactivate' : 'Reactivate', onClick: () => setConfirmDelete(r), danger: r.is_active },
+                { label: 'Delete', onClick: () => setConfirmHardDelete(r), danger: true },
+              ].map(item => (
+                <button key={item.label} onClick={() => { item.onClick(); setOpenActionsFor(null) }}
+                  style={{
+                    display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px',
+                    border: 'none', background: 'none', cursor: 'pointer', fontFamily: 'inherit',
+                    fontSize: '13px', color: item.danger ? C.danger : C.text,
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.background = C.bg}
+                  onMouseLeave={e => e.currentTarget.style.background = 'none'}>
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </div>
     )},
   ]
@@ -521,7 +570,15 @@ function HsnMaster() {
       </Modal>
 
       <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
-        title='Deactivate HSN Entry' message={`Deactivate "${confirmDelete?.hsn_code}"?`} danger />
+        title={confirmDelete?.is_active ? 'Deactivate HSN Entry' : 'Reactivate HSN Entry'}
+        message={confirmDelete?.is_active
+          ? `Deactivate "${confirmDelete?.hsn_code}"? It stays visible in History and old documents still resolve against it — it just won't show in dropdowns for new ones.`
+          : `Reactivate "${confirmDelete?.hsn_code}"? It'll show in dropdowns again.`}
+        danger={confirmDelete?.is_active} />
+      {/* CHANGED: real delete — permanently removes this rate version, unlike Deactivate above. */}
+      <ConfirmModal open={!!confirmHardDelete} onClose={() => setConfirmHardDelete(null)} onConfirm={handleHardDelete}
+        title='Delete HSN Entry' danger
+        message={`Permanently delete "${confirmHardDelete?.hsn_code}"${confirmHardDelete?.effective_to === null ? ' — this is its current rate version' : ''}? This cannot be undone. If any document still needs this rate on its own date, use Deactivate instead.`} />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
