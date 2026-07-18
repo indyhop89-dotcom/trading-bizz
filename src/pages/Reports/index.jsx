@@ -8,12 +8,12 @@ import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchStockMovementData, buildActualStockMap } from '../../utils/stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
 
-// CHANGED: GST Summary and TDS/TCS Report are grouped under a "Compliance"
-// section in the tab bar; everything else stays in the unlabeled group.
-const TAB_GROUPS = [
-  { label: 'Compliance', tabs: ['GST Summary', 'TDS/TCS Report'] },
-  { label: null, tabs: ['P&L', 'Party Ledger', 'Ledger', 'Profitability', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing'] },
-]
+// CHANGED: "Compliance" is one tab in the main row, sitting next to Party
+// Ledger. Selecting it reveals a second-level sub-tab row for its two
+// reports (GST Summary, TDS/TCS Report) rather than splitting the main row
+// into groups.
+const TABS = ['P&L', 'Party Ledger', 'Compliance', 'Ledger', 'Profitability', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing']
+const COMPLIANCE_TABS = ['GST Summary', 'TDS/TCS Report']
 
 // 'YYYY-MM' → 'Jul 2026' for the month-wise GST table
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -1210,6 +1210,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
 // ─── Reports Shell ────────────────────────────────────────────────────────────
 export default function Reports() {
   const [tab, setTab]           = useState('P&L')
+  const [complianceTab, setComplianceTab] = useState('GST Summary') // CHANGED: sub-tab within Compliance
   // CHANGED: master sees every entity same as before; everyone else only
   // sees entities they've been granted — no point offering an entity picker
   // full of entities whose reports RLS would return empty for anyway.
@@ -1229,34 +1230,44 @@ export default function Reports() {
         <p style={{ fontSize: '13px', color: C.textMuted, margin: '4px 0 0' }}>Financial and operational reports</p>
       </div>
 
-      {/* CHANGED: tabs are grouped — Compliance (GST Summary, TDS/TCS Report)
-          first, then the rest, unlabeled — instead of one flat row. */}
-      {TAB_GROUPS.map((group, gi) => (
-        <div key={gi} style={{ marginBottom: gi === TAB_GROUPS.length - 1 ? '24px' : '8px' }}>
-          {group.label && (
-            <div style={{ fontSize: '10px', fontWeight: 700, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>{group.label}</div>
-          )}
-          <div style={{ display: 'flex', gap: '4px', borderBottom: `2px solid ${C.border}`, paddingBottom: '0' }}>
-            {group.tabs.map(t => (
-              <button key={t} onClick={() => setTab(t)}
-                style={{
-                  padding: '8px 20px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-                  fontWeight: tab === t ? 700 : 500, fontSize: '13px',
-                  color: tab === t ? C.text : C.textSoft,
-                  background: 'transparent',
-                  borderBottom: tab === t ? `2px solid ${C.accent}` : '2px solid transparent',
-                  marginBottom: '-2px', transition: 'all 0.15s',
-                }}>
-                {t}
-              </button>
-            ))}
-          </div>
+      {/* Tabs */}
+      <div style={{ display: 'flex', gap: '4px', marginBottom: tab === 'Compliance' ? '0' : '24px', borderBottom: `2px solid ${C.border}`, paddingBottom: '0' }}>
+        {TABS.map(t => (
+          <button key={t} onClick={() => setTab(t)}
+            style={{
+              padding: '8px 20px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
+              fontWeight: tab === t ? 700 : 500, fontSize: '13px',
+              color: tab === t ? C.text : C.textSoft,
+              background: 'transparent',
+              borderBottom: tab === t ? `2px solid ${C.accent}` : '2px solid transparent',
+              marginBottom: '-2px', transition: 'all 0.15s',
+            }}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {/* CHANGED: Compliance sub-tabs — shown only when Compliance is active */}
+      {tab === 'Compliance' && (
+        <div style={{ display: 'flex', gap: '4px', marginBottom: '24px', borderBottom: `1px solid ${C.border}`, paddingBottom: '0' }}>
+          {COMPLIANCE_TABS.map(t => (
+            <button key={t} onClick={() => setComplianceTab(t)}
+              style={{
+                padding: '6px 16px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
+                fontWeight: complianceTab === t ? 700 : 500, fontSize: '12px',
+                color: complianceTab === t ? C.accent : C.textSoft,
+                background: complianceTab === t ? C.bg : 'transparent',
+                borderRadius: '6px 6px 0 0', transition: 'all 0.15s',
+              }}>
+              {t}
+            </button>
+          ))}
         </div>
-      ))}
+      )}
 
       {tab === 'P&L'         && <PLReport entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
-      {tab === 'GST Summary' && <GSTSummary entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
-      {tab === 'TDS/TCS Report' && <TdsTcsReport entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
+      {tab === 'Compliance' && complianceTab === 'GST Summary' && <GSTSummary entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
+      {tab === 'Compliance' && complianceTab === 'TDS/TCS Report' && <TdsTcsReport entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Party Ledger' && <PartyLedger entities={entities} parties={parties} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Ledger'      && <Ledger entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Profitability' && <ProfitabilityReport entities={entities} fys={fys} />}
