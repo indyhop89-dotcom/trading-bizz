@@ -918,16 +918,28 @@ function Users() {
             }}>
               {grantableEntities.map(ent => {
                 const checked = newUser.entityIds.includes(ent.id)
+                const hasExpiry = !!newUser.expiryByEntity[ent.id]
                 return (
                   <div key={ent.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer', flex: 1 }}>
                       <input type='checkbox' checked={checked} onChange={() => toggleNewUserEntity(ent.id)} style={{ width: '14px', height: '14px' }} />
                       {ent.short_name || ent.name}
                     </label>
-                    {checked && (
-                      <input type='date' value={newUser.expiryByEntity[ent.id] || ''} onChange={e => setNewUserExpiry(ent.id, e.target.value)}
-                        title='Access expires end of this day (blank = permanent)'
-                        style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                    {/* CHANGED: permanent by default (unchanged) — expiry is an
+                        explicit opt-in per entity, never shown or required unless
+                        "+ Temporary" is clicked. */}
+                    {checked && (hasExpiry
+                      ? <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <input type='date' value={newUser.expiryByEntity[ent.id]} onChange={e => setNewUserExpiry(ent.id, e.target.value)}
+                            title='Access expires end of this day'
+                            style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                          <button type='button' onClick={() => setNewUserExpiry(ent.id, '')} title='Make permanent'
+                            style={{ background: 'none', border: 'none', color: C.textMuted, cursor: 'pointer', fontSize: '13px', padding: '0 2px' }}>×</button>
+                        </div>
+                      : <button type='button' onClick={() => setNewUserExpiry(ent.id, today())}
+                          style={{ background: 'none', border: 'none', color: C.accent, fontSize: '11px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+                          + Temporary
+                        </button>
                     )}
                   </div>
                 )
@@ -969,17 +981,28 @@ function Users() {
             }}>
               {entities.map(ent => {
                 const checked = form.entityIds.includes(ent.id)
+                const hasExpiry = !!form.expiryByEntity[ent.id]
                 return (
                   <div key={ent.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer', flex: 1 }}>
                       <input type='checkbox' checked={checked} onChange={() => toggleEntity(ent.id)} style={{ width: '14px', height: '14px' }} />
                       {ent.short_name || ent.name}
                     </label>
-                    {/* CHANGED: optional per-entity expiry — blank = permanent access, unchanged from today's behavior */}
-                    {checked && (
-                      <input type='date' value={form.expiryByEntity[ent.id] || ''} onChange={e => setExpiry(ent.id, e.target.value)}
-                        title='Access expires end of this day (blank = permanent)'
-                        style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                    {/* CHANGED: permanent by default (unchanged) — expiry is an
+                        explicit opt-in per entity, never shown or required unless
+                        "+ Temporary" is clicked. */}
+                    {checked && (hasExpiry
+                      ? <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <input type='date' value={form.expiryByEntity[ent.id]} onChange={e => setExpiry(ent.id, e.target.value)}
+                            title='Access expires end of this day'
+                            style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                          <button type='button' onClick={() => setExpiry(ent.id, '')} title='Make permanent'
+                            style={{ background: 'none', border: 'none', color: C.textMuted, cursor: 'pointer', fontSize: '13px', padding: '0 2px' }}>×</button>
+                        </div>
+                      : <button type='button' onClick={() => setExpiry(ent.id, today())}
+                          style={{ background: 'none', border: 'none', color: C.accent, fontSize: '11px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+                          + Temporary
+                        </button>
                     )}
                   </div>
                 )
