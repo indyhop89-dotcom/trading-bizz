@@ -8,6 +8,7 @@ import { formatINR, toNum, roundRupees, round2 } from '../../utils/money'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces the unconfirmed next_exp_no RPC
 
 const GST_RATES     = [0, 5, 12, 18, 28]
@@ -31,6 +32,9 @@ export default function Expenses() {
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
   const canDelete = profile?.role === 'master'
+  // CHANGED: expenses_write is gated on has_entity_grant(entity_id) — an
+  // expense belongs to one entity, no counterparty to worry about.
+  const { entities: accessEntities, frozen: entityFrozen, defaultEntityId } = useEntityAccess()
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
@@ -180,7 +184,7 @@ export default function Expenses() {
   return (
     <div>
       <PageHeader title='Expenses' subtitle='All costs associated with orders and entities'
-        action={<Btn onClick={() => { setForm(EMPTY); setModalOpen(true) }}>+ New Expense</Btn>}
+        action={<Btn onClick={() => { setForm({ ...EMPTY, entity_id: defaultEntityId }); setModalOpen(true) }}>+ New Expense</Btn>}
       />
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px,1fr))', gap: '12px', marginBottom: '20px' }}>
@@ -223,10 +227,10 @@ export default function Expenses() {
             <FormRow label='Date' required>
               <Input type='date' value={form.expense_date} onChange={e => setF('expense_date', e.target.value)} />
             </FormRow>
-            <FormRow label='Entity' required>
-              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)}>
+            <FormRow label='Entity' required hint={entityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)} disabled={entityFrozen}>
                 <option value=''>Select entity</option>
-                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Expense Type' required>

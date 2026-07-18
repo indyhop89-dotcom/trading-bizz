@@ -10,6 +10,7 @@ import { downloadCSV } from '../../utils/csvTemplate'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -570,6 +571,9 @@ function BDList() {
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
   const canDelete = profile?.role === 'master'
+  // CHANGED: bde_write is gated on has_entity_grant(entity_id) — a bill
+  // discounting event belongs to one entity, no counterparty.
+  const { entities: accessEntities, frozen: entityFrozen, defaultEntityId } = useEntityAccess()
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
@@ -784,7 +788,7 @@ function BDList() {
           <input ref={csvRef} type='file' accept='.csv' style={{display:'none'}} onChange={handleImport}/>
           <Btn variant='ghost' onClick={handleExport}>↓ Export CSV</Btn>
           <Btn variant='ghost' onClick={()=>setView('banks')}>🏦 Banks</Btn>
-          <Btn onClick={()=>{setForm(EMPTY);setSelInv([]);setModal(true)}}>+ New Event</Btn>
+          <Btn onClick={()=>{setForm({...EMPTY,entity_id:defaultEntityId});setSelInv([]);setModal(true)}}>+ New Event</Btn>
         </div>}
       />
 
@@ -795,7 +799,7 @@ function BDList() {
         ))}
       </div>
 
-      {tab==='dashboard'&&(loading?<div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>:<BDDashboard events={events} banks={banks} onNewEvent={()=>{setForm(EMPTY);setSelInv([]);setModal(true)}}/>)}
+      {tab==='dashboard'&&(loading?<div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>:<BDDashboard events={events} banks={banks} onNewEvent={()=>{setForm({...EMPTY,entity_id:defaultEntityId});setSelInv([]);setModal(true)}}/>)}
 
       {tab==='events'&&(
         <>
@@ -855,10 +859,10 @@ function BDList() {
       <Modal open={modal} onClose={()=>setModal(false)} title='New Bill Discounting Event' width={700}>
         <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
-            <FormRow label='Entity' required>
-              <Select value={form.entity_id||''} onChange={e=>setF('entity_id',e.target.value)}>
+            <FormRow label='Entity' required hint={entityFrozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.entity_id||''} onChange={e=>setF('entity_id',e.target.value)} disabled={entityFrozen}>
                 <option value=''>Select entity…</option>
-                {entities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}
+                {accessEntities.map(e=><option key={e.id} value={e.id}>{e.short_name||e.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Bank / Financier' required>

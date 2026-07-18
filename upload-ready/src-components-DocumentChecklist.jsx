@@ -11,6 +11,7 @@ const DOMESTIC_DOCS = [
   { slot: 'invoice',      label: 'Invoice' },
   { slot: 'packing_list', label: 'Packing List' },
   { slot: 'pi',           label: 'PI (Proforma Invoice)' },
+  { slot: 'po',           label: 'PO (Purchase Order)' },
   { slot: 'eway_bill',    label: 'E-way Bill' },
   { slot: 'einvoice',     label: 'E-invoice' },
   { slot: 'lr',           label: 'LR (Lorry Receipt)' },
@@ -376,12 +377,17 @@ export default function DocumentChecklist({
       ) : (
         <>
           {/* ── Checklist rows ── */}
+          {/* CHANGED: N/A docs sink to the bottom of the list, keeping the
+              still-actionable (Pending/Uploaded) rows together at the top. */}
           <div>
-            {docList.map((doc, i) => {
+            {[...docList]
+              .sort((a, b) => (dbToDisplay(rowFor(a.slot)?.status) === 'N/A') - (dbToDisplay(rowFor(b.slot)?.status) === 'N/A'))
+              .map((doc, i, sorted) => {
               const row = rowFor(doc.slot)
               const status = dbToDisplay(row?.status)
               const isUploading = uploading === doc.slot
               const linkedDoc = row?.document   // joined document record
+              const isNA = status === 'N/A'
 
               return (
                 <div
@@ -389,8 +395,9 @@ export default function DocumentChecklist({
                   style={{
                     display: 'flex', alignItems: 'center', gap: '10px',
                     padding: '9px 14px',
-                    borderBottom: i < docList.length - 1 ? `1px solid #f0e8d8` : 'none',
+                    borderBottom: i < sorted.length - 1 ? `1px solid #f0e8d8` : 'none',
                     background: i % 2 === 0 ? C.surface : '#faf6ed',
+                    opacity: isNA ? 0.6 : 1,
                   }}
                 >
                   {/* Doc label */}
@@ -468,7 +475,7 @@ export default function DocumentChecklist({
                       </>
                     )}
 
-                    {!readOnly && (
+                    {!readOnly && !isNA && (
                       <>
                         <button
                           onClick={() => fileRefs.current[doc.slot]?.click()}

@@ -7,12 +7,12 @@ import {
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
-import { formatINR, toNum } from '../../utils/money'
+import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
 import { withTimeout } from '../../utils/query'
-import { cleanProductName, productMatchKey } from '../../utils/products'
+import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
@@ -151,9 +151,9 @@ function POList() {
     setLinesLoading(true)
     try {
       const { data: piLines, error } = await withTimeout(
-        supabase.from('proforma_invoice_lines')
+        fetchAllPages(() => supabase.from('proforma_invoice_lines')
           .select('product_id,description,hsn_code,qty,unit,rate,gst_rate,line_no')
-          .eq('pi_id', piId).order('line_no'),
+          .eq('pi_id', piId).order('line_no')),
         20000, 'Loading PI line items',
       )
       if (error) { setToast({ message: `Could not load PI lines: ${error.message}`, type: 'error' }); return }
@@ -180,6 +180,19 @@ function POList() {
     } finally {
       setLinesLoading(false)
     }
+  }
+
+  // Picking an Order Leg (without manually touching Linked PI) should behave
+  // the same as picking the PI directly — find the PI already tied to that
+  // leg and pull its lines in. Otherwise users who go Order → Leg first (the
+  // natural order when creating a PO against an existing order) never see
+  // their line items auto-load, since Linked PI silently stays unset even
+  // though a matching PI exists (confirmed against real data: PI order_leg_id
+  // does get set once a PI is tied to a leg).
+  function handleLegSelect(legId) {
+    if (!legId || form.pi_id) return
+    const pi = pis.find(p => p.order_leg_id === legId)
+    if (pi) handlePISelect(pi.id)
   }
 
   async function loadLegs(orderId) {
@@ -279,10 +292,21 @@ function POList() {
     const allRows = Object.values(groups).flatMap(g => g.lines)
     const missingKeys = new Set()
     const missingRows = []
+    const nearMatchNotes = []
     for (const r of allRows) {
       if (!r.product?.trim()) continue
       const k = rowMatchKey(r)
       if (productMap.has(k) || missingKeys.has(k)) continue
+      // CHANGED: before treating this as a genuinely new product, check for
+      // an existing one with the same name+HSN+GST at a near-identical rate
+      // (see findNearMatchProduct) — reuse it instead of creating a phantom
+      // duplicate that silently starts at zero stock.
+      const near = findNearMatchProduct(products, { name: r.product, hsn_code: r.hsn_code, rate: r.rate, gst_rate: r.gst_rate })
+      if (near) {
+        productMap.set(k, near)
+        nearMatchNotes.push(`${r.product} @ ₹${r.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
+        continue
+      }
       missingKeys.add(k); missingRows.push(r)
     }
     if (missingRows.length > 0) {
@@ -333,21 +357,26 @@ function POList() {
         const product = r.product?.trim() ? findProduct(r) : null
         if (r.product?.trim() && !product) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
         if (!r.product?.trim()) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
-        const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
+        const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = round2(qty * rate)
         const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
-        const igst = interstate ? Math.round(taxable * gstRate / 100) : 0
-        const cgst = !interstate ? Math.round(taxable * half / 100) : 0
-        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
+        const igst = interstate ? round2(taxable * gstRate / 100) : 0
+        const cgst = !interstate ? round2(taxable * half / 100) : 0
+        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: round2(taxable+igst+cgst+cgst) }
       })
       if (lineErr) continue
-      const totals = poLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
+      const rawTotals = poLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount, total_qty: acc.total_qty+l.qty }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0,total_qty:0 })
+      // Round off to the nearest whole rupee at the header level only — see
+      // computeTotals() in LineItemsEditor.jsx for why.
+      const poPreciseSubtotal = round2(rawTotals.taxable_amount + rawTotals.cgst_amount + rawTotals.sgst_amount + rawTotals.igst_amount)
+      const poFinalTotal = roundRupees(poPreciseSubtotal)
+      const totals = { ...rawTotals, taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount), sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount), total_amount: poFinalTotal, round_off_amount: round2(poFinalTotal - poPreciseSubtotal) }
       const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, ...totals }).select().single()
       if (poErr) { errors.push(`PO ${meta.po_date}: ${poErr.message}`); continue }
       const { error: lineInsertErr } = await supabase.from('purchase_order_lines').insert(poLines.map(l => ({ ...l, po_id: po.id })))
       if (lineInsertErr) { errors.push(`PO ${poNo}: header created but line items failed to save: ${lineInsertErr.message}`); continue }
       created++
     }
-    setCsvSaving(false); setCsvResult({ created, errors }); load()
+    setCsvSaving(false); setCsvResult({ created, errors, nearMatchNotes }); load()
   }
 
   function handleExportCSV() {
@@ -398,6 +427,7 @@ function POList() {
     { label: 'Seller',  render: p => <span style={{ fontSize: '12px' }}>{p.seller?.short_name || p.seller?.name}</span> },
     { label: 'Date',    render: p => <span style={{ fontSize: '12px' }}>{fmtDate(p.po_date)}</span> },
     { label: 'Delivery',render: p => <span style={{ fontSize: '12px', color: C.textSoft }}>{p.delivery_date ? fmtDate(p.delivery_date) : '—'}</span> },
+    { label: 'Qty', right: true, render: p => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{p.total_qty || '—'}</span> },
     { label: 'Amount',  right: true, render: p => <span style={{ fontWeight: 600 }}>{formatINR(p.total_amount)}</span> },
     { label: 'Status',  render: p => <Badge status={p.status} /> },
   ]
@@ -469,6 +499,14 @@ function POList() {
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>{csvResult.created} POs created.</strong>
+              {csvResult.nearMatchNotes?.length > 0 && (
+                <details style={{ marginTop: '6px' }}>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.nearMatchNotes.length} row{csvResult.nearMatchNotes.length === 1 ? '' : 's'} matched to an existing product at a near-identical rate (no duplicate created)</summary>
+                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.nearMatchNotes.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
+                  </div>
+                </details>
+              )}
               {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
             </div>
           )}
@@ -536,7 +574,7 @@ function POList() {
               </Select>
             </FormRow>
             <FormRow label='Order Leg'>
-              <Select value={form.order_leg_id} onChange={e => setF('order_leg_id', e.target.value)} disabled={!form.order_id}>
+              <Select value={form.order_leg_id} onChange={e => { setF('order_leg_id', e.target.value); handleLegSelect(e.target.value) }} disabled={!form.order_id}>
                 <option value=''>Select leg</option>
                 {legs.map(l => <option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name || l.from_entity?.name} → {l.to_entity?.short_name || l.to_entity?.name}</option>)}
               </Select>
@@ -583,7 +621,11 @@ function PODetail() {
       supabase.from('purchase_orders')
         .select('*, buyer:buyer_entity_id(name,short_name,gstin,city), seller:seller_entity_id(name,short_name,gstin,city), orders(name)')
         .eq('id', id).single(),
-      supabase.from('purchase_order_lines').select('*').eq('po_id', id).order('line_no'),
+      // CHANGED: a plain .select() caps at PostgREST's default 1000-row
+      // response — a PO with more line items than that silently lost the
+      // rest, undercounting totals here vs the DB-side total_qty/total_amount
+      // columns (recomputed directly in Postgres, no REST cap). Same fix as PI.
+      fetchAllPages(() => supabase.from('purchase_order_lines').select('*').eq('po_id', id).order('line_no')),
     ])
     setPO(p)
     setLines(ls || [])

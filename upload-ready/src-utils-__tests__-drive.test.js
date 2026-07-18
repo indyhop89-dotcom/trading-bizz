@@ -118,16 +118,40 @@ describe('fileIcon', () => {
 // ─── getDriveViewUrl / getDriveDownloadUrl ──────────────────────────────────
 
 describe('getDriveViewUrl / getDriveDownloadUrl', () => {
-  it('getDriveViewUrl returns the driveUrl as-is', () => {
-    expect(getDriveViewUrl('file-1', 'https://example.com/f1')).toBe('https://example.com/f1')
+  beforeEach(() => {
+    global.URL.createObjectURL = vi.fn(() => 'blob:mock-url')
   })
 
-  it('getDriveDownloadUrl returns the driveUrl as-is', () => {
-    expect(getDriveDownloadUrl('file-1', 'https://example.com/f1')).toBe('https://example.com/f1')
+  it('getDriveViewUrl fetches the file with an auth header and returns a blob URL', async () => {
+    mockSession('tok-1')
+    global.fetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(new Blob(['x'])) })
+
+    const url = await getDriveViewUrl('file-1', 'https://example.com/f1')
+
+    expect(url).toBe('blob:mock-url')
+    const [fetchUrl, opts] = global.fetch.mock.calls[0]
+    expect(fetchUrl).toContain('file-1')
+    expect(opts.headers.Authorization).toBe('Bearer tok-1')
   })
 
-  it('getDriveViewUrl returns undefined when driveUrl is not provided', () => {
-    expect(getDriveViewUrl('file-1', undefined)).toBeUndefined()
+  it('getDriveDownloadUrl fetches the file with an auth header and returns a blob URL', async () => {
+    mockSession('tok-2')
+    global.fetch.mockResolvedValue({ ok: true, blob: () => Promise.resolve(new Blob(['x'])) })
+
+    const url = await getDriveDownloadUrl('file-1', 'https://example.com/f1')
+
+    expect(url).toBe('blob:mock-url')
+    expect(global.fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer tok-2')
+  })
+
+  it('getDriveViewUrl rejects when driveFileId is not provided', async () => {
+    await expect(getDriveViewUrl(undefined, 'https://example.com/f1')).rejects.toThrow('No file to open')
+  })
+
+  it('getDriveViewUrl rejects when the fetch fails', async () => {
+    mockSession()
+    global.fetch.mockResolvedValue({ ok: false })
+    await expect(getDriveViewUrl('file-1')).rejects.toThrow('Could not load file')
   })
 })
 

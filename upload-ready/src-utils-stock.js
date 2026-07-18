@@ -15,14 +15,21 @@ export async function fetchStockMovementData() {
   // CHANGED: both tables can exceed PostgREST's default 1000-row response
   // cap — a plain .select() silently truncates rather than erroring, which
   // undercounts opening/actual stock once either table grows past 1000 rows.
-  const [{ data: opening }, { data: invLines }] = await Promise.all([
+  const [{ data: opening }, { data: invLines }, { data: adjustments }] = await Promise.all([
     fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_id, qty')),
     fetchAllPages(() => supabase.from('invoice_lines')
-      .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, invoice_type)')
+      .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, invoice_type, is_deleted)')
       .not('invoice', 'is', null)),
+    // CHANGED: manual corrections (shortfall/damage/found/recount) — a signed
+    // qty_delta applied straight into actual_qty, same as opening/invoice
+    // movements. Unlike invoice lines these have no lifecycle gate (no
+    // draft/cancelled/E-way state to check) since an adjustment row only
+    // exists once someone has actually recorded the correction.
+    fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_id, qty_delta')),
   ])
   return {
     opening: opening || [],
+    adjustments: adjustments || [],
     // CHANGED: goods only count as physically moved once an E-way Bill has
     // actually been entered on the invoice — raising or submitting an
     // invoice alone doesn't move stock, dispatch does. Because this whole
@@ -39,6 +46,7 @@ export async function fetchStockMovementData() {
     // would double the qty on both sides.
     invLines: (invLines || []).filter(l =>
       l.invoice &&
+      !l.invoice.is_deleted &&
       !MOVEMENT_STATUSES_EXCLUDED.includes(l.invoice.status) &&
       !!l.invoice.eway_bill_no &&
       l.invoice.invoice_type !== 'purchase'
@@ -46,13 +54,13 @@ export async function fetchStockMovementData() {
   }
 }
 
-// Builds { "entityId__productId": { entity_id, product_id, opening_qty, invoiced_in, invoiced_out, actual_qty } }
-// actual_qty = opening + goods invoiced in (as buyer) - goods invoiced out (as seller)
-export function buildActualStockMap({ opening, invLines }) {
+// Builds { "entityId__productId": { entity_id, product_id, opening_qty, invoiced_in, invoiced_out, adjustment_qty, actual_qty } }
+// actual_qty = opening + goods invoiced in (as buyer) - goods invoiced out (as seller) + manual adjustments
+export function buildActualStockMap({ opening, invLines, adjustments = [] }) {
   const map = {}
   function ensure(entityId, productId) {
     const key = `${entityId}__${productId}`
-    if (!map[key]) map[key] = { entity_id: entityId, product_id: productId, opening_qty: 0, invoiced_in: 0, invoiced_out: 0 }
+    if (!map[key]) map[key] = { entity_id: entityId, product_id: productId, opening_qty: 0, invoiced_in: 0, invoiced_out: 0, adjustment_qty: 0 }
     return map[key]
   }
   for (const ob of opening) {
@@ -63,8 +71,11 @@ export function buildActualStockMap({ opening, invLines }) {
     ensure(line.invoice.seller_entity_id, line.product_id).invoiced_out += qty
     ensure(line.invoice.buyer_entity_id, line.product_id).invoiced_in   += qty
   }
+  for (const adj of adjustments) {
+    ensure(adj.entity_id, adj.product_id).adjustment_qty += toNum(adj.qty_delta)
+  }
   for (const row of Object.values(map)) {
-    row.actual_qty = row.opening_qty + row.invoiced_in - row.invoiced_out
+    row.actual_qty = row.opening_qty + row.invoiced_in - row.invoiced_out + row.adjustment_qty
   }
   return map
 }

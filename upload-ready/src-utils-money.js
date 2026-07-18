@@ -3,22 +3,27 @@
  *
  * Rules:
  *  - Store: numeric(15,2) in Postgres — e.g. 1250.00
- *  - Calculate: intermediate 2dp, final values rounded to whole rupee
- *  - Display: Indian comma format, no decimal places — ₹1,250 not ₹1,250.00
+ *  - Calculate: round to 2dp at every step (line taxable/tax amounts, then
+ *    header totals) — never collapse to a whole rupee mid-calculation.
+ *    Summing many already-2dp line amounts in JS floating point can leave a
+ *    tiny residue (e.g. 8784284.829999999), so the one "final adjustment" is
+ *    a last round2() pass on the summed header total — not a re-round to a
+ *    whole rupee.
+ *  - Display: Indian comma format, 2 decimal places — ₹1,250.00
  */
 
 /**
  * Format a rupee amount for display.
- * 1250     → "₹1,250"
- * 1250.60  → "₹1,251"   (rounds to whole rupee)
- * 0        → "₹0"
+ * 1250     → "₹1,250.00"
+ * 1250.6   → "₹1,250.60"
+ * 0        → "₹0.00"
  * null/''  → "—"
  */
 export function formatINR(amount) {
   if (amount === null || amount === undefined || amount === '') return '—'
-  const n = Math.round(Number(amount))
+  const n = Number(amount)
   if (isNaN(n)) return '—'
-  return '₹' + n.toLocaleString('en-IN')
+  return '₹' + n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 /**

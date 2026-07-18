@@ -22,7 +22,10 @@ function makeQuery(data, error = null) {
     lt:     vi.fn().mockReturnThis(),
     lte:    vi.fn().mockReturnThis(),
     gte:    vi.fn().mockReturnThis(),
+    neq:    vi.fn().mockReturnThis(),
+    in:     vi.fn().mockReturnThis(),
     not:    vi.fn().mockReturnThis(),
+    range:  vi.fn().mockReturnThis(),
     insert: vi.fn().mockResolvedValue({ data: null, error: null }),
     then:   resolved.then.bind(resolved),
     catch:  resolved.catch.bind(resolved),
@@ -63,7 +66,13 @@ describe('generateNotifications — queries correct tables', () => {
     mockAllEmpty()
   })
 
-  it('queries invoice_payments', async () => {
+  it('queries invoice_payments when there is an invoice with a due date', async () => {
+    // invoice_payments is only queried once there's at least one invoice with
+    // a due_date to check tranches against (see invIds.length > 0 guard).
+    mockFrom.mockImplementation((table) => {
+      if (table === 'invoices') return makeQuery([{ id: 'inv-1', invoice_no: 'INV-1', total_amount: 1000, due_date: '2000-01-01', buyer_entity_id: null }])
+      return makeQuery([])
+    })
     await generateNotifications('user-1')
     expect(mockFrom.mock.calls.map(c => c[0])).toContain('invoice_payments')
   })
@@ -73,9 +82,9 @@ describe('generateNotifications — queries correct tables', () => {
     expect(mockFrom.mock.calls.map(c => c[0])).toContain('expense_payments')
   })
 
-  it('queries bill_discounting', async () => {
+  it('queries bill_discounting_events', async () => {
     await generateNotifications('user-1')
-    expect(mockFrom.mock.calls.map(c => c[0])).toContain('bill_discounting')
+    expect(mockFrom.mock.calls.map(c => c[0])).toContain('bill_discounting_events')
   })
 
   it('does NOT query notifications table when no notifications are built', async () => {
@@ -95,6 +104,7 @@ describe('generateNotifications — triggers dedupe query when notifs exist', ()
 
     let invCallCount = 0
     mockFrom.mockImplementation((table) => {
+      if (table === 'invoices') return makeQuery([{ id: 'inv-id-001', invoice_no: 'INV-001', total_amount: 5000, due_date: '2000-01-01', buyer_entity_id: null }])
       if (table === 'invoice_payments') {
         invCallCount++
         // 1st call = overdue (has data), 2nd call = due soon (empty)

@@ -15,26 +15,43 @@ export function computeLine(line, interstate) {
   const tax     = calcLineTax(taxable, line.gst_rate, interstate)
   return {
     ...line,
-    taxable_amount: roundRupees(taxable),
+    taxable_amount: taxable,
     ...tax,
-    total_amount: roundRupees(taxable) + tax.total_tax,
+    total_amount: round2(taxable + tax.total_tax),
   }
 }
 
 export function computeTotals(lines) {
-  return lines.reduce((acc, l) => ({
+  const sum = lines.reduce((acc, l) => ({
     taxable_amount: acc.taxable_amount + (Number(l.taxable_amount) || 0),
     cgst_amount:    acc.cgst_amount    + (Number(l.cgst_amount)    || 0),
     sgst_amount:    acc.sgst_amount    + (Number(l.sgst_amount)    || 0),
     igst_amount:    acc.igst_amount    + (Number(l.igst_amount)    || 0),
-    total_amount:   acc.total_amount   + (Number(l.total_amount)   || 0),
-  }), { taxable_amount: 0, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 0 })
+    total_qty:      acc.total_qty      + (Number(l.qty)            || 0),
+  }), { taxable_amount: 0, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_qty: 0 })
+  // Lines are each already 2dp, but summing many of them in JS floating point
+  // can leave a tiny residue (e.g. 8784284.829999999) — round2() cleans that
+  // up. Rounding off to a whole rupee happens exactly once, here, on the
+  // final invoice/PI/PO total (GST Rule 46) — never per line.
+  const taxable_amount = round2(sum.taxable_amount)
+  const cgst_amount    = round2(sum.cgst_amount)
+  const sgst_amount    = round2(sum.sgst_amount)
+  const igst_amount    = round2(sum.igst_amount)
+  const subtotal       = round2(taxable_amount + cgst_amount + sgst_amount + igst_amount)
+  const total_amount   = roundRupees(subtotal)
+  const round_off_amount = round2(total_amount - subtotal)
+  // NOTE: `subtotal` is deliberately not included below — this object gets
+  // spread directly into PI/PO/Invoice insert/update payloads, and none of
+  // those tables have a `subtotal` column (only total_amount/round_off_amount
+  // do). TotalsBar derives it back as total_amount - round_off_amount.
+  return { taxable_amount, cgst_amount, sgst_amount, igst_amount, round_off_amount, total_amount, total_qty: sum.total_qty }
 }
 
 function TotalsBar({ totals, interstate }) {
   if (!totals || totals.total_amount === 0) return null
   return (
     <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 18px', minWidth: '260px' }}>
+      <TotRow label='Total Qty' val={totals.total_qty} />
       <TotRow label='Taxable Amount' val={formatINR(totals.taxable_amount)} />
       {interstate
         ? <TotRow label='IGST' val={formatINR(totals.igst_amount)} />
@@ -43,8 +60,10 @@ function TotalsBar({ totals, interstate }) {
             <TotRow label='SGST' val={formatINR(totals.sgst_amount)} />
           </>
       }
+      <TotRow label='Total' val={formatINR(totals.total_amount - totals.round_off_amount)} />
+      <TotRow label='Round Off' val={formatINR(totals.round_off_amount)} />
       <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '15px', color: C.text, paddingTop: '6px', marginTop: '4px', borderTop: `1px solid ${C.border}` }}>
-        <span>Total</span>
+        <span>Final Amount</span>
         <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatINR(totals.total_amount)}</span>
       </div>
     </div>

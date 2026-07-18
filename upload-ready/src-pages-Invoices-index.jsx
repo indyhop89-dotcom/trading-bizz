@@ -7,12 +7,12 @@ import {
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
-import { formatINR, toNum } from '../../utils/money'
+import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap } from '../../utils/hsn'
 import { withTimeout } from '../../utils/query'
-import { cleanProductName, productMatchKey } from '../../utils/products'
+import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
@@ -217,10 +217,21 @@ function InvoiceList() {
     const allRows = Object.values(groups).flatMap(g => g.lines)
     const missingKeys = new Set()
     const missingRows = []
+    const nearMatchNotes = []
     for (const r of allRows) {
       if (!r.product?.trim()) continue
       const k = rowMatchKey(r)
       if (productMap.has(k) || missingKeys.has(k)) continue
+      // CHANGED: before treating this as a genuinely new product, check for
+      // an existing one with the same name+HSN+GST at a near-identical rate
+      // (see findNearMatchProduct) — reuse it instead of creating a phantom
+      // duplicate that silently starts at zero stock.
+      const near = findNearMatchProduct(products, { name: r.product, hsn_code: r.hsn_code, rate: r.rate, gst_rate: r.gst_rate })
+      if (near) {
+        productMap.set(k, near)
+        nearMatchNotes.push(`${r.product} @ ₹${r.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
+        continue
+      }
       missingKeys.add(k); missingRows.push(r)
     }
     if (missingRows.length > 0) {
@@ -272,21 +283,26 @@ function InvoiceList() {
         const product = r.product?.trim() ? findProduct(r) : null
         if (r.product?.trim() && !product) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
         if (!r.product?.trim()) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
-        const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = Math.round(qty * rate)
+        const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = round2(qty * rate)
         const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
-        const igst = interstate ? Math.round(taxable * gstRate / 100) : 0
-        const cgst = !interstate ? Math.round(taxable * half / 100) : 0
-        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: taxable+igst+cgst+cgst }
+        const igst = interstate ? round2(taxable * gstRate / 100) : 0
+        const cgst = !interstate ? round2(taxable * half / 100) : 0
+        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: round2(taxable+igst+cgst+cgst) }
       })
       if (lineErr) continue
-      const totals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0 })
+      const rawTotals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount, total_qty: acc.total_qty+l.qty }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0,total_qty:0 })
+      // Round off to the nearest whole rupee at the header level only — see
+      // computeTotals() in LineItemsEditor.jsx for why.
+      const invPreciseSubtotal = round2(rawTotals.taxable_amount + rawTotals.cgst_amount + rawTotals.sgst_amount + rawTotals.igst_amount)
+      const invFinalTotal = roundRupees(invPreciseSubtotal)
+      const totals = { ...rawTotals, taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount), sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount), total_amount: invFinalTotal, round_off_amount: round2(invFinalTotal - invPreciseSubtotal) }
       const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
       if (invErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: ${invErr.message}`); continue }
       const { error: invLineErr } = await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
       if (invLineErr) { errors.push(`Invoice ${invoiceNo}: header created but line items failed to save: ${invLineErr.message}`); continue }
       created++
     }
-    setCsvSaving(false); setCsvResult({ created, errors }); load()
+    setCsvSaving(false); setCsvResult({ created, errors, nearMatchNotes }); load()
   }
 
   function handleExportCSV() {
@@ -342,6 +358,7 @@ function InvoiceList() {
       const overdue = new Date(i.due_date) < new Date() && i.status !== 'paid'
       return <span style={{ fontSize: '12px', color: overdue ? C.danger : C.text, fontWeight: overdue ? 700 : 400 }}>{fmtDate(i.due_date)}{overdue ? ' ⚠️' : ''}</span>
     }},
+    { label: 'Qty', right: true, render: i => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{i.total_qty || '—'}</span> },
     { label: 'Amount',  right: true, render: i => <span style={{ fontWeight: 600 }}>{formatINR(i.total_amount)}</span> },
     { label: 'Outstanding', right: true, render: i => <span style={{ fontWeight: 600, color: i.outstanding_amount > 0 ? C.warning : C.success }}>{formatINR(i.outstanding_amount)}</span> },
     { label: 'Status',  render: i => <Badge status={i.status} /> },
@@ -436,6 +453,14 @@ function InvoiceList() {
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>{csvResult.created} invoices created.</strong>
+              {csvResult.nearMatchNotes?.length > 0 && (
+                <details style={{ marginTop: '6px' }}>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.nearMatchNotes.length} row{csvResult.nearMatchNotes.length === 1 ? '' : 's'} matched to an existing product at a near-identical rate (no duplicate created)</summary>
+                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.nearMatchNotes.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
+                  </div>
+                </details>
+              )}
               {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
             </div>
           )}
@@ -464,6 +489,11 @@ function NewInvoice() {
   const [orders, setOrders]     = useState([])
   const [pis, setPIs]           = useState([])
   const [pos, setPOs]           = useState([])
+  // Which PI/PO ids already have a (non-deleted) invoice raised against them —
+  // used to hide them from the Linked PI/PO dropdowns so the same PI/PO can't
+  // be invoiced twice by accident.
+  const [usedPiIds, setUsedPiIds] = useState(new Set())
+  const [usedPoIds, setUsedPoIds] = useState(new Set())
   const [legs, setLegs]         = useState([])
   const [lines, setLines]       = useState([])
   const [hsnMap, setHsnMap]     = useState(new Map())
@@ -501,13 +531,16 @@ function NewInvoice() {
       supabase.from('purchase_orders').select('id,po_no,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name')),
-    ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }, { data: prods }]) => {
+      fetchAllPages(() => supabase.from('invoices').select('pi_id,po_id').eq('is_deleted', false)),
+    ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }, { data: prods }, { data: invRefs }]) => {
       setEntities(es || [])
       setOrders(os || [])
       setPIs(piData || [])
       setPOs(poData || [])
       setHsnMap(buildHSNMap(hsnRows || []))
       setProducts(prods || [])
+      setUsedPiIds(new Set((invRefs || []).map(r => r.pi_id).filter(Boolean)))
+      setUsedPoIds(new Set((invRefs || []).map(r => r.po_id).filter(Boolean)))
     })
   }, [])
 
@@ -519,7 +552,9 @@ function NewInvoice() {
     setF('seller_entity_id', pi.from_entity_id)
     setF('buyer_entity_id',  pi.to_entity_id)
     // Load PI lines
-    supabase.from('proforma_invoice_lines').select('*').eq('pi_id', fromPiId).order('line_no').then(({ data }) => {
+    // CHANGED: same 1000-row REST cap as elsewhere — a source PI with more
+    // lines than that would otherwise convert to an invoice missing the rest.
+    fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id', fromPiId).order('line_no')).then(({ data }) => {
       if (data) setLines(data.map(l => ({ ...l, _id: l.id })))
     })
   }, [fromPiId, pis])
@@ -580,9 +615,9 @@ function NewInvoice() {
     setLinesLoading(true)
     try {
       const { data: piLines, error } = await withTimeout(
-        supabase.from('proforma_invoice_lines')
+        fetchAllPages(() => supabase.from('proforma_invoice_lines')
           .select('product_id,description,hsn_code,qty,unit,rate,gst_rate,line_no')
-          .eq('pi_id', piId).order('line_no'),
+          .eq('pi_id', piId).order('line_no')),
         20000, 'Loading PI line items',
       )
       if (error) { setToast({ message: `Could not load PI lines: ${error.message}`, type: 'error' }); return }
@@ -623,9 +658,9 @@ function NewInvoice() {
     setLinesLoading(true)
     try {
       const { data: poLines, error } = await withTimeout(
-        supabase.from('purchase_order_lines')
+        fetchAllPages(() => supabase.from('purchase_order_lines')
           .select('product_id,description,hsn_code,qty,unit,rate,gst_rate,line_no')
-          .eq('po_id', poId).order('line_no'),
+          .eq('po_id', poId).order('line_no')),
         20000, 'Loading PO line items',
       )
       if (error) { setToast({ message: `Could not load PO lines: ${error.message}`, type: 'error' }); return }
@@ -810,13 +845,17 @@ function NewInvoice() {
             <FormRow label='Linked PI'>
               <Select value={form.pi_id} onChange={e => handlePISelect(e.target.value)}>
                 <option value=''>No PI</option>
-                {pis.map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0,8)}</option>)}
+                {pis
+                  .filter(p => (!form.order_id || p.order_id === form.order_id) && (p.id === form.pi_id || !usedPiIds.has(p.id)))
+                  .map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Linked PO'>
               <Select value={form.po_id} onChange={e => handlePOSelect(e.target.value)}>
                 <option value=''>No PO</option>
-                {pos.map(p => <option key={p.id} value={p.id}>{p.po_no || p.id.slice(0,8)}</option>)}
+                {pos
+                  .filter(p => (!form.order_id || p.order_id === form.order_id) && (p.id === form.po_id || !usedPoIds.has(p.id)))
+                  .map(p => <option key={p.id} value={p.id}>{p.po_no || p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Order'>
@@ -969,7 +1008,11 @@ function InvoiceDetail() {
         // external customers/vendors).
         .select('*, seller:seller_entity_id(name,short_name,gstin,state_code,address,city,type), buyer:buyer_entity_id(name,short_name,gstin,state_code,address,city,type), orders(name)')
         .eq('id', id).single(),
-      supabase.from('invoice_lines').select('*').eq('invoice_id', id).order('line_no'),
+      // CHANGED: a plain .select() caps at PostgREST's default 1000-row
+      // response — an invoice with more line items than that silently lost
+      // the rest, undercounting totals here vs the DB-side total_qty/
+      // total_amount columns (recomputed directly in Postgres, no REST cap).
+      fetchAllPages(() => supabase.from('invoice_lines').select('*').eq('invoice_id', id).order('line_no')),
       supabase.from('tds_tcs_entries').select('*').eq('invoice_id', id),  // CHANGED
     ])
     setInv(i)
@@ -1053,6 +1096,13 @@ function InvoiceDetail() {
       const updatedInv = { ...inv, eway_bill_no: ewbForm.eway_bill_no, eway_bill_date: ewbForm.eway_bill_date || null }
       const { error: mirrorErr } = await autoCompletePurchaseMirror(updatedInv, lines)
       if (mirrorErr) setToast({ message: `E-way Bill saved, but the buyer purchase entry failed: ${mirrorErr.message}`, type: 'error' })
+      // CHANGED: e-way bill generation IS the physical stock-movement event —
+      // sync the leg's movement_status so it doesn't stay stuck on "pending"
+      // (previously only updated via a manual edit on the leg that nobody
+      // remembered to make, so it drifted out of sync with the Stock column).
+      if (inv.order_leg_id) {
+        await supabase.from('order_legs').update({ movement_status: 'delivered' }).eq('id', inv.order_leg_id)
+      }
     }
 
     setSectSaving(false)

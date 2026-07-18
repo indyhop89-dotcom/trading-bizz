@@ -7,10 +7,10 @@ import {
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
-import { formatINR, toNum } from '../../utils/money'
+import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
-import { cleanProductName, productMatchKey } from '../../utils/products'
+import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
@@ -233,7 +233,10 @@ function PIList() {
 
   async function handleCopyLines() {
     if (!copyPiId) return
-    const { data: srcLines } = await supabase.from('proforma_invoice_lines').select('*').eq('pi_id',copyPiId).order('line_no')
+    // CHANGED: same 1000-row REST cap as the detail-page lines fetch above —
+    // a source PI with more lines than that would otherwise silently copy
+    // only the first 1000.
+    const { data: srcLines } = await fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id',copyPiId).order('line_no'))
     if (!srcLines?.length) return setToast({message:'Source PI has no lines',type:'error'})
     const pct = parseFloat(copyMarginPct)||0
     const newLines = srcLines.map((l,i) => {
@@ -316,10 +319,21 @@ function PIList() {
     const allRows = Object.values(groups).flatMap(g => g.lines)
     const missingKeys = new Set()
     const missingRows = []
+    const nearMatchNotes = []
     for (const r of allRows) {
       if (!r.product?.trim()) continue
       const k = rowMatchKey(r)
       if (productMap.has(k) || missingKeys.has(k)) continue
+      // CHANGED: before treating this as a genuinely new product, check for
+      // an existing one with the same name+HSN+GST at a near-identical rate
+      // (see findNearMatchProduct) — reuse it instead of creating a phantom
+      // duplicate that silently starts at zero stock.
+      const near = findNearMatchProduct(products, { name: r.product, hsn_code: r.hsn_code, rate: r.rate, gst_rate: r.gst_rate })
+      if (near) {
+        productMap.set(k, near)
+        nearMatchNotes.push(`${r.product} @ ₹${r.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
+        continue
+      }
       missingKeys.add(k); missingRows.push(r)
     }
     if (missingRows.length > 0) {
@@ -376,11 +390,11 @@ function PIList() {
         if (!r.product?.trim()) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate    = toNum(r.rate)
         const qty     = toNum(r.qty)
-        const taxable = Math.round(qty * rate)
+        const taxable = round2(qty * rate)
         const gstRate = toNum(r.gst_rate) || 18
         const half    = gstRate / 2
-        const igst    = interstate ? Math.round(taxable * gstRate / 100) : 0
-        const cgst    = !interstate ? Math.round(taxable * half / 100) : 0
+        const igst    = interstate ? round2(taxable * gstRate / 100) : 0
+        const cgst    = !interstate ? round2(taxable * half / 100) : 0
         const sgst    = cgst
         return {
           line_no: i + 1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code,
@@ -389,18 +403,27 @@ function PIList() {
           cgst_rate: half, cgst_amount: cgst,
           sgst_rate: half, sgst_amount: sgst,
           igst_rate: interstate ? gstRate : 0, igst_amount: igst,
-          total_amount: taxable + igst + cgst + sgst,
+          total_amount: round2(taxable + igst + cgst + sgst),
         }
       })
       if (lineErr) continue
 
-      const totals = piLines.reduce((acc, l) => ({
+      const rawTotals = piLines.reduce((acc, l) => ({
         taxable_amount: acc.taxable_amount + l.taxable_amount,
         cgst_amount:    acc.cgst_amount    + l.cgst_amount,
         sgst_amount:    acc.sgst_amount    + l.sgst_amount,
         igst_amount:    acc.igst_amount    + l.igst_amount,
         total_amount:   acc.total_amount   + l.total_amount,
-      }), { taxable_amount: 0, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 0 })
+        total_qty:      acc.total_qty      + l.qty,
+      }), { taxable_amount: 0, cgst_amount: 0, sgst_amount: 0, igst_amount: 0, total_amount: 0, total_qty: 0 })
+      // Round off to the nearest whole rupee at the header level only — see
+      // computeTotals() in LineItemsEditor.jsx for why.
+      const preciseSubtotal = round2(rawTotals.taxable_amount + rawTotals.cgst_amount + rawTotals.sgst_amount + rawTotals.igst_amount)
+      const finalTotal = roundRupees(preciseSubtotal)
+      const totals = { ...rawTotals,
+        taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount),
+        sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount),
+        total_amount: finalTotal, round_off_amount: round2(finalTotal - preciseSubtotal) }
 
       const { data: pi, error: piErr } = await supabase.from('proforma_invoices').insert({
         pi_date: piDate, from_entity_id: fromE.id, to_entity_id: toE.id,
@@ -417,7 +440,7 @@ function PIList() {
     }
 
     setCsvSaving(false)
-    setCsvResult({ created, errors })
+    setCsvResult({ created, errors, nearMatchNotes })
     load()
   }
 
@@ -451,6 +474,7 @@ function PIList() {
     { label: 'Date',   render: p => <span style={{ fontSize: '12px' }}>{fmtDate(p.pi_date)}</span> },
     { label: 'Order',  render: p => <span style={{ fontSize: '12px', color: C.textSoft }}>{p.orders?.name || '—'}</span> },
     { label: 'Tax',    render: p => <Badge status={p.is_interstate ? 'export' : 'domestic'} label={p.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /> },
+    { label: 'Qty', right: true, render: p => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{p.total_qty || '—'}</span> },
     { label: 'Amount', right: true, render: p => <span style={{ fontWeight: 600 }}>{formatINR(p.total_amount)}</span> },
     { label: 'Status', render: p => <Badge status={p.status} /> },
   ]
@@ -535,6 +559,14 @@ function PIList() {
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>{csvResult.created} PIs created.</strong>
+              {csvResult.nearMatchNotes?.length > 0 && (
+                <details style={{ marginTop: '6px' }}>
+                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.nearMatchNotes.length} row{csvResult.nearMatchNotes.length === 1 ? '' : 's'} matched to an existing product at a near-identical rate (no duplicate created)</summary>
+                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
+                    {csvResult.nearMatchNotes.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
+                  </div>
+                </details>
+              )}
               {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
             </div>
           )}
@@ -547,7 +579,7 @@ function PIList() {
 
 
       {/* Copy from previous leg PI */}
-      <Modal open={copyModal} onClose={()=>setCopyModal(false)} title='Copy Lines from Previous Leg PI' width={640}>
+      <Modal open={copyModal} onClose={()=>setCopyModal(false)} title='Copy Lines from Previous Leg PI' width={640} zIndex={1100}>
         <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
           <div style={{background:'#fffbf0',border:`1px solid #e6c040`,borderRadius:'6px',padding:'10px 14px',fontSize:'12px',color:C.textMid}}>
             Lines are copied with the margin you specify. HSN rates are re-evaluated from the current master.
@@ -688,7 +720,11 @@ function PIDetail() {
     setLoading(true)
     const [{ data: p }, { data: ls }, { data: hsnRows }, { data: os }] = await Promise.all([
       supabase.from('proforma_invoices').select('*, from_entity:from_entity_id(name,short_name,gstin,state_code,address,city), to_entity:to_entity_id(name,short_name,gstin,state_code,address,city), orders(name), order_legs(leg_no)').eq('id',id).single(),
-      supabase.from('proforma_invoice_lines').select('*').eq('pi_id',id).order('line_no'),
+      // CHANGED: a plain .select() caps at PostgREST's default 1000-row
+      // response — a PI with more line items than that silently lost the
+      // rest, undercounting Total Qty/totals here vs the DB-side total_qty
+      // column (which is recomputed directly in Postgres, no REST cap).
+      fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id',id).order('line_no')),
       supabase.from('hsn_master').select('*').eq('is_active',true),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
     ])

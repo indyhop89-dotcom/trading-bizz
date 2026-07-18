@@ -8,6 +8,7 @@ import {
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate } from '../../utils/dates'
 import { getDriveViewUrl, getDriveDownloadUrl, fileIcon } from '../../utils/drive'
+import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -37,7 +38,10 @@ export default function DocumentDatabase() {
   const [searchParams] = useSearchParams()
   const deepLinkOrderId = searchParams.get('order') // CHANGED: set when arriving from Orders' "Open in Document Database"
   const [orders, setOrders]           = useState([])
-  const [entities, setEntities]       = useState([])
+  // CHANGED: documents_access RLS already restricts what a non-master user
+  // can read; this just keeps the filter dropdown from offering entities
+  // they'd get zero results for anyway.
+  const { entities } = useEntityAccess()
   const [loading, setLoading]         = useState(true)
   const [search, setSearch]           = useState('')
   const [entityFilter, setEntityFilter] = useState('all')
@@ -54,28 +58,24 @@ export default function DocumentDatabase() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: os }, { data: es }] = await Promise.all([
-      supabase.from('orders')
-        .select(`
-          id, order_no, name, movement_type, status, created_at,
-          origin:origin_entity_id(id,name,short_name),
-          destination:destination_entity_id(id,name,short_name),
-          financial_years(name),
-          order_legs(
-            id, leg_no, leg_type, is_interstate, movement_status, cargo_status,
-            dispatch_date, delivery_date,
-            from_entity:from_entity_id(id,name,short_name,state_code),
-            to_entity:to_entity_id(id,name,short_name,state_code)
-          )
-        `)
-        .eq('is_deleted', false)
-        .order('created_at', { ascending: false }),
-      supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
-    ])
+    const { data: os } = await supabase.from('orders')
+      .select(`
+        id, order_no, name, movement_type, status, created_at,
+        origin:origin_entity_id(id,name,short_name),
+        destination:destination_entity_id(id,name,short_name),
+        financial_years(name),
+        order_legs(
+          id, leg_no, leg_type, is_interstate, movement_status, cargo_status,
+          dispatch_date, delivery_date,
+          from_entity:from_entity_id(id,name,short_name,state_code),
+          to_entity:to_entity_id(id,name,short_name,state_code)
+        )
+      `)
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: false })
 
     const allOrders = os || []
     setOrders(allOrders)
-    setEntities(es || [])
 
     // Load doc counts per leg from leg_document_checklist
     const legIds = allOrders.flatMap(o => (o.order_legs || []).map(l => l.id))

@@ -100,7 +100,7 @@ export function Badge({ status, label }) {
 }
 
 // ─── Modal ────────────────────────────────────────────────────────────────────
-export function Modal({ open, onClose, title, width = 640, children }) {
+export function Modal({ open, onClose, title, width = 640, children, zIndex = 1000 }) {
   useEffect(() => {
     if (!open) return
     const handler = e => { if (e.key === 'Escape') onClose() }
@@ -117,7 +117,7 @@ export function Modal({ open, onClose, title, width = 640, children }) {
         position: 'fixed', inset: 0,
         background: 'rgba(26,18,8,0.42)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
-        zIndex: 1000, padding: '16px',
+        zIndex, padding: '16px',
         animation: 'fadeIn 0.12s ease',
       }}
     >

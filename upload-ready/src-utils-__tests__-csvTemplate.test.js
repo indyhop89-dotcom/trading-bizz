@@ -172,7 +172,7 @@ describe('TEMPLATES', () => {
   })
 
   it('products template has correct headers', () => {
-    expect(TEMPLATES.products.headers).toEqual(['name', 'hsn_code', 'gst_rate', 'unit', 'default_rate', 'description'])
+    expect(TEMPLATES.products.headers).toEqual(['name', 'hsn_code', 'gst_rate', 'unit', 'default_rate', 'description', 'category'])
   })
 
   it('entities template has gstin field', () => {

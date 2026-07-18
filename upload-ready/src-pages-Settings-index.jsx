@@ -8,6 +8,7 @@ import { toNum } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { formatSlabSummary } from '../../utils/hsn'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { useAuth } from '../../hooks/useAuth'
 
 // REBUILT — this file was found to contain a copy of the Invoices module
 // (src/pages/Invoices/index.jsx) instead of Settings, which is why /settings
@@ -471,17 +472,24 @@ function HsnMaster() {
 }
 
 // ─── Users Tab ──────────────────────────────────────────────────────────────────
-// No create/delete here — profiles are created automatically on sign-in
-// (see handle_new_user() trigger in 001_phase1.sql). This tab manages role,
-// active/revoked status, and which entities each user can access.
-// CHANGED: entity access — backed by user_entity_access (present since
-// 001_phase1.sql: user_id, entity_id, access_level). A 'master' role user
-// implicitly sees everything (per user_has_entity_access() in the same
-// migration), so the entity picker is only meaningful for non-master roles
-// — shown but not required for master.
-const ROLES = ['master', 'entity_user', 'viewer']
+// Editing existing profiles (role, active/revoked, entity grants) was always
+// supported here. Creating new users now goes through the create-user Edge
+// Function (supabase/functions/create-user) since profiles/user_entity_access
+// have no client-writable INSERT policy for anyone but the SECURITY DEFINER
+// signup trigger — only master and admin may call it. Master can create any
+// role for any entity; admin can only create entity_user/viewer, scoped to
+// entities the admin themselves already holds a grant for (enforced again,
+// server-side, inside the Edge Function — this UI only mirrors that scoping
+// so an admin never sees an option they'd be rejected for anyway).
+const ROLES = ['master', 'admin', 'entity_user', 'viewer']
 
 function Users() {
+  const { profile: me } = useAuth()
+  const myRole = me?.role
+  const iAmMaster = myRole === 'master'
+  const iAmAdmin  = myRole === 'admin'
+  const canAddUsers = iAmMaster || iAmAdmin
+
   const [rows, setRows]         = useState([])
   const [entities, setEntities] = useState([])
   const [accessMap, setAccessMap] = useState({}) // user_id -> [entity_id, ...]
@@ -491,6 +499,22 @@ function Users() {
   const [form, setForm]         = useState({ role: 'entity_user', is_active: true, entityIds: [] })
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
+
+  // New-user modal state — separate from the edit modal above since the
+  // fields (email, password) and the save path (Edge Function vs. direct
+  // table update) are different.
+  const EMPTY_NEW_USER = { full_name: '', email: '', role: 'entity_user', entityIds: [], password: '' }
+  const [addModalOpen, setAddModalOpen] = useState(false)
+  const [newUser, setNewUser]   = useState(EMPTY_NEW_USER)
+  const [adding, setAdding]     = useState(false)
+
+  // Master may assign any role; admin is limited to entity_user/viewer so an
+  // admin can never mint another admin or a master (privilege escalation).
+  const assignableRoles = iAmMaster ? ROLES : ['entity_user', 'viewer']
+  // Master may grant any active entity; admin may only grant entities they
+  // themselves have been granted (accessMap[me.id] — already scoped correctly
+  // by RLS, since a non-master can only ever see their own access rows).
+  const grantableEntities = iAmMaster ? entities : entities.filter(e => (accessMap[me?.id] || []).includes(e.id))
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -547,6 +571,85 @@ function Users() {
     load()
   }
 
+  const [resettingPw, setResettingPw] = useState(false)
+  // Mirrors the create-user Edge Function's role restriction client-side so
+  // the button doesn't invite an admin into a reset that the function would
+  // reject anyway — admin can only touch entity_user/viewer passwords.
+  const canResetPassword = editing && (iAmMaster || (iAmAdmin && !['master', 'admin'].includes(editing.role)))
+
+  async function handleResetPassword() {
+    if (!editing) return
+    setResettingPw(true)
+    const { data, error } = await supabase.functions.invoke('update-user-password', {
+      body: { user_id: editing.id },
+    })
+    setResettingPw(false)
+    if (error) {
+      let serverMessage = error.message
+      try {
+        if (error.context && typeof error.context.json === 'function') {
+          const body = await error.context.json()
+          serverMessage = body?.error || serverMessage
+        }
+      } catch { /* fall back to error.message below */ }
+      return setToast({ message: serverMessage, type: 'error' })
+    }
+    if (data?.error) return setToast({ message: data.error, type: 'error' })
+    setToast({ message: `Password reset. Temporary password: ${data?.temp_password}`, type: 'success' })
+  }
+
+  function openAddUser() {
+    setNewUser({ full_name: '', email: '', role: 'entity_user', entityIds: [], password: '' })
+    setAddModalOpen(true)
+  }
+
+  function toggleNewUserEntity(id) {
+    setNewUser(f => ({ ...f, entityIds: f.entityIds.includes(id) ? f.entityIds.filter(x => x !== id) : [...f.entityIds, id] }))
+  }
+
+  async function handleAddUser() {
+    if (!newUser.full_name.trim() || !newUser.email.trim()) {
+      return setToast({ message: 'Name and email are required', type: 'error' })
+    }
+    if (newUser.role !== 'master' && newUser.entityIds.length === 0) {
+      return setToast({ message: 'Select at least one entity for this role', type: 'error' })
+    }
+    setAdding(true)
+    const { data, error } = await supabase.functions.invoke('create-user', {
+      body: {
+        full_name: newUser.full_name.trim(),
+        email: newUser.email.trim(),
+        role: newUser.role,
+        entity_ids: newUser.entityIds,
+        password: newUser.password.trim() || undefined,
+      },
+    })
+    setAdding(false)
+    // Edge Function errors (4xx/5xx) surface through `error`, not `data`.
+    // supabase-js wraps the raw Response on error.context rather than parsing
+    // it — our function always replies with JSON `{ error: '...' }`, so pull
+    // the real message out of that body instead of the generic HTTP message.
+    if (error) {
+      let serverMessage = error.message
+      try {
+        if (error.context && typeof error.context.json === 'function') {
+          const body = await error.context.json()
+          serverMessage = body?.error || serverMessage
+        }
+      } catch { /* fall back to error.message below */ }
+      return setToast({ message: serverMessage, type: 'error' })
+    }
+    if (data?.error) return setToast({ message: data.error, type: 'error' })
+    setAddModalOpen(false)
+    setToast({
+      message: data?.temp_password
+        ? `User created. Temporary password: ${data.temp_password}`
+        : 'User created',
+      type: 'success',
+    })
+    load()
+  }
+
   function entityLabel(entityIds, role) {
     if (role === 'master') return <span style={{ color: C.textMuted }}>All (master)</span>
     if (!entityIds || entityIds.length === 0) return <span style={{ color: C.danger }}>None assigned</span>
@@ -571,14 +674,64 @@ function Users() {
 
   return (
     <div>
+      {canAddUsers && (
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
+          <Btn onClick={openAddUser}>+ Add User</Btn>
+        </div>
+      )}
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={rows}
-              emptyState={<EmptyState icon='👤' title='No users yet' message='Users appear here once they sign in for the first time.' />}
+              emptyState={<EmptyState icon='👤' title='No users yet' message={canAddUsers ? 'Add a user above, or they’ll appear here once they sign in for the first time.' : 'Users appear here once they sign in for the first time.'} />}
             />
         }
       </Card>
+
+      <Modal open={addModalOpen} onClose={() => setAddModalOpen(false)} title='Add User' width={460}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <FormRow label='Full Name' required>
+            <Input value={newUser.full_name} onChange={e => setNewUser(f => ({ ...f, full_name: e.target.value }))} />
+          </FormRow>
+          <FormRow label='Email' required>
+            <Input type='email' value={newUser.email} onChange={e => setNewUser(f => ({ ...f, email: e.target.value }))} />
+          </FormRow>
+          <FormRow label='Role'>
+            <Select value={newUser.role} onChange={e => setNewUser(f => ({ ...f, role: e.target.value }))}>
+              {assignableRoles.map(r => <option key={r} value={r}>{r}</option>)}
+            </Select>
+          </FormRow>
+
+          <FormRow label={newUser.role === 'master' ? 'Entity Access (master sees all)' : 'Entity Access'}>
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '220px', overflowY: 'auto',
+              border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 12px',
+              opacity: newUser.role === 'master' ? 0.5 : 1, pointerEvents: newUser.role === 'master' ? 'none' : 'auto',
+            }}>
+              {grantableEntities.map(ent => (
+                <label key={ent.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer' }}>
+                  <input type='checkbox' checked={newUser.entityIds.includes(ent.id)} onChange={() => toggleNewUserEntity(ent.id)} style={{ width: '14px', height: '14px' }} />
+                  {ent.short_name || ent.name}
+                </label>
+              ))}
+              {grantableEntities.length === 0 && (
+                <span style={{ fontSize: '12px', color: C.textMuted }}>
+                  {iAmAdmin ? 'You have no entity access yourself to grant from.' : 'No active entities found.'}
+                </span>
+              )}
+            </div>
+          </FormRow>
+
+          <FormRow label='Password' hint='Leave blank to auto-generate a temporary password'>
+            <Input type='text' value={newUser.password} onChange={e => setNewUser(f => ({ ...f, password: e.target.value }))} placeholder='Auto-generated if blank' />
+          </FormRow>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setAddModalOpen(false)}>Cancel</Btn>
+            <Btn onClick={handleAddUser} disabled={adding}>{adding ? 'Creating…' : 'Create User'}</Btn>
+          </div>
+        </div>
+      </Modal>
 
       <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={`Edit User — ${editing?.full_name || ''}`} width={460}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
@@ -610,9 +763,14 @@ function Users() {
             <input type='checkbox' id='user_active' checked={form.is_active} onChange={e => setForm(f => ({ ...f, is_active: e.target.checked }))} style={{ width: '14px', height: '14px' }} />
             <label htmlFor='user_active' style={{ fontSize: '13px', color: C.textMid, cursor: 'pointer' }}>Active (unchecking revokes sign-in access)</label>
           </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
-            <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            {canResetPassword
+              ? <Btn variant='ghost' onClick={handleResetPassword} disabled={resettingPw} style={{ color: C.danger }}>{resettingPw ? 'Resetting…' : 'Reset Password'}</Btn>
+              : <span />}
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
+              <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>
+            </div>
           </div>
         </div>
       </Modal>

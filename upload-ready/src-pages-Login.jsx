@@ -10,6 +10,7 @@ export default function Login() {
   const [error, setError]                 = useState('')
   const [loading, setLoading]             = useState(false)
   const [googleLoading, setGoogleLoading] = useState(false)
+  const [showPassword, setShowPassword]   = useState(false)
 
   async function handleSubmit(e) {
     e.preventDefault()
@@ -100,16 +101,30 @@ export default function Login() {
             <label style={{ fontSize: '11px', fontWeight: 700, color: '#7a6a4a', textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: '4px' }}>
               Password
             </label>
-            <input
-              type='password' value={password} onChange={e => setPassword(e.target.value)}
-              required placeholder='••••••••'
-              style={{
-                width: '100%', padding: '9px 12px', boxSizing: 'border-box',
-                border: '1.5px solid #e8dfc8', borderRadius: '6px',
-                background: '#fffdf6', fontSize: '14px', color: '#1a1208',
-                outline: 'none', fontFamily: 'inherit',
-              }}
-            />
+            <div style={{ position: 'relative' }}>
+              <input
+                type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)}
+                required placeholder='••••••••'
+                style={{
+                  width: '100%', padding: '9px 40px 9px 12px', boxSizing: 'border-box',
+                  border: '1.5px solid #e8dfc8', borderRadius: '6px',
+                  background: '#fffdf6', fontSize: '14px', color: '#1a1208',
+                  outline: 'none', fontFamily: 'inherit',
+                }}
+              />
+              <button
+                type='button' onClick={() => setShowPassword(s => !s)}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                title={showPassword ? 'Hide password' : 'Show password'}
+                style={{
+                  position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)',
+                  background: 'none', border: 'none', cursor: 'pointer', padding: '4px',
+                  color: '#9a8a6a', fontSize: '13px', lineHeight: 1,
+                }}
+              >
+                {showPassword ? '🙈' : '👁️'}
+              </button>
+            </div>
           </div>
 
           {shownError && (
