@@ -7,22 +7,41 @@ import {
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import DocumentAttachments from '../../components/DocumentAttachments'
-import { formatINR } from '../../utils/money'
+import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
 import { buildHSNMap } from '../../utils/hsn'
-import { useAuth } from '../../hooks/useAuth' // CHANGED: master-only delete, same convention as PI/PO/Invoices
+import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
+import { hasFullAccess } from '../../utils/roles'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces broken next_note_no RPC / undefined resolveFY
 
 const NOTE_TYPES = ['credit_note', 'debit_note']
 const REASONS    = ['return', 'rate_correction', 'quantity_correction', 'other']
 const STATUSES   = ['draft', 'submitted', 'cancelled']
 
+// CHANGED: computeLine()'s return spreads calcLineTax()'s result (which
+// includes cgst_rate/sgst_rate/igst_rate/total_tax — none of them real
+// columns on credit_debit_note_lines) onto the line, plus UI-only fields
+// like _id. Inserting that object as-is fails with "Could not find the
+// 'cgst_rate' column ... in the schema cache" — silently, since the insert
+// call's error was never checked, so notes always saved with zero lines.
+// Allow-listing real DB columns (same pattern PI/PO/Invoices already use
+// via PI_LINE_COLUMNS/toPILinePayload) can't miss a field this way.
+const NOTE_LINE_COLUMNS = [
+  'product_id', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
+  'taxable_amount', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
+]
+function toNoteLinePayload(computedLine, noteId, lineNo) {
+  const out = { note_id: noteId, line_no: lineNo }
+  for (const col of NOTE_LINE_COLUMNS) if (computedLine[col] !== undefined) out[col] = computedLine[col]
+  return out
+}
+
 // ─── List ──────────────────────────────────────────────────────────────────────
 function NoteList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
@@ -44,6 +63,17 @@ function NoteList() {
   const [noteLines, setNoteLines] = useState([])
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
+  // CHANGED: "Simple / Numbers only" mode — issue a note as a small set of
+  // net adjustment amounts, one per GST rate, instead of full product
+  // line-item entry — for corrections that don't warrant re-keying
+  // products/qty/rate but still need to split across multiple GST rates
+  // (e.g. an invoice with both 12% and 18% items).
+  const [simpleMode, setSimpleMode] = useState(false)
+  const [simpleRows, setSimpleRows] = useState([{ amount: '', gst_rate: '18' }])
+  // CHANGED: TDS/TCS on this note is auto-derived from the linked invoice's
+  // payment history (see handleSave) — this just previews that rate to the
+  // user before they save, read-only, no manual entry.
+  const [linkedRates, setLinkedRates] = useState({ tds: 0, tcs: 0 })
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -79,10 +109,54 @@ function NoteList() {
     })
   }
 
+  // Prefill Simple-mode rows from the selected invoice's own lines — one row
+  // per DISTINCT GST rate actually on that invoice (amount left blank for
+  // the user to fill in), so an invoice mixing e.g. 12% and 18% items
+  // starts with both rows ready instead of one blended line. Falls back to
+  // a single '18' row if the invoice has no lines to read rates from.
+  useEffect(() => {
+    if (!simpleMode) return
+    // Reset before (re-)fetching so a previously-selected invoice's rows
+    // never linger when the new selection has different (or no) rates.
+    if (!form.against_invoice_id) { setSimpleRows([{ amount: '', gst_rate: '18' }]); return }
+    let cancelled = false
+    supabase.from('invoice_lines').select('gst_rate').eq('invoice_id', form.against_invoice_id)
+      .then(({ data }) => {
+        if (cancelled) return
+        const rates = [...new Set((data || []).map(l => l.gst_rate).filter(r => r != null))].sort((a, b) => a - b)
+        setSimpleRows(rates.length ? rates.map(r => ({ amount: '', gst_rate: String(r) })) : [{ amount: '', gst_rate: '18' }])
+      })
+    return () => { cancelled = true }
+  }, [simpleMode, form.against_invoice_id])
+
+  // CHANGED: preview the TDS/TCS rate that will be auto-applied (see handleSave).
+  useEffect(() => {
+    if (!form.against_invoice_id) { setLinkedRates({ tds: 0, tcs: 0 }); return }
+    let cancelled = false
+    supabase.from('invoice_payments')
+      .select('tds_rate,tcs_rate').eq('invoice_id', form.against_invoice_id).eq('is_deleted', false)
+      .order('actual_payment_date', { ascending: false }).limit(1).maybeSingle()
+      .then(({ data }) => { if (!cancelled) setLinkedRates({ tds: toNum(data?.tds_rate) || 0, tcs: toNum(data?.tcs_rate) || 0 }) })
+    return () => { cancelled = true }
+  }, [form.against_invoice_id])
+
+  function addSimpleRow()            { setSimpleRows(rows => [...rows, { amount: '', gst_rate: '18' }]) }
+  function removeSimpleRow(idx)      { setSimpleRows(rows => rows.filter((_, i) => i !== idx)) }
+  function updateSimpleRow(idx, k, v) { setSimpleRows(rows => rows.map((r, i) => i === idx ? { ...r, [k]: v } : r)) }
+
   async function handleSave() {
     if (!form.against_invoice_id || !form.issuer_entity_id || !form.receiver_entity_id)
       return setToast({ message: 'Invoice, Issuer and Receiver are required', type: 'error' })
-    const computed = noteLines.map(l => computeLine(l, form.is_interstate))
+    const simpleLines = simpleRows.filter(r => toNum(r.amount) > 0)
+    if (simpleMode && simpleLines.length === 0)
+      return setToast({ message: 'Enter at least one non-zero adjustment amount', type: 'error' })
+    // Simple mode: one synthetic line per GST-rate row, run through the
+    // exact same computeLine/computeTotals math every full-line-item note
+    // already uses — no separate tax-math path needed.
+    const sourceLines = simpleMode
+      ? simpleLines.map(r => ({ description: 'Rate/amount adjustment', hsn_code: '-', product_id: null, qty: 1, unit: 'Nos', rate: toNum(r.amount), gst_rate: toNum(r.gst_rate) }))
+      : noteLines
+    const computed = sourceLines.map(l => computeLine(l, form.is_interstate))
     const totals   = computeTotals(computed)
     setSaving(true)
     // CHANGED: resolveFY() was called here but never defined anywhere in this
@@ -103,12 +177,36 @@ function NoteList() {
       const typePrefix = form.note_type === 'credit_note' ? 'CN' : 'DN'
       noteNo = await suggestNextNo({ table: 'credit_debit_notes', noCol: 'note_no', entityShort: `${issuerEntity?.short_name || issuerEntity?.name || 'X'}-${typePrefix}`, fyCode })
     }
+    // CHANGED: the live credit_debit_notes table has no `notes`, `total_qty`,
+    // or `round_off_amount` column (confirmed directly against the live
+    // schema — PostgREST rejected inserts with "Could not find the 'notes'
+    // column ... in the schema cache"), despite the migration file/UI
+    // implying otherwise. Spreading ...totals used to silently try to write
+    // total_qty/round_off_amount too. Fixed by listing only the totals
+    // columns that actually exist, and folding the "Notes" field (which had
+    // nowhere to be saved, and NoteDetail never rendered it anyway) into
+    // reason_notes — the one free-text column this table actually has.
+    const combinedNotes = [form.reason_notes, form.notes].filter(Boolean).join('\n\n') || null
+    // CHANGED: TDS/TCS on a credit/debit note is never hand-entered — it's
+    // auto-derived from the linked invoice's own payment history (the same
+    // rate the buyer/seller already applied when settling that invoice), so a
+    // correction against a TDS/TCS-bearing invoice stays proportionally
+    // consistent with it rather than needing a second manual entry surface.
+    const { data: lastTranche } = await supabase.from('invoice_payments')
+      .select('tds_rate,tcs_rate').eq('invoice_id', form.against_invoice_id).eq('is_deleted', false)
+      .order('actual_payment_date', { ascending: false }).limit(1).maybeSingle()
+    const tdsRate = toNum(lastTranche?.tds_rate) || 0
+    const tcsRate = toNum(lastTranche?.tcs_rate) || 0
     const payload = {
       note_type: form.note_type, against_invoice_id: form.against_invoice_id,
       issuer_entity_id: form.issuer_entity_id, receiver_entity_id: form.receiver_entity_id,
-      note_date: form.note_date, reason: form.reason, reason_notes: form.reason_notes||null,
-      is_interstate: form.is_interstate, ...totals,
-      status: 'draft', notes: form.notes||null, note_no: noteNo,
+      note_date: form.note_date, reason: form.reason, reason_notes: combinedNotes,
+      is_interstate: form.is_interstate,
+      taxable_amount: totals.taxable_amount, cgst_amount: totals.cgst_amount,
+      sgst_amount: totals.sgst_amount, igst_amount: totals.igst_amount, total_amount: totals.total_amount,
+      tds_rate: tdsRate || null, tds_amount: tdsRate ? Math.round(totals.taxable_amount * tdsRate / 100) : 0,
+      tcs_rate: tcsRate || null, tcs_amount: tcsRate ? Math.round(totals.taxable_amount * tcsRate / 100) : 0,
+      status: 'draft', note_no: noteNo,
     }
     // NOTE: the migration doc for credit_debit_notes marks financial_year_id
     // NOT NULL, but the same doc-vs-live mismatch was confirmed for
@@ -120,11 +218,10 @@ function NoteList() {
     // silently succeeding wrong, and it's a one-line fix to add it back.
     const { data: note, error } = await supabase.from('credit_debit_notes').insert(payload).select().single()
     if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
-    if (noteLines.length > 0) {
-      const linesPayload = computed.map((l, i) => ({
-        ...l, note_id: note.id, line_no: i + 1, _id: undefined,
-      }))
-      await supabase.from('credit_debit_note_lines').insert(linesPayload)
+    if (sourceLines.length > 0) {
+      const linesPayload = computed.map((l, i) => toNoteLinePayload(l, note.id, i + 1))
+      const { error: linesError } = await supabase.from('credit_debit_note_lines').insert(linesPayload)
+      if (linesError) { setSaving(false); return setToast({ message: `Note saved, but line items failed: ${linesError.message}`, type: 'error' }) }
     }
     setSaving(false)
     setToast({ message: 'Note created', type: 'success' })
@@ -172,6 +269,9 @@ function NoteList() {
     { label: 'Date',     render: n => <span style={{ fontSize: '12px' }}>{fmtDate(n.note_date)}</span> },
     { label: 'Reason',   render: n => <span style={{ fontSize: '11px', textTransform: 'capitalize' }}>{n.reason?.replace('_', ' ')}</span> },
     { label: 'Amount',   right: true, render: n => <span style={{ fontWeight: 600 }}>{formatINR(n.total_amount)}</span> },
+    { label: 'TDS/TCS',  right: true, render: n => (n.tds_amount || n.tcs_amount)
+        ? <span style={{ fontSize: '12px', color: C.textSoft }}>{n.tds_amount ? `TDS ${formatINR(n.tds_amount)}` : ''}{n.tds_amount && n.tcs_amount ? ' / ' : ''}{n.tcs_amount ? `TCS ${formatINR(n.tcs_amount)}` : ''}</span>
+        : <span style={{ color: C.textMuted }}>—</span> },
     { label: 'Status',   render: n => <Badge status={n.status} /> },
   ]
 
@@ -180,7 +280,7 @@ function NoteList() {
       <PageHeader
         title='Credit & Debit Notes'
         subtitle='Adjustments against issued invoices'
-        action={<Btn onClick={() => { setForm({ note_type: 'credit_note', against_invoice_id: '', issuer_entity_id: '', receiver_entity_id: '', note_date: today(), reason: 'return', reason_notes: '', is_interstate: false, notes: '', note_no: '' }); setNoteLines([]); setModalOpen(true) }}>+ New Note</Btn>}
+        action={<Btn onClick={() => { setForm({ note_type: 'credit_note', against_invoice_id: '', issuer_entity_id: '', receiver_entity_id: '', note_date: today(), reason: 'return', reason_notes: '', is_interstate: false, notes: '', note_no: '' }); setNoteLines([]); setSimpleMode(false); setSimpleRows([{ amount: '', gst_rate: '18' }]); setModalOpen(true) }}>+ New Note</Btn>}
       />
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
@@ -239,7 +339,10 @@ function NoteList() {
                 {REASONS.map(r => <option key={r} value={r}>{r.replace('_', ' ')}</option>)}
               </Select>
             </FormRow>
-            <FormRow label='Against Invoice' required>
+            <FormRow label='Against Invoice' required
+              hint={(linkedRates.tds > 0 || linkedRates.tcs > 0)
+                ? `Will auto-apply from this invoice's payment: ${linkedRates.tds > 0 ? `TDS ${linkedRates.tds}%` : ''}${linkedRates.tds > 0 && linkedRates.tcs > 0 ? ', ' : ''}${linkedRates.tcs > 0 ? `TCS ${linkedRates.tcs}%` : ''}`
+                : undefined}>
               <Select value={form.against_invoice_id} onChange={e => setF('against_invoice_id', e.target.value)}>
                 <option value=''>Select invoice</option>
                 {invoices.map(i => <option key={i.id} value={i.id}>{i.invoice_no || i.id.slice(0,8)}</option>)}
@@ -266,7 +369,35 @@ function NoteList() {
           </div>
           <FormRow label='Reason Notes'><Textarea value={form.reason_notes} onChange={e => setF('reason_notes', e.target.value)} rows={2} /></FormRow>
           <SectionDivider label='Line Items' />
-          <LineItemsEditor lines={noteLines} setLines={setNoteLines} interstate={form.is_interstate} hsnMap={hsnMap} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+            <input type='checkbox' id='cdn_simple_mode' checked={simpleMode} onChange={e => setSimpleMode(e.target.checked)} style={{ width: '14px', height: '14px' }} />
+            <label htmlFor='cdn_simple_mode' style={{ fontSize: '13px', color: C.textMid, cursor: 'pointer' }}>
+              Simple / Numbers only — just adjust an amount, no product line items
+            </label>
+          </div>
+          {simpleMode ? (
+            <div>
+              <div style={{ fontSize: '11px', color: C.textMuted, marginBottom: '6px' }}>
+                One row per GST rate — taxable amount per row, GST is computed on top of each.
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {simpleRows.map((row, i) => (
+                  <div key={i} style={{ display: 'grid', gridTemplateColumns: '2fr 1fr auto', gap: '10px', alignItems: 'center' }}>
+                    <Input type='number' value={row.amount} onChange={e => updateSimpleRow(i, 'amount', e.target.value)} placeholder='Adjustment amount (₹)' />
+                    <Select value={row.gst_rate} onChange={e => updateSimpleRow(i, 'gst_rate', e.target.value)}>
+                      {[0, 3, 5, 12, 18, 28].map(r => <option key={r} value={r}>{r}%</option>)}
+                    </Select>
+                    <Btn size='sm' variant='ghost' onClick={() => removeSimpleRow(i)} style={{ color: C.danger }}>✕</Btn>
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: '8px' }}>
+                <Btn size='sm' variant='ghost' onClick={addSimpleRow}>+ Add Row</Btn>
+              </div>
+            </div>
+          ) : (
+            <LineItemsEditor lines={noteLines} setLines={setNoteLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.note_date} />
+          )}
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
@@ -288,7 +419,7 @@ function NoteDetail() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: master-only delete, same convention as PI/PO/Invoices detail pages
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [note, setNote]   = useState(null)

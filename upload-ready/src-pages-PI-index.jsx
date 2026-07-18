@@ -16,8 +16,38 @@ import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock } from '../../utils/stock'
+import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
+import { downloadDocumentExcel } from '../../utils/documentExcel'
+import { getDriveViewUrl } from '../../utils/drive'
+
+// Fetches its own full entity rows (address/bank/logo columns) by id rather
+// than relying on the page's own load() query to embed them — this keeps
+// the wider, newer entity columns (which may not exist yet until migration
+// 025_entity_logo.sql is applied) isolated to document generation, so a
+// missing column here can never break the PI detail page itself loading.
+export async function buildPIDoc(pi, lines) {
+  const [{ data: fromEntity }, { data: toEntity }] = await Promise.all([
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', pi.from_entity_id).single(),
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', pi.to_entity_id).single(),
+  ])
+  let logoSrc = null
+  if (fromEntity?.logo_file_id) { try { logoSrc = await getDriveViewUrl(fromEntity.logo_file_id) } catch { /* no logo — text-only header */ } }
+  return {
+    docType: 'PI',
+    docNo: pi.pi_no, docDate: pi.pi_date, validOrDueDate: pi.valid_upto,
+    paymentTerms: pi.payment_terms, deliveryTimeline: pi.delivery_timeline, modeOfTransport: pi.mode_of_transport || 'Road',
+    sellerEntity: { ...fromEntity, logoSrc },
+    buyerEntity: toEntity,
+    lines,
+    totals: { taxable_amount: pi.taxable_amount, cgst_amount: pi.cgst_amount, sgst_amount: pi.sgst_amount, igst_amount: pi.igst_amount, round_off_amount: pi.round_off_amount, total_amount: pi.total_amount },
+    interstate: pi.is_interstate,
+    bankDetails: fromEntity,
+    notes: pi.notes,
+  }
+}
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 
@@ -47,7 +77,16 @@ const EMPTY_FORM = {
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
   pi_no: '', // CHANGED: optional manual PI number — blank suggests one via suggestNextNo()
+  // CHANGED: the generated PDF/Excel has always had a Payment Terms/Delivery
+  // Timeline/Mode of Transport row in its accent bar (ported from the
+  // reference generator tools) but nothing ever collected these — they
+  // rendered blank on every document. mode_of_transport defaults to 'Road'
+  // to match the reference tool's own default.
+  payment_terms: '', delivery_timeline: '', mode_of_transport: 'Road',
 }
+
+const PAYMENT_TERMS_OPTIONS = ['100% Advance', 'Net 30 Days', 'Net 45 Days', 'Net 60 Days', '50% Advance, 50% on Delivery', 'Against Delivery', 'LC at Sight', 'Cash on Delivery']
+const TRANSPORT_MODES = ['Road', 'Air', 'Rail', 'Sea', 'Courier']
 
 // Write planned stock movements on PI create
 async function writeStockMovementsForPI(pi, lines) {
@@ -66,11 +105,9 @@ async function writeStockMovementsForPI(pi, lines) {
 function PIList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
-  // CHANGED: bulk delete — restricted to the 'master' role, which is the only
-  // elevated/full-access role in this app's schema (ROLES = master, entity_user,
-  // viewer — see Settings). This matches the existing `isAdmin` convention used
-  // in Payments (`profile?.role === 'master'`).
-  const canDelete = profile?.role === 'master'
+  // Bulk delete — restricted to 'master'/'admin', the full-access roles
+  // (ROLES = master, admin, entity_user, viewer — see Settings).
+  const canDelete = hasFullAccess(profile)
   // CHANGED: which entities this user may raise a PI *from* — master sees
   // all, everyone else only the entities they've been granted access to.
   const { entities: accessEntities, frozen: fromEntityFrozen, defaultEntityId } = useEntityAccess()
@@ -244,7 +281,7 @@ function PIList() {
       const newRate  = pct !== 0 ? calcSellRate(costRate, pct) : costRate
       let gstRate=l.gst_rate, hsnRes=null, hsnSrc='default'
       if (hsnMap && l.hsn_code) {
-        const res = resolveGSTRate(l.hsn_code, newRate, hsnMap)
+        const res = resolveGSTRate(l.hsn_code, newRate, hsnMap, form.pi_date)
         if (res.gst_rate!==null){ gstRate=res.gst_rate; hsnRes=res.gst_rate; hsnSrc=res.source }
       }
       return computeLine({_id:Date.now()+i,line_no:i+1,product_id:l.product_id||'',description:l.description||'',hsn_code:l.hsn_code||'',qty:l.qty,unit:l.unit||'Nos',rate:newRate,gst_rate:gstRate,_cost_rate:costRate,_margin_pct:String(pct),_hsn_resolved_rate:hsnRes,_hsn_source:hsnSrc,_hsn_override:false,_hsn_manually_set:false}, form.is_interstate)
@@ -652,13 +689,25 @@ function PIList() {
                 {legs.map(l => <option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name || l.from_entity?.name} → {l.to_entity?.short_name || l.to_entity?.name}</option>)}
               </Select>
             </FormRow>
+            <FormRow label='Payment Terms' hint='Shown on the generated PI PDF/Excel'>
+              <Input list='pi-payment-terms' value={form.payment_terms} onChange={e => setF('payment_terms', e.target.value)} placeholder='e.g. Net 30 Days' />
+              <datalist id='pi-payment-terms'>{PAYMENT_TERMS_OPTIONS.map(o => <option key={o} value={o} />)}</datalist>
+            </FormRow>
+            <FormRow label='Delivery Timeline' hint='Shown on the generated PI PDF/Excel'>
+              <Input value={form.delivery_timeline} onChange={e => setF('delivery_timeline', e.target.value)} placeholder='e.g. 7-10 working days from confirmation' />
+            </FormRow>
+            <FormRow label='Mode of Transport'>
+              <Select value={form.mode_of_transport} onChange={e => setF('mode_of_transport', e.target.value)}>
+                {TRANSPORT_MODES.map(m => <option key={m} value={m}>{m}</option>)}
+              </Select>
+            </FormRow>
           </div>
 
           <SectionDivider label='Line Items' />
           <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'-4px'}}>
             <Btn size='sm' variant='ghost' onClick={openCopyModal}>📋 Copy from previous leg PI…</Btn>
           </div>
-          <LineItemsEditor lines={piLines} setLines={setPILines} interstate={form.is_interstate} hsnMap={hsnMap} showMargin={true} stockMap={stockMap} products={products}/>
+          <LineItemsEditor lines={piLines} setLines={setPILines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.pi_date} showMargin={true} stockMap={stockMap} products={products}/>
 
           <SectionDivider label='Billing & Shipping (optional)' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -700,7 +749,7 @@ function PIDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
   const { profile } = useAuth()
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [pi, setPI]         = useState(null)
@@ -715,10 +764,19 @@ function PIDetail() {
   const [saving, setSaving]       = useState(false)
   const [toast, setToast]         = useState(null)
   const [confirmCancel, setConfirmCancel] = useState(false)
+  const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
+  // CHANGED: bulk CSV upload to correct an existing PI's lines while
+  // editing — needs the products list (for name matching) that this
+  // detail page never fetched before, since it never had a product picker.
+  const [products, setProducts] = useState([])
+  const [bulkCsvModal, setBulkCsvModal]     = useState(false)
+  const [bulkCsvText, setBulkCsvText]       = useState('')
+  const [bulkCsvResult, setBulkCsvResult]   = useState(null)
+  const [bulkCsvSaving, setBulkCsvSaving]   = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: p }, { data: ls }, { data: hsnRows }, { data: os }] = await Promise.all([
+    const [{ data: p }, { data: ls }, { data: hsnRows }, { data: os }, { data: prods }] = await Promise.all([
       supabase.from('proforma_invoices').select('*, from_entity:from_entity_id(name,short_name,gstin,state_code,address,city), to_entity:to_entity_id(name,short_name,gstin,state_code,address,city), orders(name), order_legs(leg_no)').eq('id',id).single(),
       // CHANGED: a plain .select() caps at PostgREST's default 1000-row
       // response — a PI with more line items than that silently lost the
@@ -727,8 +785,9 @@ function PIDetail() {
       fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id',id).order('line_no')),
       supabase.from('hsn_master').select('*').eq('is_active',true),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
-    setPI(p); setLines(ls||[]); setHsnMap(buildHSNMap(hsnRows||[])); setOrders(os||[]); setLoading(false)
+    setPI(p); setLines(ls||[]); setHsnMap(buildHSNMap(hsnRows||[])); setOrders(os||[]); setProducts(prods||[]); setLoading(false)
   }, [id])
 
   useEffect(() => { load() }, [load])
@@ -755,7 +814,7 @@ function PIDetail() {
     if (lines.length > MAX_EDITABLE_LINES) {
       return setToast({message:`This PI has ${lines.length} line items, above the ${MAX_EDITABLE_LINES} safety limit. If this isn't expected, it's likely duplicated by a past bug — run supabase/maintenance/dedupe_line_items.sql to clean it up.`,type:'error'})
     }
-    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||'',order_id:pi.order_id||'',order_leg_id:pi.order_leg_id||''})
+    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||'',order_id:pi.order_id||'',order_leg_id:pi.order_leg_id||'',payment_terms:pi.payment_terms||'',delivery_timeline:pi.delivery_timeline||'',mode_of_transport:pi.mode_of_transport||'Road'})
     setEditLines(lines.map(l=>({...l,_id:l.id,_hsn_resolved_rate:null,_hsn_override:false,_hsn_manually_set:false,_cost_rate:null,_margin_pct:''})))
     if (pi.order_id) loadLegs(pi.order_id)
     setEditing(true)
@@ -777,9 +836,15 @@ function PIDetail() {
     }
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
     const totals = computeTotals(computedLines)
-    // order_id/order_leg_id are uuid columns — an empty string (cleared in the
-    // dropdown) must be sent as null, not '', or the update fails.
-    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,order_id:editForm.order_id||null,order_leg_id:editForm.order_leg_id||null,...totals,updated_at:new Date()}).eq('id',id)
+    // order_id/order_leg_id are uuid columns and valid_upto is a date column
+    // — an empty string (cleared in the dropdown, or a PI that never had a
+    // valid_upto set so startEdit() seeded editForm with '') must be sent as
+    // null, not '', or the update fails with "invalid input syntax for type
+    // date/uuid: \"\"". The create flow already guards this (handleSave
+    // deletes empty optional fields from its payload); this edit path never
+    // did, so saving any PI with no valid_upto always failed silently until
+    // now — same bug, edit side.
+    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,valid_upto:editForm.valid_upto||null,order_id:editForm.order_id||null,order_leg_id:editForm.order_leg_id||null,...totals,updated_at:new Date()}).eq('id',id)
     if (piErr) { setSaving(false); return setToast({message:piErr.message,type:'error'}) }
     // CHANGED: this delete's result was never checked. If it silently failed
     // (RLS/timeout) while the insert below still ran, every re-save stacked
@@ -799,11 +864,67 @@ function PIDetail() {
 
   function handleExportLines() {
     if (!pi||!lines.length) return
-    downloadCSV(`${pi.pi_no||'pi'}_lines_${today()}.csv`,['line_no','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'],lines)
+    // CHANGED: added a `product` column (resolved from product_id) — this
+    // export doubles as the starting template for the bulk-correction
+    // upload below, and a corrected file needs the product name to
+    // re-match lines back to their product on re-import.
+    const rows = lines.map(l => ({ ...l, product: products.find(p=>p.id===l.product_id)?.name || '' }))
+    downloadCSV(`${pi.pi_no||'pi'}_lines_${today()}.csv`,['line_no','product','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'],rows)
+  }
+
+  // CHANGED: bulk-upload corrections to an existing PI's lines while
+  // editing — replaces editLines entirely with the CSV's rows rather than
+  // appending, since a corrections file represents the full corrected set.
+  // Product resolution: match by `product` column name (case-insensitive)
+  // against the products table; if blank, inherit product_id from the
+  // existing line at the same line_no (so a file that only touches
+  // qty/rate doesn't need to restate every product). Unmatched rows are
+  // left with product_id=null — the existing findLinesMissingProductId
+  // check at save time already blocks on that, and editing mode now has a
+  // product dropdown (see LineItemsEditor below) to fix them manually.
+  async function handleBulkLinesCsv() {
+    setBulkCsvSaving(true)
+    const rows = bulkCsvText.trim().split('\n').filter(l => l.trim())
+    if (rows.length < 2) { setBulkCsvSaving(false); return setBulkCsvResult({ loaded: 0, errors: ['Need header + data rows'] }) }
+    const delim = detectDelimiter(rows[0])
+    const header = parseCSVLine(rows[0], delim).map(h => h.trim().toLowerCase())
+    const byName = new Map(products.map(p => [p.name.trim().toLowerCase(), p]))
+    const byLineNo = new Map(lines.map(l => [String(l.line_no), l]))
+    const errors = []
+    const newLines = []
+    for (let i = 1; i < rows.length; i++) {
+      const cols = parseCSVLine(rows[i], delim)
+      const row = {}
+      header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
+      if (!row.description && !row.qty && !row.rate) continue // blank row
+      const existing = row.line_no ? byLineNo.get(row.line_no) : null
+      const matchedProduct = row.product ? byName.get(row.product.toLowerCase()) : null
+      if (row.product && !matchedProduct) errors.push(`Row ${i + 1}: product "${row.product}" not found — line added without a product, pick one manually before saving.`)
+      const productId = matchedProduct?.id || (!row.product ? existing?.product_id : null) || ''
+      newLines.push({
+        _id: existing?.id || Date.now() + i, line_no: newLines.length + 1,
+        product_id: productId, description: row.description || existing?.description || '',
+        hsn_code: row.hsn_code || existing?.hsn_code || '', qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
+        rate: toNum(row.rate), gst_rate: toNum(row.gst_rate) || existing?.gst_rate || 18,
+        taxable_amount: 0, cgst_rate: 0, cgst_amount: 0, sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,
+        _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '',
+      })
+    }
+    const computed = newLines.map(l => computeLine(l, editForm.is_interstate))
+    setEditLines(computed)
+    setBulkCsvSaving(false)
+    setBulkCsvResult({ loaded: computed.length, errors })
   }
 
   async function updateStatus(status) {
     await supabase.from('proforma_invoices').update({status,updated_at:new Date()}).eq('id',id)
+    // Mark this PI's planned stock_movements rows cancelled too — they were
+    // never being flagged, leaving stale 'active' planned movements for a
+    // cancelled PI even though Actual Stock (computed live from invoice_lines)
+    // never reads this table.
+    if (status === 'cancelled') {
+      await supabase.from('stock_movements').update({is_cancelled:true}).eq('voucher_type','pi').eq('voucher_id',id)
+    }
     setToast({message:`PI marked as ${status}`,type:'success'}); load()
   }
 
@@ -815,11 +936,26 @@ function PIDetail() {
     navigate('/pi')
   }
 
+  async function handleDownloadPDF() {
+    setDocBusy('pdf')
+    try { printDocument(await buildPIDoc(pi, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate PDF', type: 'error' }) }
+    finally { setDocBusy('') }
+  }
+
+  async function handleDownloadExcel() {
+    setDocBusy('excel')
+    try { downloadDocumentExcel(await buildPIDoc(pi, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate Excel', type: 'error' }) }
+    finally { setDocBusy('') }
+  }
+
   if (loading) return <div style={{padding:'48px',textAlign:'center',color:C.textMuted}}>Loading…</div>
   if (!pi)     return <div style={{padding:'48px',textAlign:'center',color:C.danger}}>PI not found.</div>
 
   const canConvert = ['accepted','sent','draft'].includes(pi.status) && !editing
-  const isLocked   = ['converted','cancelled'].includes(pi.status)
+  // Master/admin can still edit/cancel a converted or cancelled PI when a correction is needed.
+  const isLocked   = !hasFullAccess(profile) && ['converted','cancelled'].includes(pi.status)
 
   return (
     <div>
@@ -830,7 +966,10 @@ function PIDetail() {
         subtitle={`${pi.from_entity?.name} → ${pi.to_entity?.name} · ${fmtDate(pi.pi_date)}`}
         action={
           <div style={{display:'flex',gap:'8px',flexWrap:'wrap',alignItems:'center'}}>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             <Btn size='sm' variant='ghost' onClick={handleExportLines}>↓ CSV</Btn>
+            {editing&&<Btn size='sm' variant='ghost' onClick={()=>{setBulkCsvText('');setBulkCsvResult(null);setBulkCsvModal(true)}}>↑ Bulk Upload</Btn>}
             {!editing&&!isLocked&&<Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing&&<Btn size='sm' variant='ghost' onClick={()=>setEditing(false)}>Discard</Btn>}
             {editing&&<Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving?'Saving…':'Save Changes'}</Btn>}
@@ -890,6 +1029,16 @@ function PIDetail() {
             </FormRow>
             <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>
             <FormRow label='Bill To'><Input value={editForm.bill_to} onChange={e=>setEditForm(f=>({...f,bill_to:e.target.value}))}/></FormRow>
+            <FormRow label='Payment Terms' hint='Shown on the generated PI PDF/Excel'>
+              <Input list='pi-edit-payment-terms' value={editForm.payment_terms} onChange={e=>setEditForm(f=>({...f,payment_terms:e.target.value}))} placeholder='e.g. Net 30 Days'/>
+              <datalist id='pi-edit-payment-terms'>{PAYMENT_TERMS_OPTIONS.map(o=><option key={o} value={o}/>)}</datalist>
+            </FormRow>
+            <FormRow label='Delivery Timeline' hint='Shown on the generated PI PDF/Excel'>
+              <Input value={editForm.delivery_timeline} onChange={e=>setEditForm(f=>({...f,delivery_timeline:e.target.value}))} placeholder='e.g. 7-10 working days from confirmation'/>
+            </FormRow>
+            <FormRow label='Mode of Transport'>
+              <Select value={editForm.mode_of_transport} onChange={e=>setEditForm(f=>({...f,mode_of_transport:e.target.value}))}>{TRANSPORT_MODES.map(m=><option key={m} value={m}>{m}</option>)}</Select>
+            </FormRow>
           </div>
           <div style={{marginTop:'8px'}}><FormRow label='Notes'><Textarea value={editForm.notes} onChange={e=>setEditForm(f=>({...f,notes:e.target.value}))} rows={2}/></FormRow></div>
         </Card>
@@ -900,8 +1049,10 @@ function PIDetail() {
           setLines={editing?setEditLines:()=>{}}
           interstate={editing?editForm.is_interstate:pi.is_interstate}
           hsnMap={hsnMap}
+          asOfDate={editing?editForm.pi_date:pi.pi_date}
           readOnly={!editing}
           showMargin={true}
+          products={editing?products:undefined}
         />
       </Card>
 
@@ -925,6 +1076,31 @@ function PIDetail() {
         title='Cancel PI' message='Cancel this proforma invoice? This action cannot be undone.' danger />
       <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
         title='Delete PI' message={`Delete ${pi.pi_no || 'this PI'}? This cannot be undone.`} danger />
+
+      <Modal open={bulkCsvModal} onClose={() => setBulkCsvModal(false)} title='Bulk Upload — Correct Line Items' width={560}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div style={{ fontSize: '12px', color: C.textMid }}>
+            Columns: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>line_no,product,description,hsn_code,qty,unit,rate,gst_rate</code><br />
+            This <b>replaces every line</b> currently in the editor below with the rows in this file — download your current lines first,
+            correct the numbers in Excel/Sheets, then re-upload. <code>line_no</code> matches a row back to its existing product/line;
+            leave <code>product</code> blank on a row to keep that line's current product. Extra columns (taxable_amount, etc.) are ignored — they're recomputed.
+          </div>
+          <Btn size='sm' variant='ghost' onClick={handleExportLines}>↓ Download Current Lines as Template</Btn>
+          <CsvFileDrop onText={setBulkCsvText} />
+          <textarea value={bulkCsvText} onChange={e => setBulkCsvText(e.target.value)} rows={8} placeholder='Or paste CSV data here…'
+            style={{ padding: '8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '11px', fontFamily: 'monospace', resize: 'vertical' }} />
+          {bulkCsvResult && (
+            <div style={{ background: bulkCsvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${bulkCsvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
+              {bulkCsvResult.loaded} line(s) loaded into the editor{bulkCsvResult.errors.length ? ` — ${bulkCsvResult.errors.length} warning(s)` : ''}. Review below, then Save Changes.
+              {bulkCsvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setBulkCsvModal(false)}>Close</Btn>
+            <Btn onClick={handleBulkLinesCsv} disabled={bulkCsvSaving || !bulkCsvText.trim()}>{bulkCsvSaving ? 'Loading…' : 'Load Into Editor'}</Btn>
+          </div>
+        </div>
+      </Modal>
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>

@@ -289,16 +289,19 @@ export function Btn({ children, onClick, variant = 'primary', size = 'md', disab
 }
 
 // ─── FormRow ──────────────────────────────────────────────────────────────────
-export function FormRow({ label, required, children, hint, error }) {
+export function FormRow({ label, required, children, hint, error, action }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
       {label && (
-        <label style={{
-          fontSize: '11px', fontWeight: 700, color: 'var(--text-soft)',
-          textTransform: 'uppercase', letterSpacing: '0.05em',
-        }}>
-          {label}{required && <span style={{ color: 'var(--danger)', marginLeft: '2px' }}>*</span>}
-        </label>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+          <label style={{
+            fontSize: '11px', fontWeight: 700, color: 'var(--text-soft)',
+            textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            {label}{required && <span style={{ color: 'var(--danger)', marginLeft: '2px' }}>*</span>}
+          </label>
+          {action}
+        </div>
       )}
       {children}
       {hint && !error && <div style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.4 }}>{hint}</div>}
@@ -308,7 +311,7 @@ export function FormRow({ label, required, children, hint, error }) {
 }
 
 // ─── Input ────────────────────────────────────────────────────────────────────
-export function Input({ value, onChange, placeholder, type = 'text', disabled, readOnly, style: extra, onKeyDown }) {
+export function Input({ value, onChange, placeholder, type = 'text', disabled, readOnly, style: extra, onKeyDown, list }) {
   return (
     <input
       type={type}
@@ -318,6 +321,7 @@ export function Input({ value, onChange, placeholder, type = 'text', disabled, r
       placeholder={placeholder}
       disabled={disabled}
       readOnly={readOnly}
+      list={list}
       className='tb-input'
       style={{
         padding: '7px 10px',
@@ -520,6 +524,11 @@ export function Table({ columns, rows, onRowClick, emptyState, sortKey, sortDir,
                   borderBottom: '1px solid var(--border)',
                   borderTop: '1px solid var(--border)',
                   whiteSpace: 'nowrap',
+                  // CHANGED: stays pinned when this table sits inside a
+                  // scrollable container (e.g. a Card with maxHeight+overflowY)
+                  // — harmless no-op otherwise, since a non-scrolling ancestor
+                  // never triggers the sticky behavior.
+                  position: 'sticky', top: 0, zIndex: 1,
                 }}
               >
                 {col.label}<SortIcon col={col} />

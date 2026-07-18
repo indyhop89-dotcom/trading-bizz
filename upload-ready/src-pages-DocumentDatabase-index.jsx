@@ -374,6 +374,12 @@ export default function DocumentDatabase() {
                               display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
                               gap: '4px',
                             }}>
+                              {/* CHANGED: show both status badges, same order as the Orders page
+                                  (movement_status + cargo_status), so a leg's status reads
+                                  identically wherever it's viewed — this page previously showed
+                                  cargo_status alone, dropping the movement_status context Orders
+                                  shows right next to it. */}
+                              <Badge status={leg.movement_status} />
                               <Badge status={leg.cargo_status?.replace(/_/g, ' ')} label={leg.cargo_status?.replace(/_/g, ' ')} />
                               <span style={{ marginLeft: '4px' }}>{isOpen ? '▲' : '▼'}</span>
                             </div>

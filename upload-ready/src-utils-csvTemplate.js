@@ -120,11 +120,11 @@ export const TEMPLATES = {
 
   hsn_master: {
     filename: 'hsn_master_template.csv',
-    headers:  ['hsn_code', 'description', 'rate_type', 'fixed_rate', 'slabs'],
+    headers:  ['hsn_code', 'description', 'rate_type', 'fixed_rate', 'slabs', 'effective_from'],
     rows: [
-      { hsn_code: '5208', description: 'Cotton woven fabric >=85%, <=200gsm', rate_type: 'fixed', fixed_rate: 5,  slabs: '' },
-      { hsn_code: '6109', description: 'T-shirts, singlets, vests knitted',    rate_type: 'slab',  fixed_rate: '', slabs: '1000:5|null:12' },
-      { hsn_code: '6201', description: 'Mens overcoats and capes',             rate_type: 'slab',  fixed_rate: '', slabs: '1000:5|5000:12|null:18' },
+      { hsn_code: '5208', description: 'Cotton woven fabric >=85%, <=200gsm', rate_type: 'fixed', fixed_rate: 5,  slabs: '', effective_from: '' },
+      { hsn_code: '6109', description: 'T-shirts, singlets, vests knitted',    rate_type: 'slab',  fixed_rate: '', slabs: '1000:5|null:12', effective_from: '' },
+      { hsn_code: '6201', description: 'Mens overcoats and capes',             rate_type: 'slab',  fixed_rate: '', slabs: '1000:5|5000:12|null:18', effective_from: '' },
     ],
     notes: [
       '# rate_type  = fixed OR slab',
@@ -132,6 +132,10 @@ export const TEMPLATES = {
       '# slabs      = for slab type: threshold_rupees:gst_rate pairs separated by |',
       '#             null threshold = open-ended final slab (must be last)',
       '#             example: 1000:5|null:12 means <=Rs1000 @ 5%, above @ 12%',
+      '# effective_from = YYYY-MM-DD, the date this rate takes effect — leave blank to use today.',
+      '#             re-uploading an existing hsn_code adds a NEW dated version rather than',
+      '#             overwriting its history; documents keep resolving to the rate that was',
+      '#             actually in force on their own date.',
     ],
   },
 

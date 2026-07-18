@@ -289,13 +289,20 @@ export default function DocumentChecklist({
     }
   }
 
-  async function handleDeleteOther() {
+  async function handleDeleteDoc() {
     try {
       await deleteFileFromDrive(confirmDelete.drive_file_id)
     } catch (err) {
       console.error('Storage delete error:', err)
     }
     await supabase.from('documents').delete().eq('id', confirmDelete.id)
+    // Checklist-slot documents keep their slot row — clear it back to
+    // Pending instead of deleting the row, since the slot itself still applies.
+    if (confirmDelete.checklistRowId) {
+      await supabase.from('leg_document_checklist')
+        .update({ document_id: null, status: 'pending', updated_at: new Date().toISOString() })
+        .eq('id', confirmDelete.checklistRowId)
+    }
     setConfirmDelete(null)
     setToast({ message: 'Document removed', type: 'success' })
     load()
@@ -472,6 +479,21 @@ export default function DocumentChecklist({
                         >
                           ↓ Save
                         </button>
+                        {!readOnly && (
+                          <button
+                            onClick={() => setConfirmDelete({ ...linkedDoc, checklistRowId: row.id })}
+                            title='Delete file'
+                            style={{
+                              padding: '4px 8px', borderRadius: '4px',
+                              fontSize: '12px', fontWeight: 600,
+                              background: 'none', color: C.danger,
+                              border: `1px solid ${C.border}`,
+                              cursor: 'pointer', fontFamily: 'inherit',
+                            }}
+                          >
+                            ×
+                          </button>
+                        )}
                       </>
                     )}
 
@@ -662,7 +684,7 @@ export default function DocumentChecklist({
       <ConfirmModal
         open={!!confirmDelete}
         onClose={() => setConfirmDelete(null)}
-        onConfirm={handleDeleteOther}
+        onConfirm={handleDeleteDoc}
         title='Remove Document'
         message={`Remove "${confirmDelete?.file_name}"? This deletes the file permanently.`}
         danger

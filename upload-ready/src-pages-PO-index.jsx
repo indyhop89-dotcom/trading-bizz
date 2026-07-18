@@ -16,7 +16,41 @@ import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../u
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
+import { downloadDocumentExcel } from '../../utils/documentExcel'
+import { getDriveViewUrl } from '../../utils/drive'
+
+// A PO's letterhead/issuer is the BUYER (the entity placing the order) —
+// the vendor being ordered from goes in the "Bill To" block. This is the
+// reverse of PI/Invoice, where the seller is the issuer.
+//
+// Fetches its own full entity rows (address/bank/logo columns) by id rather
+// than relying on the page's own load() query to embed them — this keeps
+// the wider, newer entity columns (which may not exist yet until migration
+// 025_entity_logo.sql is applied) isolated to document generation, so a
+// missing column here can never break the PO detail page itself loading.
+export async function buildPODoc(po, lines) {
+  const [{ data: buyer }, { data: seller }] = await Promise.all([
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', po.buyer_entity_id).single(),
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', po.seller_entity_id).single(),
+  ])
+  let logoSrc = null
+  if (buyer?.logo_file_id) { try { logoSrc = await getDriveViewUrl(buyer.logo_file_id) } catch { /* no logo — text-only header */ } }
+  return {
+    docType: 'PO',
+    docNo: po.po_no, docDate: po.po_date, validOrDueDate: po.delivery_date,
+    paymentTerms: po.payment_terms, deliveryTimeline: po.delivery_timeline, modeOfTransport: po.mode_of_transport || 'Road',
+    sellerEntity: { ...buyer, logoSrc },
+    buyerEntity: seller,
+    lines,
+    totals: { taxable_amount: po.taxable_amount, cgst_amount: po.cgst_amount, sgst_amount: po.sgst_amount, igst_amount: po.igst_amount, round_off_amount: po.round_off_amount, total_amount: po.total_amount },
+    interstate: po.is_interstate,
+    bankDetails: buyer,
+    notes: po.notes,
+  }
+}
 
 const PO_STATUSES = ['open', 'partial', 'completed', 'cancelled']
 
@@ -44,14 +78,21 @@ const EMPTY_FORM = {
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
   po_no: '', // CHANGED: optional manual PO number — blank suggests one via suggestNextNo()
+  // CHANGED: same gap as PI — the generated PDF/Excel has always had a
+  // Payment Terms/Delivery Timeline/Mode of Transport row that nothing
+  // ever collected, so it rendered blank on every document.
+  payment_terms: '', delivery_timeline: '', mode_of_transport: 'Road',
 }
+
+const PAYMENT_TERMS_OPTIONS = ['100% Advance', 'Net 30 Days', 'Net 45 Days', 'Net 60 Days', '50% Advance, 50% on Delivery', 'Against Delivery', 'LC at Sight', 'Cash on Delivery']
+const TRANSPORT_MODES = ['Road', 'Air', 'Rail', 'Sea', 'Courier']
 
 // ─── PO List ──────────────────────────────────────────────────────────────────
 function POList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: which entities this user may raise a PO *as buyer* — the buyer
   // converts the seller's PI into their own PO, so buyer is the writing side
   // (see 015_fix_po_write_gate.sql — po_write is gated on buyer_entity_id).
@@ -579,6 +620,18 @@ function POList() {
                 {legs.map(l => <option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name || l.from_entity?.name} → {l.to_entity?.short_name || l.to_entity?.name}</option>)}
               </Select>
             </FormRow>
+            <FormRow label='Payment Terms' hint='Shown on the generated PO PDF/Excel'>
+              <Input list='po-payment-terms' value={form.payment_terms} onChange={e => setF('payment_terms', e.target.value)} placeholder='e.g. Net 30 Days' />
+              <datalist id='po-payment-terms'>{PAYMENT_TERMS_OPTIONS.map(o => <option key={o} value={o} />)}</datalist>
+            </FormRow>
+            <FormRow label='Delivery Timeline' hint='Shown on the generated PO PDF/Excel'>
+              <Input value={form.delivery_timeline} onChange={e => setF('delivery_timeline', e.target.value)} placeholder='e.g. 7-10 working days from confirmation' />
+            </FormRow>
+            <FormRow label='Mode of Transport'>
+              <Select value={form.mode_of_transport} onChange={e => setF('mode_of_transport', e.target.value)}>
+                {TRANSPORT_MODES.map(m => <option key={m} value={m}>{m}</option>)}
+              </Select>
+            </FormRow>
           </div>
           <SectionDivider label='Line Items' />
           {linesLoading && (
@@ -587,7 +640,7 @@ function POList() {
               Loading line items from the linked PI…
             </div>
           )}
-          <LineItemsEditor lines={poLines} setLines={setPOLines} interstate={form.is_interstate} hsnMap={hsnMap} products={products} />
+          <LineItemsEditor lines={poLines} setLines={setPOLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.po_date} products={products} />
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
@@ -606,7 +659,7 @@ function PODetail() {
   const { id } = useParams()
   const navigate = useNavigate()
   const { profile } = useAuth()
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [po, setPO]     = useState(null)
@@ -614,6 +667,7 @@ function PODetail() {
   const [loading, setLoading] = useState(true)
   const [toast, setToast] = useState(null)
   const [confirmCancel, setConfirmCancel] = useState(false)
+  const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -648,6 +702,20 @@ function PODetail() {
     navigate('/po')
   }
 
+  async function handleDownloadPDF() {
+    setDocBusy('pdf')
+    try { printDocument(await buildPODoc(po, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate PDF', type: 'error' }) }
+    finally { setDocBusy('') }
+  }
+
+  async function handleDownloadExcel() {
+    setDocBusy('excel')
+    try { downloadDocumentExcel(await buildPODoc(po, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate Excel', type: 'error' }) }
+    finally { setDocBusy('') }
+  }
+
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!po)     return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>PO not found.</div>
 
@@ -659,6 +727,8 @@ function PODetail() {
         subtitle={`${po.buyer?.name} ← ${po.seller?.name} · ${fmtDate(po.po_date)}`}
         action={
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             {po.status === 'open' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('completed')}>Mark Completed</Btn>}
             {!['cancelled','completed'].includes(po.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
             {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}

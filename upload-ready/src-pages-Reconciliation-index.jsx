@@ -15,7 +15,8 @@ const TABS = ['Intercompany', 'Invoice Match']
 function IntercompanyTab() {
   const [pairs, setPairs]   = useState([])
   const [loading, setLoading] = useState(true)
-  const [filter, setFilter] = useState('all') // all | matched | unmatched
+  const [filter, setFilter] = useState('all') // all | matched | unmatched | variance | waived
+  const [toast, setToast] = useState(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -23,7 +24,7 @@ function IntercompanyTab() {
     // Get all sales invoices between associates
     const { data: salesInvoices } = await supabase
       .from('invoices')
-      .select('id, invoice_no, invoice_date, total_amount, status, seller:seller_entity_id(id,name,short_name,type), buyer:buyer_entity_id(id,name,short_name,type)')
+      .select('id, invoice_no, invoice_date, total_amount, status, no_purchase_needed, seller:seller_entity_id(id,name,short_name,type), buyer:buyer_entity_id(id,name,short_name,type)')
       .eq('invoice_type', 'sales')
       .eq('is_deleted', false)
       .neq('status', 'cancelled')
@@ -62,7 +63,10 @@ function IntercompanyTab() {
         is_matched:       isMatched,
         has_variance:     hasVariance,
         variance_amount:  variance,
-        status: !match ? 'unmatched' : isMatched ? 'matched' : 'variance',
+        // A sale can legitimately have no purchase side (goods shipped from
+        // existing inventory rather than a fresh purchase) — inv.no_purchase_needed
+        // lets that be acknowledged instead of showing as a permanent error.
+        status: !match ? (inv.no_purchase_needed ? 'waived' : 'unmatched') : isMatched ? 'matched' : 'variance',
       }
     }))
 
@@ -72,15 +76,25 @@ function IntercompanyTab() {
 
   useEffect(() => { load() }, [load])
 
+  async function toggleNoPurchaseNeeded(invoiceId, next) {
+    const { error } = await supabase.from('invoices').update({ no_purchase_needed: next }).eq('id', invoiceId)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setPairs(ps => ps.map(p => p.sales_invoice.id === invoiceId
+      ? { ...p, sales_invoice: { ...p.sales_invoice, no_purchase_needed: next }, status: next ? 'waived' : 'unmatched' }
+      : p))
+  }
+
   const filtered = filter === 'all' ? pairs : pairs.filter(p => p.status === filter)
   const matchedCount   = pairs.filter(p => p.status === 'matched').length
   const unmatchedCount = pairs.filter(p => p.status === 'unmatched').length
   const varianceCount  = pairs.filter(p => p.status === 'variance').length
+  const waivedCount    = pairs.filter(p => p.status === 'waived').length
 
   const statusStyle = {
     matched:   { bg: '#e8f3ec', color: '#1a5c30', label: '✓ Matched' },
     unmatched: { bg: '#f0e8e8', color: '#8a2020', label: '✗ Purchase side missing' },
     variance:  { bg: '#fff3cc', color: '#7a5000', label: '⚠ Amount mismatch' },
+    waived:    { bg: '#e8eef3', color: '#2a4a68', label: 'ℹ Inventory source' },
   }
 
   const th = { padding: '9px 14px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', whiteSpace: 'nowrap' }
@@ -93,10 +107,11 @@ function IntercompanyTab() {
         <StatCard label='Matched'   value={matchedCount}   color={C.success} />
         <StatCard label='Unmatched' value={unmatchedCount} color={unmatchedCount > 0 ? C.danger : C.success} />
         <StatCard label='Variance'  value={varianceCount}  color={varianceCount  > 0 ? C.warning : C.success} />
+        <StatCard label='Inventory source' value={waivedCount} />
       </div>
 
       <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
-        {['all','matched','unmatched','variance'].map(f => (
+        {['all','matched','unmatched','variance','waived'].map(f => (
           <button key={f} onClick={() => setFilter(f)}
             style={{ padding: '6px 14px', border: `1.5px solid ${filter === f ? C.accent : C.border}`, borderRadius: '6px', background: filter === f ? C.accent : C.surface, color: filter === f ? '#f5f0e8' : C.textMid, fontSize: '12px', fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', textTransform: 'capitalize' }}>
             {f}
@@ -141,7 +156,10 @@ function IntercompanyTab() {
                       <td style={{ ...td, fontSize: '12px' }}>{fmtDate(pair.sales_invoice.invoice_date)}</td>
                       <td style={{ ...td, textAlign: 'right', fontWeight: 600 }}>{formatINR(pair.sales_invoice.total_amount)}</td>
                       <td style={{ ...td, fontFamily: 'monospace', fontSize: '12px', color: pair.purchase_invoice ? C.text : C.danger }}>
-                        {pair.purchase_invoice?.invoice_no || pair.purchase_invoice?.id?.slice(0,8) || <span style={{ color: C.danger }}>— not found</span>}
+                        {pair.purchase_invoice?.invoice_no || pair.purchase_invoice?.id?.slice(0,8) ||
+                          (pair.status === 'waived'
+                            ? <span style={{ color: C.textMuted }}>— inventory source</span>
+                            : <span style={{ color: C.danger }}>— not found</span>)}
                       </td>
                       <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: pair.purchase_invoice ? C.text : C.textMuted }}>
                         {pair.purchase_invoice ? formatINR(pair.purchase_invoice.total_amount) : '—'}
@@ -150,9 +168,23 @@ function IntercompanyTab() {
                         {pair.variance_amount != null ? (pair.variance_amount === 0 ? '—' : formatINR(pair.variance_amount)) : '—'}
                       </td>
                       <td style={td}>
-                        <span style={{ fontSize: '11px', fontWeight: 700, background: s.bg, color: s.color, padding: '3px 8px', borderRadius: '4px', whiteSpace: 'nowrap' }}>
-                          {s.label}
-                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                          <span style={{ fontSize: '11px', fontWeight: 700, background: s.bg, color: s.color, padding: '3px 8px', borderRadius: '4px', whiteSpace: 'nowrap' }}>
+                            {s.label}
+                          </span>
+                          {(pair.status === 'unmatched' || pair.status === 'waived') && (
+                            <button
+                              onClick={() => toggleNoPurchaseNeeded(pair.sales_invoice.id, pair.status === 'unmatched')}
+                              style={{
+                                fontSize: '11px', fontWeight: 600, padding: '3px 8px', borderRadius: '4px',
+                                background: 'none', color: C.textMuted, border: `1px solid ${C.border}`,
+                                cursor: 'pointer', fontFamily: 'inherit', whiteSpace: 'nowrap',
+                              }}
+                            >
+                              {pair.status === 'unmatched' ? 'Mark inventory source' : 'Undo'}
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   )
@@ -162,6 +194,7 @@ function IntercompanyTab() {
           </div>
         )}
       </Card>
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
 }

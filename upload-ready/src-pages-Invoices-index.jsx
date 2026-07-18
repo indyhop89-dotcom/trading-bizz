@@ -16,19 +16,41 @@ import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../u
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock, getInvoiceLifecycleStage } from '../../utils/stock'
+import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
+import { downloadDocumentExcel } from '../../utils/documentExcel'
+import { getDriveViewUrl } from '../../utils/drive'
+import { isValidEwayBill, EWAY_BILL_ERROR } from '../../utils/validation'
+
+// Fetches its own full entity rows (address/bank/logo columns) by id rather
+// than relying on the page's own load() query to embed them — this keeps
+// the wider, newer entity columns (which may not exist yet until migration
+// 025_entity_logo.sql is applied) isolated to document generation, so a
+// missing column here can never break the Invoice detail page itself loading.
+export async function buildInvoiceDoc(inv, lines) {
+  const [{ data: seller }, { data: buyer }] = await Promise.all([
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', inv.seller_entity_id).single(),
+    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', inv.buyer_entity_id).single(),
+  ])
+  let logoSrc = null
+  if (seller?.logo_file_id) { try { logoSrc = await getDriveViewUrl(seller.logo_file_id) } catch { /* no logo — text-only header */ } }
+  return {
+    docType: 'INVOICE',
+    docNo: inv.invoice_no, docDate: inv.invoice_date, validOrDueDate: inv.due_date,
+    sellerEntity: { ...seller, logoSrc },
+    buyerEntity: buyer,
+    lines,
+    totals: { taxable_amount: inv.taxable_amount, cgst_amount: inv.cgst_amount, sgst_amount: inv.sgst_amount, igst_amount: inv.igst_amount, round_off_amount: inv.round_off_amount, total_amount: inv.total_amount },
+    interstate: inv.is_interstate,
+    bankDetails: seller,
+    notes: inv.notes,
+    ewayBill: { eway_bill_no: inv.eway_bill_no, vehicle_no: inv.vehicle_no, transporter_name: inv.transporter_name, challan_no: inv.challan_no },
+  }
+}
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
-const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
-const TDS_SECTION_LABELS = {
-  '194C': 'Payment to Contractors',
-  '194H': 'Commission or Brokerage',
-  '194I': 'Rent',
-  '194J': 'Professional/Technical Services',
-  '194Q': 'Purchase of Goods',
-  '206C': 'TCS on Sale of Goods',
-}
 
 // CHANGED: LineItemsEditor lines carry UI-only helper fields (_id, _cost_rate,
 // _margin_pct, _hsn_*) that are NOT columns on invoice_lines. Sending them made
@@ -118,7 +140,7 @@ function InvoiceList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [selected, setSelected] = useState(new Set())
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false)
   const [bulkDeleting, setBulkDeleting] = useState(false)
@@ -332,6 +354,14 @@ function InvoiceList() {
   async function handleBulkDelete() {
     setBulkDeleting(true)
     const { error } = await supabase.from('invoices').update({ is_deleted: true }).in('id', [...selected])
+    // Same reopen-the-source-PI fix as the single-invoice delete above —
+    // otherwise a bulk-deleted invoice leaves its PI stuck on 'converted'.
+    if (!error) {
+      const piIds = invoices.filter(i => selected.has(i.id) && i.pi_id).map(i => i.pi_id)
+      if (piIds.length) {
+        await supabase.from('proforma_invoices').update({ status: 'accepted', converted_to_invoice_id: null }).in('id', piIds)
+      }
+    }
     setBulkDeleting(false)
     setConfirmBulkDelete(false)
     if (error) return setToast({ message: error.message, type: 'error' })
@@ -504,24 +534,12 @@ function NewInvoice() {
   const [form, setForm]         = useState({ ...EMPTY_FORM, pi_id: fromPiId || '' })
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
-  // CHANGED: TDS/TCS entries
-  const [tdsEntries, setTdsEntries] = useState([])  // [{type,section,rate,base_amount}]
   // CHANGED: available stock for the seller entity — feeds LineItemsEditor's
   // stockMap so the seller can see (and be warned about) overselling past
   // what they actually have on hand. Was previously never wired in at all.
   const [stockMap, setStockMap] = useState({})
   const [stockWarning, setStockWarning] = useState(null)
   const [linesLoading, setLinesLoading] = useState(false)  // CHANGED: PI/PO line-item fetch in progress
-
-  function addTdsRow(type) {
-    setTdsEntries(rows => [...rows, { _id: Date.now(), type, section: type === 'tcs' ? '206C' : '194C', rate: type === 'tcs' ? 0.1 : 1, base_amount: '' }])
-  }
-  function updateTdsRow(id, key, val) {
-    setTdsEntries(rows => rows.map(r => r._id === id ? { ...r, [key]: val } : r))
-  }
-  function removeTdsRow(id) {
-    setTdsEntries(rows => rows.filter(r => r._id !== id))
-  }
 
   useEffect(() => {
     Promise.all([
@@ -742,6 +760,14 @@ function NewInvoice() {
     }
     if (!payload.tds_amount)    delete payload.tds_amount
     if (!payload.tcs_amount)    delete payload.tcs_amount
+    // CHANGED: eway_bill_no/eway_bill_date must never be set at creation —
+    // unconditionally, not just when blank. saveEwbForm's stock/purchase-mirror/
+    // cargo-status side effects only fire on the false→true transition of
+    // eway_bill_no; if it arrived already-set from creation, that transition
+    // (and both side effects) would silently never happen. Every invoice must
+    // start EWB-less and get it exclusively through that one dedicated flow.
+    delete payload.eway_bill_no
+    delete payload.eway_bill_date
 
     const { data: inv, error } = await supabase.from('invoices').insert(payload).select().single()
     if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
@@ -757,30 +783,10 @@ function NewInvoice() {
       return setToast({ message: `Invoice ${invoiceNo} was created, but its line items failed to save: ${linesErr.message}. Delete this invoice and try again.`, type: 'error' })
     }
 
-    // CHANGED: Insert TDS/TCS entries
-    if (tdsEntries.length > 0) {
-      const tdsPayload = tdsEntries
-        .filter(r => r.base_amount && parseFloat(r.base_amount) > 0)
-        .map(r => {
-          const base   = Math.round(parseFloat(r.base_amount))
-          const amount = Math.round(base * parseFloat(r.rate) / 100)
-          return {
-            invoice_id:            inv.id,
-            entry_type:            r.type,
-            section_code:          r.section,
-            section_desc:          TDS_SECTION_LABELS[r.section] || r.section,
-            deducted_by_entity_id: r.type === 'tds' ? form.buyer_entity_id  : form.seller_entity_id,
-            deductee_entity_id:    r.type === 'tds' ? form.seller_entity_id : form.buyer_entity_id,
-            base_amount:           base,
-            rate:                  parseFloat(r.rate),
-            amount,
-          }
-        })
-      if (tdsPayload.length > 0) {
-        const { error: tdsErr } = await supabase.from('tds_tcs_entries').insert(tdsPayload)
-        if (tdsErr) setToast({ message: `Invoice ${invoiceNo} saved, but TDS/TCS entries failed to save: ${tdsErr.message}`, type: 'error' })
-      }
-    }
+    // TDS/TCS is no longer recorded at invoice creation — it's recognized at
+    // payment time instead (Payments → Invoice Payment Tracker), which is the
+    // single source of truth going forward. See tds_tcs_entries: still read
+    // (never written) below for invoices created before this change.
 
     // Mark PI as converted if applicable
     if (form.pi_id) {
@@ -876,7 +882,7 @@ function NewInvoice() {
             </div>
           )}
           <div style={{ marginTop: '12px' }}>
-            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} stockMap={stockMap} products={products} />
+            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.invoice_date} stockMap={stockMap} products={products} />
           </div>
         </Card>
 
@@ -896,7 +902,14 @@ function NewInvoice() {
         </Card>
 
         <Card style={{ padding: '20px' }}>
-          <SectionDivider label='Billing, Shipping & E-way Bill' />
+          {/* CHANGED: E-way Bill entry removed from here — it must only ever be
+              added via the dedicated flow on the invoice detail page
+              (saveEwbForm). That's the ONLY path that auto-creates the buyer's
+              purchase-register mirror and syncs the order leg's movement/cargo
+              status on the false→true transition; entering it here at creation
+              time would set eway_bill_no from the start, so that transition
+              (and both side effects) would silently never fire. */}
+          <SectionDivider label='Billing & Shipping' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '12px' }}>
             <FormRow label='Bill From'>
               <Input value={form.bill_from} onChange={e => setF('bill_from', e.target.value)} placeholder='Billing address of seller' />
@@ -910,49 +923,7 @@ function NewInvoice() {
             <FormRow label='Ship To'>
               <Input value={form.ship_to} onChange={e => setF('ship_to', e.target.value)} placeholder='Delivery location' />
             </FormRow>
-            <FormRow label='E-way Bill No'>
-              <Input value={form.eway_bill_no} onChange={e => setF('eway_bill_no', e.target.value)} placeholder='EWB number' />
-            </FormRow>
-            <FormRow label='E-way Bill Date' hint='Can differ from invoice date'>
-              <Input type='date' value={form.eway_bill_date} onChange={e => setF('eway_bill_date', e.target.value)} />
-            </FormRow>
           </div>
-        </Card>
-
-        {/* CHANGED: TDS/TCS section */}
-        <Card style={{ padding: '20px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-            <SectionDivider label='TDS / TCS (optional)' />
-            <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
-              <Btn size='sm' variant='ghost' onClick={() => addTdsRow('tds')}>+ TDS</Btn>
-              <Btn size='sm' variant='ghost' onClick={() => addTdsRow('tcs')}>+ TCS</Btn>
-            </div>
-          </div>
-          {tdsEntries.length === 0 ? (
-            <div style={{ fontSize: '12px', color: C.textMuted, padding: '8px 0' }}>No TDS/TCS entries. Click + TDS or + TCS to add.</div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              {tdsEntries.map(row => {
-                const base   = parseFloat(row.base_amount) || 0
-                const amount = Math.round(base * parseFloat(row.rate) / 100)
-                return (
-                  <div key={row._id} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr 1fr auto', gap: '10px', alignItems: 'center', padding: '10px 12px', background: C.bg, borderRadius: '6px', border: `1px solid ${C.border}` }}>
-                    <Badge status={row.type === 'tcs' ? 'export' : 'domestic'} label={row.type.toUpperCase()} />
-                    <Select value={row.section} onChange={e => updateTdsRow(row._id, 'section', e.target.value)}>
-                      {TDS_SECTIONS.map(s => <option key={s} value={s}>{s} — {TDS_SECTION_LABELS[s]}</option>)}
-                    </Select>
-                    <FormRow label='Base Amount (₹)'>
-                      <Input type='number' value={row.base_amount} onChange={e => updateTdsRow(row._id, 'base_amount', e.target.value)} placeholder='0' />
-                    </FormRow>
-                    <FormRow label={`Rate % → ₹${amount.toLocaleString('en-IN')}`}>
-                      <Input type='number' step='0.01' value={row.rate} onChange={e => updateTdsRow(row._id, 'rate', e.target.value)} />
-                    </FormRow>
-                    <button onClick={() => removeTdsRow(row._id)} style={{ background: 'none', border: 'none', color: C.danger, cursor: 'pointer', fontSize: '18px', padding: '0 4px' }}>×</button>
-                  </div>
-                )
-              })}
-            </div>
-          )}
         </Card>
 
         <Card style={{ padding: '20px' }}>
@@ -982,7 +953,7 @@ function InvoiceDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
   const { profile } = useAuth()
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [inv, setInv]     = useState(null)
@@ -997,6 +968,7 @@ function InvoiceDetail() {
   const [irnEdit, setIrnEdit]   = useState(false)
   const [irnForm, setIrnForm]   = useState({})
   const [sectSaving, setSectSaving] = useState(false)
+  const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -1059,9 +1031,29 @@ function InvoiceDetail() {
   async function handleDelete() {
     setDeleting(true)
     const { error } = await supabase.from('invoices').update({ is_deleted: true }).eq('id', id)
+    // Deleting an invoice that was converted from a PI left the source PI
+    // stuck on status 'converted' pointing at a now soft-deleted invoice —
+    // reopen it so it shows up as needing conversion again.
+    if (!error && inv?.pi_id) {
+      await supabase.from('proforma_invoices').update({ status: 'accepted', converted_to_invoice_id: null }).eq('id', inv.pi_id)
+    }
     setDeleting(false); setConfirmDelete(false)
     if (error) return setToast({ message: error.message, type: 'error' })
     navigate('/invoices')
+  }
+
+  async function handleDownloadPDF() {
+    setDocBusy('pdf')
+    try { printDocument(await buildInvoiceDoc(inv, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate PDF', type: 'error' }) }
+    finally { setDocBusy('') }
+  }
+
+  async function handleDownloadExcel() {
+    setDocBusy('excel')
+    try { downloadDocumentExcel(await buildInvoiceDoc(inv, lines)) }
+    catch (err) { setToast({ message: err.message || 'Could not generate Excel', type: 'error' }) }
+    finally { setDocBusy('') }
   }
 
   // CHANGED: save EWB + Challan fields
@@ -1076,6 +1068,7 @@ function InvoiceDetail() {
     setEwbEdit(true)
   }
   async function saveEwbForm() {
+    if (!isValidEwayBill(ewbForm.eway_bill_no)) return setToast({ message: EWAY_BILL_ERROR, type: 'error' })
     setSectSaving(true)
     const wasEwaySet = !!inv.eway_bill_no
     const { error } = await supabase.from('invoices').update({
@@ -1100,8 +1093,11 @@ function InvoiceDetail() {
       // sync the leg's movement_status so it doesn't stay stuck on "pending"
       // (previously only updated via a manual edit on the leg that nobody
       // remembered to make, so it drifted out of sync with the Stock column).
+      // cargo_status is the separate field Document Database actually shows —
+      // it was never touched here either, so a leg with an invoice + EWB
+      // already on file could still read "awaiting cargo" forever.
       if (inv.order_leg_id) {
-        await supabase.from('order_legs').update({ movement_status: 'delivered' }).eq('id', inv.order_leg_id)
+        await supabase.from('order_legs').update({ movement_status: 'delivered', cargo_status: 'cargo_dispatched' }).eq('id', inv.order_leg_id)
       }
     }
 
@@ -1140,6 +1136,13 @@ function InvoiceDetail() {
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!inv)    return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>Invoice not found.</div>
 
+  // 'paid' wasn't locked before, only 'cancelled' — added here since a paid
+  // invoice's E-way Bill/IRN sections could otherwise still be changed after
+  // settlement, which is a live-data-integrity risk (an EWB save also moves
+  // stock, which shouldn't happen for a settled or cancelled invoice).
+  // Master/admin can still override the lock when a correction is genuinely needed.
+  const isLocked = !hasFullAccess(profile) && ['cancelled', 'paid'].includes(inv.status)
+
   return (
     <div>
       <button onClick={() => navigate('/invoices')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '13px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', marginBottom: '4px' }}>← Invoices</button>
@@ -1148,6 +1151,8 @@ function InvoiceDetail() {
         subtitle={`${inv.seller?.name} → ${inv.buyer?.name} · ${fmtDate(inv.invoice_date)}`}
         action={
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
+            <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             {inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
             {!['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
@@ -1221,13 +1226,13 @@ function InvoiceDetail() {
               <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
             )}
           </div>
-          {!ewbEdit && (
+          {!ewbEdit && !isLocked && (
             <Btn size='sm' variant='ghost' onClick={openEwbEdit}>
               {(inv.eway_bill_no || inv.challan_no) ? 'Edit' : '+ Add'}
             </Btn>
           )}
         </div>
-        {ewbEdit ? (
+        {ewbEdit && !isLocked ? (
           <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
             {!inv.eway_bill_no && inv.invoice_type === 'sales' && (
               <div style={{background:'#fff3cc',border:'1px solid #e6c040',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#7a5000'}}>
@@ -1239,7 +1244,7 @@ function InvoiceDetail() {
               </div>
             )}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-              <FormRow label='EWB Number'>
+              <FormRow label='EWB Number' error={!isValidEwayBill(ewbForm.eway_bill_no) ? EWAY_BILL_ERROR : undefined}>
                 <Input value={ewbForm.eway_bill_no} onChange={e => setEwbForm(f => ({...f, eway_bill_no: e.target.value}))} placeholder='e.g. 421234567890' />
               </FormRow>
               <FormRow label='EWB Date'>
@@ -1277,7 +1282,9 @@ function InvoiceDetail() {
           </div>
         ) : (
           <div style={{ padding: '12px 14px', fontSize: '12px', color: C.textMuted }}>
-            No E-way Bill or Challan details entered. Click <strong>+ Add</strong> to fill in.
+            {isLocked
+              ? `No E-way Bill or Challan details entered. Invoice is ${inv.status} — locked from further edits.`
+              : <>No E-way Bill or Challan details entered. Click <strong>+ Add</strong> to fill in.</>}
           </div>
         )}
       </div>
@@ -1291,13 +1298,13 @@ function InvoiceDetail() {
               <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
             )}
           </div>
-          {!irnEdit && (
+          {!irnEdit && !isLocked && (
             <Btn size='sm' variant='ghost' onClick={openIrnEdit}>
               {(inv.einvoice_irn || inv.einvoice_ack_no) ? 'Edit' : '+ Add'}
             </Btn>
           )}
         </div>
-        {irnEdit ? (
+        {irnEdit && !isLocked ? (
           <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <FormRow label='IRN (Invoice Reference Number)'>
               <Input
@@ -1357,7 +1364,9 @@ function InvoiceDetail() {
           </div>
         ) : (
           <div style={{ padding: '12px 14px', fontSize: '12px', color: C.textMuted }}>
-            No IRN entered yet. Click <strong>+ Add</strong> after generating from GST portal.
+            {isLocked
+              ? `No IRN entered. Invoice is ${inv.status} — locked from further edits.`
+              : <>No IRN entered yet. Click <strong>+ Add</strong> after generating from GST portal.</>}
           </div>
         )}
       </div>

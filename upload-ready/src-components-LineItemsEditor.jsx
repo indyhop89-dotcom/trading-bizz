@@ -79,6 +79,9 @@ function TotalsBar({ totals, interstate }) {
  *   interstate - boolean
  *   products   - optional product list
  *   hsnMap     - Map from buildHSNMap()
+ *   asOfDate   - the parent document's own date (invoice_date/pi_date/po_date/note_date) —
+ *                HSN rates are resolved as of this date, not "today", so a document dated
+ *                for an earlier period keeps the rate that was actually in force back then.
  *   readOnly   - boolean
  *   showMargin - boolean — show Margin % column + apply-all control
  *   stockMap   - Map<product_id, availableQty> — for shortfall warnings
@@ -107,7 +110,7 @@ const ROW_HEIGHT = 56
 const OVERSCAN = 15
 const VIEWPORT_HEIGHT = 600
 
-export default function LineItemsEditor({ lines, setLines, interstate, products = [], hsnMap, readOnly, showMargin = false, stockMap }) {
+export default function LineItemsEditor({ lines, setLines, interstate, products = [], hsnMap, asOfDate, readOnly, showMargin = false, stockMap }) {
 
   const [applyMarginPct, setApplyMarginPct] = useState('')
   const [scrollTop, setScrollTop] = useState(0)
@@ -145,7 +148,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
         const rateForLookup = key === 'rate' ? toNum(val) : toNum(updated.rate)
         const hsnForLookup  = key === 'hsn_code' ? val : updated.hsn_code
         const { gst_rate, source } = hsnMap
-          ? resolveGSTRate(hsnForLookup, rateForLookup, hsnMap)
+          ? resolveGSTRate(hsnForLookup, rateForLookup, hsnMap, asOfDate)
           : { gst_rate: null, source: 'default' }
 
         if (gst_rate !== null) {
@@ -208,7 +211,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
 
             // Re-evaluate HSN at new rate
             if (hsnMap && updated.hsn_code) {
-              const { gst_rate, source } = resolveGSTRate(updated.hsn_code, newRate, hsnMap)
+              const { gst_rate, source } = resolveGSTRate(updated.hsn_code, newRate, hsnMap, asOfDate)
               if (gst_rate !== null) {
                 updated.gst_rate = gst_rate
                 updated._hsn_resolved_rate = gst_rate
@@ -253,7 +256,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
         _hsn_manually_set: false,
       }
       if (hsnMap && updated.hsn_code) {
-        const { gst_rate, source } = resolveGSTRate(updated.hsn_code, newRate, hsnMap)
+        const { gst_rate, source } = resolveGSTRate(updated.hsn_code, newRate, hsnMap, asOfDate)
         if (gst_rate !== null) {
           updated.gst_rate = gst_rate
           updated._hsn_resolved_rate = gst_rate
@@ -279,7 +282,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
         _cost_rate: null, _margin_pct: '', // reset cost lock when product changes
       }
       const { gst_rate, source } = hsnMap
-        ? resolveGSTRate(updated.hsn_code, toNum(updated.rate), hsnMap)
+        ? resolveGSTRate(updated.hsn_code, toNum(updated.rate), hsnMap, asOfDate)
         : { gst_rate: null }
       if (gst_rate !== null) {
         updated.gst_rate = gst_rate

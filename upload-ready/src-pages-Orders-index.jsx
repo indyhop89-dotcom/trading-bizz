@@ -9,10 +9,44 @@ import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
 import { formatINR, toNum } from '../../utils/money'
 import { suggestNextNo } from '../../utils/numbering'
-import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master-only delete, matches PI/PO/Invoices pattern
+import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master/admin-only delete, matches PI/PO/Invoices pattern
+import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { getInvoiceLifecycleStage } from '../../utils/stock'
 import { getDriveViewUrl } from '../../utils/drive'
+import { fetchAllPages } from '../../utils/query'
+import { printDocument } from '../../utils/documentTemplate'
+import { downloadDocumentExcel } from '../../utils/documentExcel'
+import { buildPIDoc } from '../PI/index'
+import { buildPODoc } from '../PO/index'
+import { buildInvoiceDoc } from '../Invoices/index'
+
+// Per-leg "Generate Docs" convenience action — the leg view here only holds
+// summary columns (piMap/poMap/invMap), so each click fetches that one
+// document's full header + line items on demand (build*Doc() itself fetches
+// the full entity rows it needs), then reuses the exact same
+// printDocument/downloadDocumentExcel calls each document's own detail page uses.
+async function fetchAndBuildLegDoc(docType, docId) {
+  if (docType === 'PI') {
+    const [{ data: pi }, { data: lines }] = await Promise.all([
+      supabase.from('proforma_invoices').select('*').eq('id', docId).single(),
+      fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id', docId).order('line_no')),
+    ])
+    return buildPIDoc(pi, lines || [])
+  }
+  if (docType === 'PO') {
+    const [{ data: po }, { data: lines }] = await Promise.all([
+      supabase.from('purchase_orders').select('*').eq('id', docId).single(),
+      fetchAllPages(() => supabase.from('purchase_order_lines').select('*').eq('po_id', docId).order('line_no')),
+    ])
+    return buildPODoc(po, lines || [])
+  }
+  const [{ data: inv }, { data: lines }] = await Promise.all([
+    supabase.from('invoices').select('*').eq('id', docId).single(),
+    fetchAllPages(() => supabase.from('invoice_lines').select('*').eq('invoice_id', docId).order('line_no')),
+  ])
+  return buildInvoiceDoc(inv, lines || [])
+}
 
 const MOVEMENT_TYPES    = ['domestic', 'export', 'blended']
 const ORDER_STATUSES    = ['open', 'in_progress', 'completed', 'cancelled']
@@ -191,7 +225,7 @@ function OrdersList() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role, same convention as PI/PO/Invoices
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: which entities this user may raise an order *from* — orders_write
   // is gated on has_entity_grant(origin_entity_id).
   const { entities: accessEntities, frozen: originEntityFrozen, defaultEntityId } = useEntityAccess()
@@ -413,7 +447,7 @@ function OrderDetail() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: single-order delete, master-only, same convention as PI/PO/Invoices detail pages
-  const canDelete = profile?.role === 'master'
+  const canDelete = hasFullAccess(profile)
   // CHANGED: orders_write / order_legs_write are both gated on
   // has_entity_grant(origin_entity_id / from_entity_id) — same "creating
   // side" restriction as the New Order form.
@@ -438,6 +472,7 @@ function OrderDetail() {
   const [docMap, setDocMap]     = useState({})
   const [costBasisMap, setCostBasisMap] = useState({}) // CHANGED: leg-1's real acquisition cost, keyed by leg id — see computeLegMargin
   const [docsOpen, setDocsOpen] = useState({})
+  const [legDocBusy, setLegDocBusy] = useState('') // `${legId}:${docType}:${format}` while generating
   // CHANGED: order-wide document completeness — sums each leg's checklist
   // instead of only showing completeness one leg at a time.
   const [docCompleteness, setDocCompleteness] = useState({ uploaded: 0, total: 0 })
@@ -512,6 +547,21 @@ function OrderDetail() {
   function setLF(k,v){ setLegForm(f=>({...f,[k]:v})) }
   function setOF(k,v){ setOrderForm(f=>({...f,[k]:v})) }
   function toggleDocs(legId){ setDocsOpen(d=>({...d,[legId]:!d[legId]})) }
+
+  async function handleLegDoc(legId, docType, docId, format) {
+    if (!docId) return
+    const key = `${legId}:${docType}:${format}`
+    setLegDocBusy(key)
+    try {
+      const doc = await fetchAndBuildLegDoc(docType, docId)
+      if (format === 'pdf') printDocument(doc)
+      else downloadDocumentExcel(doc)
+    } catch (err) {
+      setToast({ message: err.message || `Could not generate ${docType} ${format}`, type: 'error' })
+    } finally {
+      setLegDocBusy('')
+    }
+  }
   function openNewLeg(){ setEditingLeg(null); setLegForm({...EMPTY_LEG,from_entity_id:defaultEntityId}); setLegModal(true) }
   function openEditLeg(leg){ setEditingLeg(leg); setLegForm({from_entity_id:leg.from_entity_id||'',to_entity_id:leg.to_entity_id||'',movement_status:leg.movement_status||'pending',cargo_status:leg.cargo_status||'awaiting_cargo',dispatch_date:leg.dispatch_date||'',delivery_date:leg.delivery_date||'',notes:leg.notes||''}); setLegModal(true) }
 
@@ -617,8 +667,24 @@ function OrderDetail() {
       {legs.length===0
         ? <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px'}}><EmptyState icon='↗' title='No legs yet' message='Add the first leg to this order.' action={<Btn onClick={openNewLeg}>+ Add Leg</Btn>}/></div>
         : legs.map(leg=>{
-          const pi=piMap[leg.id], inv=invMap[leg.id]
+          const pi=piMap[leg.id], po=poMap[leg.id], inv=invMap[leg.id]
           const legM=computeLegMargin(leg,legs,invMap,costBasisMap)
+          const docBtn=(docType,docRow,label)=>{
+            const docId=docRow?.id
+            return (
+              <span key={docType} style={{display:'inline-flex',alignItems:'center',gap:'4px',opacity:docId?1:0.4}}>
+                <span style={{fontSize:'11px',color:C.textMuted,fontWeight:600}}>{label}</span>
+                <button title={`Download ${label} PDF`} disabled={!docId||!!legDocBusy} onClick={()=>handleLegDoc(leg.id,docType,docId,'pdf')}
+                  style={{background:'none',border:`1px solid ${C.border}`,borderRadius:'4px',padding:'2px 6px',fontSize:'11px',cursor:docId?'pointer':'not-allowed'}}>
+                  {legDocBusy===`${leg.id}:${docType}:pdf`?'…':'⎙'}
+                </button>
+                <button title={`Download ${label} Excel`} disabled={!docId||!!legDocBusy} onClick={()=>handleLegDoc(leg.id,docType,docId,'excel')}
+                  style={{background:'none',border:`1px solid ${C.border}`,borderRadius:'4px',padding:'2px 6px',fontSize:'11px',cursor:docId?'pointer':'not-allowed'}}>
+                  {legDocBusy===`${leg.id}:${docType}:excel`?'…':'↓'}
+                </button>
+              </span>
+            )
+          }
           return (
             <div key={leg.id} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px',marginBottom:'12px',overflow:'hidden'}}>
               <div style={{padding:'14px 18px',borderBottom:`1px solid ${C.border}`,display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:'8px'}}>
@@ -645,6 +711,12 @@ function OrderDetail() {
                 {leg.notes&&<div style={{color:C.textMuted}}>{leg.notes}</div>}
               </div>
               <div style={{padding:'0 18px'}}><LegPipeline pi={pi} inv={inv}/></div>
+              <div style={{padding:'8px 18px 0',display:'flex',gap:'14px',flexWrap:'wrap',alignItems:'center'}}>
+                <span style={{fontSize:'11px',color:C.textMuted,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.04em'}}>Generate:</span>
+                {docBtn('PI',pi,'PI')}
+                {docBtn('PO',po,'PO')}
+                {docBtn('INVOICE',inv,'Invoice')}
+              </div>
               <div style={{borderTop:`1px solid ${C.border}`,marginTop:'8px'}}>
                 <button onClick={()=>toggleDocs(leg.id)} style={{width:'100%',padding:'8px 18px',background:'none',border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'space-between',fontSize:'12px',fontWeight:600,color:C.textSoft,fontFamily:'inherit'}}>
                   <span>📎 Documents</span>

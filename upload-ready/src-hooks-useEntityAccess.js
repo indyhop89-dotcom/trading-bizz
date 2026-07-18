@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../supabaseClient'
 import { useAuth } from './useAuth'
+import { hasFullAccess } from '../utils/roles'
 
 // Which entities can the current user act as (create/edit records for)?
 // Master/admin users get every active entity. Everyone else gets only the
@@ -21,16 +22,24 @@ export function useEntityAccess() {
     let cancelled = false
     async function load() {
       setLoading(true)
-      if (profile.role === 'master') {
+      if (hasFullAccess(profile)) {
         const { data } = await supabase.from('entities')
           .select('id,name,short_name,gstin,state_code,type')
           .eq('is_active', true).eq('is_deleted', false).order('name')
         if (!cancelled) setEntities(data || [])
       } else {
         const { data } = await supabase.from('user_entity_access')
-          .select('entity:entity_id(id,name,short_name,gstin,state_code,type)')
+          .select('expires_at, entity:entity_id(id,name,short_name,gstin,state_code,type)')
           .eq('user_id', profile.id)
-        const granted = (data || []).map(g => g.entity).filter(Boolean)
+        // CHANGED: an expired grant shouldn't show up as a pickable entity —
+        // has_entity_grant() (the actual RLS enforcement) filters the same
+        // way, this is just the matching client-side UX so an expired entity
+        // doesn't linger in a "from"/"seller" dropdown after it's already
+        // stopped working server-side.
+        const now = Date.now()
+        const granted = (data || [])
+          .filter(g => !g.expires_at || new Date(g.expires_at).getTime() > now)
+          .map(g => g.entity).filter(Boolean)
           .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
         if (!cancelled) setEntities(granted)
       }
@@ -40,7 +49,7 @@ export function useEntityAccess() {
     return () => { cancelled = true }
   }, [profile])
 
-  const isMaster = profile?.role === 'master'
+  const isMaster = hasFullAccess(profile)
   const frozen = !isMaster && entities.length === 1
 
   return { entities, isMaster, frozen, loading, defaultEntityId: !isMaster ? (entities[0]?.id || '') : '' }

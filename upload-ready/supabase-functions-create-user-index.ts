@@ -52,7 +52,7 @@ Deno.serve(async (req) => {
     }
 
     const body = await req.json()
-    const { email, full_name, role, entity_ids, password } = body
+    const { email, full_name, role, entity_ids, entity_expiries, password } = body
 
     if (!email || !full_name) {
       return json({ error: 'email and full_name are required' }, 400)
@@ -114,10 +114,13 @@ Deno.serve(async (req) => {
     }
 
     if (role !== 'master' && entity_ids?.length) {
+      // entity_expiries is optional — an entity_id absent from it (or the
+      // whole field omitted) gets permanent access, exactly as before.
       const grants = entity_ids.map((entity_id) => ({
         user_id: newUserId,
         entity_id,
         granted_by: caller.id,
+        expires_at: entity_expiries?.[entity_id] || null,
       }))
       const { error: grantErr } = await adminClient.from('user_entity_access').insert(grants)
       if (grantErr) {

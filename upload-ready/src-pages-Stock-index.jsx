@@ -14,6 +14,7 @@ import { cleanProductName, productMatchKey, findNearMatchProduct, findMergeSugge
 // CHANGED: needed to know the current user's role/id for entity-access scoping
 import { useAuth } from '../../hooks/useAuth'
 import { fetchAllPages } from '../../utils/query'
+import { hasFullAccess } from '../../utils/roles'
 
 const UNITS = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
 const TABS  = ['Opening Stock', 'Stock Position', 'Adjustments', 'Products']
@@ -567,7 +568,7 @@ function StockAdjustments() {
   useEffect(() => {
     if (!profile) return
     async function loadEntities() {
-      if (profile.role === 'master') {
+      if (hasFullAccess(profile)) {
         const { data: es } = await supabase.from('entities')
           .select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name')
         setEntities(es || [])
@@ -883,7 +884,7 @@ function StockPosition() {
 
   // CHANGED: current user's role/id decide which entities they may even see
   const { profile } = useAuth()
-  const isMaster = profile?.role === 'master'
+  const isMaster = hasFullAccess(profile)
 
   useEffect(() => {
     if (!profile) return // wait until we know the role before deciding what to fetch
@@ -902,8 +903,8 @@ function StockPosition() {
       setProducts(ps || [])
       if (fyData?.length) setFyFilter(fyData[0].id)
 
-      if (profile.role === 'master') {
-        // Master sees every entity, "All entities" included — unchanged behaviour.
+      if (hasFullAccess(profile)) {
+        // Master/admin see every entity, "All entities" included — unchanged behaviour.
         const { data: es } = await supabase.from('entities')
           .select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name')
         setEntities(es || [])
@@ -1357,7 +1358,7 @@ function StockPosition() {
 // just parameterized and callable from the UI instead of hand-run once.
 function MergeDuplicates() {
   const { profile } = useAuth()
-  const canMerge = profile?.role === 'master'
+  const canMerge = hasFullAccess(profile)
 
   const [products, setProducts] = useState([])
   const [totals, setTotals]     = useState({}) // product_id -> { opening, actual }
