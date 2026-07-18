@@ -70,6 +70,10 @@ function NoteList() {
   // (e.g. an invoice with both 12% and 18% items).
   const [simpleMode, setSimpleMode] = useState(false)
   const [simpleRows, setSimpleRows] = useState([{ amount: '', gst_rate: '18' }])
+  // CHANGED: TDS/TCS on this note is auto-derived from the linked invoice's
+  // payment history (see handleSave) — this just previews that rate to the
+  // user before they save, read-only, no manual entry.
+  const [linkedRates, setLinkedRates] = useState({ tds: 0, tcs: 0 })
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -125,6 +129,17 @@ function NoteList() {
     return () => { cancelled = true }
   }, [simpleMode, form.against_invoice_id])
 
+  // CHANGED: preview the TDS/TCS rate that will be auto-applied (see handleSave).
+  useEffect(() => {
+    if (!form.against_invoice_id) { setLinkedRates({ tds: 0, tcs: 0 }); return }
+    let cancelled = false
+    supabase.from('invoice_payments')
+      .select('tds_rate,tcs_rate').eq('invoice_id', form.against_invoice_id).eq('is_deleted', false)
+      .order('actual_payment_date', { ascending: false }).limit(1).maybeSingle()
+      .then(({ data }) => { if (!cancelled) setLinkedRates({ tds: toNum(data?.tds_rate) || 0, tcs: toNum(data?.tcs_rate) || 0 }) })
+    return () => { cancelled = true }
+  }, [form.against_invoice_id])
+
   function addSimpleRow()            { setSimpleRows(rows => [...rows, { amount: '', gst_rate: '18' }]) }
   function removeSimpleRow(idx)      { setSimpleRows(rows => rows.filter((_, i) => i !== idx)) }
   function updateSimpleRow(idx, k, v) { setSimpleRows(rows => rows.map((r, i) => i === idx ? { ...r, [k]: v } : r)) }
@@ -172,6 +187,16 @@ function NoteList() {
     // nowhere to be saved, and NoteDetail never rendered it anyway) into
     // reason_notes — the one free-text column this table actually has.
     const combinedNotes = [form.reason_notes, form.notes].filter(Boolean).join('\n\n') || null
+    // CHANGED: TDS/TCS on a credit/debit note is never hand-entered — it's
+    // auto-derived from the linked invoice's own payment history (the same
+    // rate the buyer/seller already applied when settling that invoice), so a
+    // correction against a TDS/TCS-bearing invoice stays proportionally
+    // consistent with it rather than needing a second manual entry surface.
+    const { data: lastTranche } = await supabase.from('invoice_payments')
+      .select('tds_rate,tcs_rate').eq('invoice_id', form.against_invoice_id).eq('is_deleted', false)
+      .order('actual_payment_date', { ascending: false }).limit(1).maybeSingle()
+    const tdsRate = toNum(lastTranche?.tds_rate) || 0
+    const tcsRate = toNum(lastTranche?.tcs_rate) || 0
     const payload = {
       note_type: form.note_type, against_invoice_id: form.against_invoice_id,
       issuer_entity_id: form.issuer_entity_id, receiver_entity_id: form.receiver_entity_id,
@@ -179,6 +204,8 @@ function NoteList() {
       is_interstate: form.is_interstate,
       taxable_amount: totals.taxable_amount, cgst_amount: totals.cgst_amount,
       sgst_amount: totals.sgst_amount, igst_amount: totals.igst_amount, total_amount: totals.total_amount,
+      tds_rate: tdsRate || null, tds_amount: tdsRate ? Math.round(totals.taxable_amount * tdsRate / 100) : 0,
+      tcs_rate: tcsRate || null, tcs_amount: tcsRate ? Math.round(totals.taxable_amount * tcsRate / 100) : 0,
       status: 'draft', note_no: noteNo,
     }
     // NOTE: the migration doc for credit_debit_notes marks financial_year_id
@@ -242,6 +269,9 @@ function NoteList() {
     { label: 'Date',     render: n => <span style={{ fontSize: '12px' }}>{fmtDate(n.note_date)}</span> },
     { label: 'Reason',   render: n => <span style={{ fontSize: '11px', textTransform: 'capitalize' }}>{n.reason?.replace('_', ' ')}</span> },
     { label: 'Amount',   right: true, render: n => <span style={{ fontWeight: 600 }}>{formatINR(n.total_amount)}</span> },
+    { label: 'TDS/TCS',  right: true, render: n => (n.tds_amount || n.tcs_amount)
+        ? <span style={{ fontSize: '12px', color: C.textSoft }}>{n.tds_amount ? `TDS ${formatINR(n.tds_amount)}` : ''}{n.tds_amount && n.tcs_amount ? ' / ' : ''}{n.tcs_amount ? `TCS ${formatINR(n.tcs_amount)}` : ''}</span>
+        : <span style={{ color: C.textMuted }}>—</span> },
     { label: 'Status',   render: n => <Badge status={n.status} /> },
   ]
 
@@ -309,7 +339,10 @@ function NoteList() {
                 {REASONS.map(r => <option key={r} value={r}>{r.replace('_', ' ')}</option>)}
               </Select>
             </FormRow>
-            <FormRow label='Against Invoice' required>
+            <FormRow label='Against Invoice' required
+              hint={(linkedRates.tds > 0 || linkedRates.tcs > 0)
+                ? `Will auto-apply from this invoice's payment: ${linkedRates.tds > 0 ? `TDS ${linkedRates.tds}%` : ''}${linkedRates.tds > 0 && linkedRates.tcs > 0 ? ', ' : ''}${linkedRates.tcs > 0 ? `TCS ${linkedRates.tcs}%` : ''}`
+                : undefined}>
               <Select value={form.against_invoice_id} onChange={e => setF('against_invoice_id', e.target.value)}>
                 <option value=''>Select invoice</option>
                 {invoices.map(i => <option key={i.id} value={i.id}>{i.invoice_no || i.id.slice(0,8)}</option>)}

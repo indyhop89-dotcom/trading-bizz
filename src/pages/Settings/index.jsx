@@ -9,6 +9,7 @@ import { fmtDate, today } from '../../utils/dates'
 import { formatSlabSummary } from '../../utils/hsn'
 import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 
 // REBUILT — this file was found to contain a copy of the Invoices module
 // (src/pages/Invoices/index.jsx) instead of Settings, which is why /settings
@@ -17,7 +18,7 @@ import { useAuth } from '../../hooks/useAuth'
 // existing hsn_master CSV template format already defined in csvTemplate.js.
 // If a better version turns up in git history, prefer that over this file.
 
-const TABS = ['Financial Years', 'Entity Groups', 'HSN Master', 'Users']
+const TABS = ['Financial Years', 'Entity Groups', 'HSN Master', 'Parties', 'Users']
 
 // ─── Financial Years Tab ───────────────────────────────────────────────────────
 const EMPTY_FY = { name: '', code: '', start_date: '', end_date: '', is_active: false }
@@ -835,6 +836,164 @@ function Users() {
   )
 }
 
+// ─── Parties Tab ────────────────────────────────────────────────────────────────
+// Global vendor/supplier master, shared across all entities. Master/admin only
+// (RLS parties_write gates on role IN ('master','admin')).
+const EMPTY_PARTY = {
+  name: '', gstin: '', pan: '', contact_person: '', phone: '', email: '',
+  address: '', payment_terms: '', payment_days: '', notes: '', is_active: true,
+}
+
+function Parties() {
+  const { profile } = useAuth()
+  const canManage = hasFullAccess(profile)
+  const [rows, setRows]         = useState([])
+  const [loading, setLoading]   = useState(true)
+  const [search, setSearch]     = useState('')
+  const [modalOpen, setModalOpen] = useState(false)
+  const [editing, setEditing]   = useState(null)
+  const [form, setForm]         = useState(EMPTY_PARTY)
+  const [saving, setSaving]     = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [toast, setToast]       = useState(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    const { data } = await supabase.from('parties').select('*').eq('is_deleted', false).order('name')
+    setRows(data || [])
+    setLoading(false)
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
+  function openNew()  { setEditing(null); setForm(EMPTY_PARTY); setModalOpen(true) }
+  function openEdit(r) {
+    setEditing(r)
+    setForm({
+      name: r.name || '', gstin: r.gstin || '', pan: r.pan || '',
+      contact_person: r.contact_person || '', phone: r.phone || '', email: r.email || '',
+      address: r.address || '', payment_terms: r.payment_terms || '',
+      payment_days: r.payment_days ?? '', notes: r.notes || '', is_active: r.is_active,
+    })
+    setModalOpen(true)
+  }
+
+  async function handleSave() {
+    if (!form.name.trim()) return setToast({ message: 'Name is required', type: 'error' })
+    const days = form.payment_days === '' ? null : parseInt(form.payment_days, 10)
+    if (days !== null && (isNaN(days) || days < 0)) return setToast({ message: 'Payment days must be a positive number', type: 'error' })
+    setSaving(true)
+    const payload = {
+      name: form.name.trim(),
+      gstin: form.gstin.trim().toUpperCase() || null,
+      pan: form.pan.trim().toUpperCase() || null,
+      contact_person: form.contact_person.trim() || null,
+      phone: form.phone.trim() || null,
+      email: form.email.trim() || null,
+      address: form.address.trim() || null,
+      payment_terms: form.payment_terms.trim() || null,
+      payment_days: days,
+      notes: form.notes.trim() || null,
+      is_active: form.is_active,
+    }
+    const res = editing
+      ? await supabase.from('parties').update(payload).eq('id', editing.id)
+      : await supabase.from('parties').insert(payload)
+    setSaving(false)
+    if (res.error) {
+      const msg = res.error.code === '23505' ? 'A party with this GSTIN already exists' : res.error.message
+      return setToast({ message: msg, type: 'error' })
+    }
+    setModalOpen(false)
+    setToast({ message: editing ? 'Party updated' : 'Party added', type: 'success' })
+    load()
+  }
+
+  async function handleDelete() {
+    if (!confirmDelete) return
+    const { error } = await supabase.from('parties').update({ is_deleted: true }).eq('id', confirmDelete.id)
+    if (error) setToast({ message: `Could not delete — ${error.message}`, type: 'error' })
+    else setToast({ message: 'Party removed', type: 'success' })
+    setConfirmDelete(null)
+    load()
+  }
+
+  const filtered = rows.filter(r => {
+    if (!search) return true
+    const q = search.toLowerCase()
+    return r.name?.toLowerCase().includes(q) || r.gstin?.toLowerCase().includes(q) || r.contact_person?.toLowerCase().includes(q)
+  })
+
+  const columns = [
+    { label: 'S.No.', render: (r, i) => <span style={{ color: C.textMuted }}>{i + 1}</span> },
+    { label: 'Name',  render: r => <span style={{ fontWeight: 600 }}>{r.name}{!r.is_active && <span style={{ color: C.textMuted, fontWeight: 400 }}> (inactive)</span>}</span> },
+    { label: 'GSTIN', render: r => <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{r.gstin || '—'}</span> },
+    { label: 'Contact', render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{r.contact_person || r.phone || '—'}</span> },
+    { label: 'Payment', render: r => <span style={{ fontSize: '12px' }}>{r.payment_days != null ? `${r.payment_days} days` : (r.payment_terms || '—')}</span> },
+    ...(canManage ? [{ label: 'Actions', render: r => (
+      <div style={{ display: 'flex', gap: '6px' }} onClick={e => e.stopPropagation()}>
+        <Btn size='sm' variant='ghost' onClick={() => openEdit(r)}>Edit</Btn>
+        <Btn size='sm' variant='ghost' onClick={() => setConfirmDelete(r)} style={{ color: C.danger }}>Delete</Btn>
+      </div>
+    )}] : []),
+  ]
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center' }}>
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search name, GSTIN, contact…'
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, fontFamily: 'inherit' }} />
+        {canManage && <Btn onClick={openNew}>+ New Party</Btn>}
+      </div>
+      {!canManage && (
+        <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '12px' }}>Only master/admin can add or edit parties.</div>
+      )}
+      <Card>
+        {loading
+          ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
+          : <Table columns={columns} rows={filtered}
+              emptyState={<EmptyState icon='🤝' title='No parties yet' action={canManage ? <Btn onClick={openNew}>+ New Party</Btn> : undefined} />}
+            />
+        }
+      </Card>
+
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? 'Edit Party' : 'New Party'} width={560}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <FormRow label='Name' required><Input value={form.name} onChange={e => setF('name', e.target.value)} placeholder='Full legal / trade name' /></FormRow>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='GSTIN'><Input value={form.gstin} onChange={e => setF('gstin', e.target.value.toUpperCase())} placeholder='22AAAAA0000A1Z5' style={{ fontFamily: 'monospace' }} /></FormRow>
+            <FormRow label='PAN'><Input value={form.pan} onChange={e => setF('pan', e.target.value.toUpperCase())} placeholder='AAAAA0000A' style={{ fontFamily: 'monospace' }} /></FormRow>
+            <FormRow label='Contact Person'><Input value={form.contact_person} onChange={e => setF('contact_person', e.target.value)} /></FormRow>
+            <FormRow label='Phone'><Input value={form.phone} onChange={e => setF('phone', e.target.value)} /></FormRow>
+            <FormRow label='Email'><Input type='email' value={form.email} onChange={e => setF('email', e.target.value)} /></FormRow>
+            <FormRow label='Status'>
+              <Select value={form.is_active ? 'active' : 'inactive'} onChange={e => setF('is_active', e.target.value === 'active')}>
+                <option value='active'>Active</option>
+                <option value='inactive'>Inactive</option>
+              </Select>
+            </FormRow>
+          </div>
+          <FormRow label='Address'><Textarea value={form.address} onChange={e => setF('address', e.target.value)} rows={2} /></FormRow>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Payment Terms' hint='Optional label, e.g. "Net 30", "Advance"'><Input value={form.payment_terms} onChange={e => setF('payment_terms', e.target.value)} /></FormRow>
+            <FormRow label='Payment Days' hint='Days to due date — auto-fills an expense’s due date'><Input type='number' value={form.payment_days} onChange={e => setF('payment_days', e.target.value)} placeholder='e.g. 30' /></FormRow>
+          </div>
+          <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save Changes' : 'Create'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
+        title='Delete Party' message={`Delete "${confirmDelete?.name}"? Expenses already tagged to it keep their vendor details.`} danger />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  )
+}
+
 // ─── Settings Shell ─────────────────────────────────────────────────────────────
 export default function Settings() {
   const [tab, setTab] = useState('Financial Years')
@@ -855,6 +1014,7 @@ export default function Settings() {
       {tab === 'Financial Years' && <FinancialYears />}
       {tab === 'Entity Groups'   && <EntityGroups />}
       {tab === 'HSN Master'      && <HsnMaster />}
+      {tab === 'Parties'         && <Parties />}
       {tab === 'Users'           && <Users />}
     </div>
   )

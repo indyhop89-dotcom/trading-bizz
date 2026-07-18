@@ -12,19 +12,25 @@ import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { hasFullAccess } from '../../utils/roles'
 import { computeInvoiceOutstanding } from '../../utils/payments'
 
-// ─── TDS constants (mirrors Invoices module) ───────────────────────────────────
-const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
+// ─── TDS / TCS constants ────────────────────────────────────────────────────────
+// CHANGED: §206C (TCS on sale of goods) was previously listed here as a "TDS
+// section" — it's TCS, a distinct withholding a SELLER collects from a buyer,
+// not tax a payer deducts. Split into its own section list so the two are
+// never conflated in the UI or the saved data.
+const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q']
 const TDS_SECTION_LABELS = {
   '194C': 'Payment to Contractors',
   '194H': 'Commission or Brokerage',
   '194I': 'Rent',
   '194J': 'Professional/Technical Services',
   '194Q': 'Purchase of Goods',
-  '206C': 'TCS on Sale of Goods',
 }
 const TDS_DEFAULT_RATES = {
-  '194C': 1, '194H': 5, '194I': 10, '194J': 10, '194Q': 0.1, '206C': 0.1,
+  '194C': 1, '194H': 5, '194I': 10, '194J': 10, '194Q': 0.1,
 }
+const TCS_SECTIONS = ['206C']
+const TCS_SECTION_LABELS = { '206C': 'TCS on Sale of Goods' }
+const TCS_DEFAULT_RATES = { '206C': 0.1 }
 
 // ─── constants ────────────────────────────────────────────────────────────────
 const CURRENCIES = ['INR', 'USD', 'AED', 'EUR', 'GBP', 'SGD', 'SAR']
@@ -150,6 +156,7 @@ const EMPTY_INV = {
   currency: 'INR', exchange_rate: '1',
   basis: '',                 // gross amount being settled by this tranche (defaults to pending)
   apply_tds: false, tds_section: '', tds_rate: '',
+  apply_tcs: false, tcs_section: '', tcs_rate: '', // CHANGED: TCS at payment time
   adjustments: '0', adjustment_notes: '',
   actual_payment_date: '', notes: '',
 }
@@ -260,6 +267,7 @@ function InvoicePaymentTracker() {
         }
       }
       if (k === 'tds_section') u.tds_rate = TDS_DEFAULT_RATES[v] != null ? String(TDS_DEFAULT_RATES[v]) : u.tds_rate
+      if (k === 'tcs_section') u.tcs_rate = TCS_DEFAULT_RATES[v] != null ? String(TCS_DEFAULT_RATES[v]) : u.tcs_rate
       return u
     })
   }
@@ -305,6 +313,9 @@ function InvoicePaymentTracker() {
       apply_tds: !!toNum(payment.tds_amount),
       tds_section: payment.tds_section || '',
       tds_rate: payment.tds_rate != null ? String(payment.tds_rate) : '',
+      apply_tcs: !!toNum(payment.tcs_amount),
+      tcs_section: payment.tcs_section || '',
+      tcs_rate: payment.tcs_rate != null ? String(payment.tcs_rate) : '',
       adjustments: payment.adjustments != null ? String(payment.adjustments) : '0',
       adjustment_notes: payment.adjustment_notes || '',
       actual_payment_date: payment.actual_payment_date || today(),
@@ -315,7 +326,17 @@ function InvoicePaymentTracker() {
   }
 
   const tdsAmount  = form.apply_tds ? computeTds(form.basis, form.tds_rate) : 0
+  // CHANGED: TCS is a separate collection ON TOP of the invoice amount (the
+  // seller collects it from the buyer and remits it), not a reduction — unlike
+  // TDS it must NOT flow into `cashAmount`/`amount`, because computeInvoiceOutstanding
+  // (utils/payments.js) reconstructs "settled" as amount + tds_amount + adjustments,
+  // deliberately designed so TDS "adds back" to fully settle the invoice's own
+  // value. Folding TCS into `amount` would inflate settled by the TCS amount and
+  // understate what's still pending. TCS is tracked in its own column and shown
+  // only as an extra cash line in the preview below.
+  const tcsAmount  = form.apply_tcs ? computeTds(form.basis, form.tcs_rate) : 0
   const cashAmount = Math.max(0, roundRupees(toNum(form.basis) - tdsAmount))
+  const totalCashThisTranche = cashAmount + tcsAmount // informational only — not persisted as `amount`
 
   async function handleSave() {
     if (!form.invoice_id) return setToast({ message: 'Select an invoice', type: 'error' })
@@ -331,6 +352,10 @@ function InvoicePaymentTracker() {
       tds_rate: form.apply_tds ? (toNum(form.tds_rate) || 0) : 0,
       tds_base_amount: form.apply_tds ? toNum(form.basis) : 0,
       tds_amount: tdsAmount,
+      tcs_section: form.apply_tcs ? (form.tcs_section || null) : null,
+      tcs_rate: form.apply_tcs ? (toNum(form.tcs_rate) || 0) : 0,
+      tcs_base_amount: form.apply_tcs ? toNum(form.basis) : 0,
+      tcs_amount: tcsAmount,
       adjustments: toNum(form.adjustments) || 0, adjustment_notes: form.adjustment_notes || null,
       actual_payment_date: form.actual_payment_date, notes: form.notes || null,
       updated_at: new Date(),
@@ -456,8 +481,8 @@ function InvoicePaymentTracker() {
                 <div style={{ overflowX: 'auto' }}>
                   <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                     <thead><tr>
-                      {['Date','Paid','TDS','Section','Adj.','Notes','Docs',''].map((h,i) => (
-                        <th key={i} style={{ ...th, textAlign: i === 1 || i === 2 || i === 4 ? 'right' : 'left' }}>{h}</th>
+                      {['Date','Paid','TDS','Section','TCS','Section','Adj.','Notes','Docs',''].map((h,i) => (
+                        <th key={i} style={{ ...th, textAlign: i === 1 || i === 2 || i === 4 || i === 6 ? 'right' : 'left' }}>{h}</th>
                       ))}
                     </tr></thead>
                     <tbody>
@@ -467,6 +492,8 @@ function InvoicePaymentTracker() {
                           <td style={{ ...td, textAlign: 'right', fontWeight: 600 }}><AmtCell amount={t.amount} currency='INR' /></td>
                           <td style={{ ...td, textAlign: 'right' }}><AmtCell amount={t.tds_amount} currency='INR' /></td>
                           <td style={td}>{t.tds_section || '—'}</td>
+                          <td style={{ ...td, textAlign: 'right' }}><AmtCell amount={t.tcs_amount} currency='INR' /></td>
+                          <td style={td}>{t.tcs_section || '—'}</td>
                           <td style={{ ...td, textAlign: 'right' }}><AmtCell amount={t.adjustments} currency='INR' /></td>
                           <td style={{ ...td, maxWidth: '160px' }}>{t.notes || '—'}</td>
                           <td style={td}><DocumentAttachments sourceType='invoice_payments' sourceId={t.id} entityName={inv.buyer?.name || 'General'} compact /></td>
@@ -550,8 +577,27 @@ function InvoicePaymentTracker() {
             </div>
           )}
 
+          {/* CHANGED: TCS — the seller collects this on top of the invoice
+              amount from the buyer; unlike TDS it adds to what changes hands. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input type='checkbox' id='apply_tcs' checked={form.apply_tcs} onChange={e => setF('apply_tcs', e.target.checked)} style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+            <label htmlFor='apply_tcs' style={{ fontSize: '13px', fontWeight: 600, color: C.text, cursor: 'pointer' }}>Collect TCS on this payment</label>
+          </div>
+
+          {form.apply_tcs && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px' }}>
+              <FormRow label='TCS Section'>
+                <Select value={form.tcs_section} onChange={e => setF('tcs_section', e.target.value)}>
+                  <option value=''>Select</option>
+                  {TCS_SECTIONS.map(s => <option key={s} value={s}>{s} — {TCS_SECTION_LABELS[s]}</option>)}
+                </Select>
+              </FormRow>
+              <FormRow label='TCS Rate %'><Input type='number' step='0.01' value={form.tcs_rate} onChange={e => setF('tcs_rate', e.target.value)} /></FormRow>
+            </div>
+          )}
+
           {toNum(form.basis) > 0 && (
-            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px 14px', display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '8px', fontSize: '13px' }}>
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px 14px', display: 'grid', gridTemplateColumns: `repeat(${tcsAmount > 0 ? 5 : 3},1fr)`, gap: '8px', fontSize: '13px' }}>
               <div>
                 <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Settling</div>
                 <strong>{formatINR(form.basis)}</strong>
@@ -560,10 +606,22 @@ function InvoicePaymentTracker() {
                 <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>TDS Deducted</div>
                 <strong style={{ color: C.warning }}>− {formatINR(tdsAmount)}</strong>
               </div>
+              {tcsAmount > 0 && (
+                <div>
+                  <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>TCS Collected</div>
+                  <strong style={{ color: C.warning }}>+ {formatINR(tcsAmount)}</strong>
+                </div>
+              )}
               <div>
-                <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Amount to be Paid</div>
+                <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Applied to Invoice</div>
                 <strong style={{ color: C.success }}>{formatINR(cashAmount)}</strong>
               </div>
+              {tcsAmount > 0 && (
+                <div>
+                  <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>Total Cash This Tranche</div>
+                  <strong style={{ color: C.success }}>{formatINR(totalCashThisTranche)}</strong>
+                </div>
+              )}
             </div>
           )}
 

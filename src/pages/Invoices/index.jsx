@@ -50,15 +50,6 @@ export async function buildInvoiceDoc(inv, lines) {
 }
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
-const TDS_SECTIONS = ['194C', '194H', '194I', '194J', '194Q', '206C']
-const TDS_SECTION_LABELS = {
-  '194C': 'Payment to Contractors',
-  '194H': 'Commission or Brokerage',
-  '194I': 'Rent',
-  '194J': 'Professional/Technical Services',
-  '194Q': 'Purchase of Goods',
-  '206C': 'TCS on Sale of Goods',
-}
 
 // CHANGED: LineItemsEditor lines carry UI-only helper fields (_id, _cost_rate,
 // _margin_pct, _hsn_*) that are NOT columns on invoice_lines. Sending them made
@@ -542,24 +533,12 @@ function NewInvoice() {
   const [form, setForm]         = useState({ ...EMPTY_FORM, pi_id: fromPiId || '' })
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
-  // CHANGED: TDS/TCS entries
-  const [tdsEntries, setTdsEntries] = useState([])  // [{type,section,rate,base_amount}]
   // CHANGED: available stock for the seller entity — feeds LineItemsEditor's
   // stockMap so the seller can see (and be warned about) overselling past
   // what they actually have on hand. Was previously never wired in at all.
   const [stockMap, setStockMap] = useState({})
   const [stockWarning, setStockWarning] = useState(null)
   const [linesLoading, setLinesLoading] = useState(false)  // CHANGED: PI/PO line-item fetch in progress
-
-  function addTdsRow(type) {
-    setTdsEntries(rows => [...rows, { _id: Date.now(), type, section: type === 'tcs' ? '206C' : '194C', rate: type === 'tcs' ? 0.1 : 1, base_amount: '' }])
-  }
-  function updateTdsRow(id, key, val) {
-    setTdsEntries(rows => rows.map(r => r._id === id ? { ...r, [key]: val } : r))
-  }
-  function removeTdsRow(id) {
-    setTdsEntries(rows => rows.filter(r => r._id !== id))
-  }
 
   useEffect(() => {
     Promise.all([
@@ -795,30 +774,10 @@ function NewInvoice() {
       return setToast({ message: `Invoice ${invoiceNo} was created, but its line items failed to save: ${linesErr.message}. Delete this invoice and try again.`, type: 'error' })
     }
 
-    // CHANGED: Insert TDS/TCS entries
-    if (tdsEntries.length > 0) {
-      const tdsPayload = tdsEntries
-        .filter(r => r.base_amount && parseFloat(r.base_amount) > 0)
-        .map(r => {
-          const base   = Math.round(parseFloat(r.base_amount))
-          const amount = Math.round(base * parseFloat(r.rate) / 100)
-          return {
-            invoice_id:            inv.id,
-            entry_type:            r.type,
-            section_code:          r.section,
-            section_desc:          TDS_SECTION_LABELS[r.section] || r.section,
-            deducted_by_entity_id: r.type === 'tds' ? form.buyer_entity_id  : form.seller_entity_id,
-            deductee_entity_id:    r.type === 'tds' ? form.seller_entity_id : form.buyer_entity_id,
-            base_amount:           base,
-            rate:                  parseFloat(r.rate),
-            amount,
-          }
-        })
-      if (tdsPayload.length > 0) {
-        const { error: tdsErr } = await supabase.from('tds_tcs_entries').insert(tdsPayload)
-        if (tdsErr) setToast({ message: `Invoice ${invoiceNo} saved, but TDS/TCS entries failed to save: ${tdsErr.message}`, type: 'error' })
-      }
-    }
+    // TDS/TCS is no longer recorded at invoice creation — it's recognized at
+    // payment time instead (Payments → Invoice Payment Tracker), which is the
+    // single source of truth going forward. See tds_tcs_entries: still read
+    // (never written) below for invoices created before this change.
 
     // Mark PI as converted if applicable
     if (form.pi_id) {
@@ -955,42 +914,6 @@ function NewInvoice() {
               <Input type='date' value={form.eway_bill_date} onChange={e => setF('eway_bill_date', e.target.value)} />
             </FormRow>
           </div>
-        </Card>
-
-        {/* CHANGED: TDS/TCS section */}
-        <Card style={{ padding: '20px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-            <SectionDivider label='TDS / TCS (optional)' />
-            <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
-              <Btn size='sm' variant='ghost' onClick={() => addTdsRow('tds')}>+ TDS</Btn>
-              <Btn size='sm' variant='ghost' onClick={() => addTdsRow('tcs')}>+ TCS</Btn>
-            </div>
-          </div>
-          {tdsEntries.length === 0 ? (
-            <div style={{ fontSize: '12px', color: C.textMuted, padding: '8px 0' }}>No TDS/TCS entries. Click + TDS or + TCS to add.</div>
-          ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              {tdsEntries.map(row => {
-                const base   = parseFloat(row.base_amount) || 0
-                const amount = Math.round(base * parseFloat(row.rate) / 100)
-                return (
-                  <div key={row._id} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr 1fr 1fr auto', gap: '10px', alignItems: 'center', padding: '10px 12px', background: C.bg, borderRadius: '6px', border: `1px solid ${C.border}` }}>
-                    <Badge status={row.type === 'tcs' ? 'export' : 'domestic'} label={row.type.toUpperCase()} />
-                    <Select value={row.section} onChange={e => updateTdsRow(row._id, 'section', e.target.value)}>
-                      {TDS_SECTIONS.map(s => <option key={s} value={s}>{s} — {TDS_SECTION_LABELS[s]}</option>)}
-                    </Select>
-                    <FormRow label='Base Amount (₹)'>
-                      <Input type='number' value={row.base_amount} onChange={e => updateTdsRow(row._id, 'base_amount', e.target.value)} placeholder='0' />
-                    </FormRow>
-                    <FormRow label={`Rate % → ₹${amount.toLocaleString('en-IN')}`}>
-                      <Input type='number' step='0.01' value={row.rate} onChange={e => updateTdsRow(row._id, 'rate', e.target.value)} />
-                    </FormRow>
-                    <button onClick={() => removeTdsRow(row._id)} style={{ background: 'none', border: 'none', color: C.danger, cursor: 'pointer', fontSize: '18px', padding: '0 4px' }}>×</button>
-                  </div>
-                )
-              })}
-            </div>
-          )}
         </Card>
 
         <Card style={{ padding: '20px' }}>

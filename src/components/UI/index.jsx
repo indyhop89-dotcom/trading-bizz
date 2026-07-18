@@ -289,16 +289,19 @@ export function Btn({ children, onClick, variant = 'primary', size = 'md', disab
 }
 
 // ─── FormRow ──────────────────────────────────────────────────────────────────
-export function FormRow({ label, required, children, hint, error }) {
+export function FormRow({ label, required, children, hint, error, action }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
       {label && (
-        <label style={{
-          fontSize: '11px', fontWeight: 700, color: 'var(--text-soft)',
-          textTransform: 'uppercase', letterSpacing: '0.05em',
-        }}>
-          {label}{required && <span style={{ color: 'var(--danger)', marginLeft: '2px' }}>*</span>}
-        </label>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+          <label style={{
+            fontSize: '11px', fontWeight: 700, color: 'var(--text-soft)',
+            textTransform: 'uppercase', letterSpacing: '0.05em',
+          }}>
+            {label}{required && <span style={{ color: 'var(--danger)', marginLeft: '2px' }}>*</span>}
+          </label>
+          {action}
+        </div>
       )}
       {children}
       {hint && !error && <div style={{ fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.4 }}>{hint}</div>}

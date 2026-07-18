@@ -2,13 +2,25 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../../supabaseClient'
 import { fetchAllPages } from '../../utils/query'
 import { C, Card, FormRow, Select, Spinner, StatCard, Badge } from '../../components/UI/index'
-import { formatINR } from '../../utils/money'
+import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, fyOptions, today } from '../../utils/dates'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchStockMovementData, buildActualStockMap } from '../../utils/stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
 
-const TABS = ['P&L', 'GST Summary', 'Ledger', 'Profitability', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing']
+// CHANGED: GST Summary and TDS/TCS Report are grouped under a "Compliance"
+// section in the tab bar; everything else stays in the unlabeled group.
+const TAB_GROUPS = [
+  { label: 'Compliance', tabs: ['GST Summary', 'TDS/TCS Report'] },
+  { label: null, tabs: ['P&L', 'Party Ledger', 'Ledger', 'Profitability', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing'] },
+]
+
+// 'YYYY-MM' → 'Jul 2026' for the month-wise GST table
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+function monthLabel(ym) {
+  const [y, m] = (ym || '').split('-')
+  return m ? `${MONTH_NAMES[Number(m) - 1]} ${y}` : (ym || '—')
+}
 
 // ─── P&L Report ───────────────────────────────────────────────────────────────
 function PLReport({ entities, fys, defaultEntityId }) {
@@ -135,27 +147,35 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
       .select('id,total_amount,taxable_amount,cgst_amount,sgst_amount,igst_amount,is_interstate,invoice_date,seller:seller_entity_id(gstin,name)')
       .eq('buyer_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled')
 
+    // CHANGED: GST-bearing expenses give input tax credit too — pulled in so the
+    // month-wise net payable reflects real cash outflow, not sales−purchases only.
+    let expensesQ = supabase.from('expenses')
+      .select('gst_amount,expense_date')
+      .eq('entity_id', entityId).eq('is_deleted', false).gt('gst_amount', 0)
+
     if (fyFilter) {
       salesQ     = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
       purchasesQ = purchasesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
+      expensesQ  = expensesQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
     }
 
-    // CHANGED: TDS/TCS summary — deducted_by_entity_id is a liability (we owe
-    // this to the government), deductee_entity_id is a credit (someone else
-    // already deducted it on our behalf, we claim it against our own tax).
-    const { data: tdsEntries } = await supabase
-      .from('tds_tcs_entries')
-      .select('id, entry_type, base_amount, amount, deducted_by_entity_id, deductee_entity_id, invoice:invoice_id(invoice_date)')
-      .or(`deducted_by_entity_id.eq.${entityId},deductee_entity_id.eq.${entityId}`)
+    const [{ data: sales }, { data: purchases }, { data: expenses }] = await Promise.all([salesQ, purchasesQ, expensesQ])
 
-    const tdsFiltered = (tdsEntries || []).filter(t => !fyFilter || !t.invoice?.invoice_date ||
-      (t.invoice.invoice_date >= fyFilter.start_date && t.invoice.invoice_date <= fyFilter.end_date))
-
-    const sumWhere = (type, side) => tdsFiltered
-      .filter(t => t.entry_type === type && t[side] === entityId)
-      .reduce((s, t) => s + (Number(t.amount) || 0), 0)
-
-    const [{ data: sales }, { data: purchases }] = await Promise.all([salesQ, purchasesQ])
+    // CHANGED: month-wise breakdown for GST cash-flow planning. Output tax on
+    // sales less ITC from BOTH purchase invoices and GST-bearing expenses, per
+    // calendar month, with net GST payable (never negative — surplus ITC just
+    // carries forward).
+    const monthly = {}
+    const mKey = d => (d || '').slice(0, 7)  // YYYY-MM
+    const ensureM = k => (monthly[k] || (monthly[k] = { output: 0, purchaseITC: 0, expenseITC: 0 }))
+    ;(sales || []).forEach(i => { ensureM(mKey(i.invoice_date)).output      += (i.cgst_amount + i.sgst_amount + i.igst_amount) })
+    ;(purchases || []).forEach(i => { ensureM(mKey(i.invoice_date)).purchaseITC += (i.cgst_amount + i.sgst_amount + i.igst_amount) })
+    ;(expenses || []).forEach(e => { ensureM(mKey(e.expense_date)).expenseITC  += (e.gst_amount || 0) })
+    const monthlyRows = Object.keys(monthly).sort().map(k => {
+      const m = monthly[k]
+      return { month: k, output: m.output, purchaseITC: m.purchaseITC, expenseITC: m.expenseITC, net: Math.max(0, m.output - m.purchaseITC - m.expenseITC) }
+    })
+    const expenseITC = (expenses || []).reduce((s, e) => s + (e.gst_amount || 0), 0)
 
     // Output tax
     const outputTaxable = (sales || []).reduce((s, i) => s + i.taxable_amount, 0)
@@ -175,10 +195,10 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
 
     setData({
       outputTaxable, outputCGST, outputSGST, outputIGST, inputTaxable, inputCGST, inputSGST, inputIGST, payableCGST, payableSGST, payableIGST,
-      tdsDeducted: sumWhere('tds', 'deducted_by_entity_id'), // liability — pay to govt
-      tdsCredit:   sumWhere('tds', 'deductee_entity_id'),    // credit — claim against our own tax
-      tcsCollected: sumWhere('tcs', 'deducted_by_entity_id'),
-      tcsCredit:    sumWhere('tcs', 'deductee_entity_id'),
+      expenseITC, monthlyRows, // CHANGED: expense ITC + month-wise planning table
+      // TDS/TCS moved to its own report (Compliance → TDS/TCS Report), which
+      // aggregates invoice_payments + credit_debit_notes + expenses — this
+      // card used to read only the now-legacy tds_tcs_entries table.
     })
     setLoading(false)
   }
@@ -248,16 +268,213 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
         </Card>
       )}
 
+      {data && data.expenseITC > 0 && (
+        <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 14px', fontSize: '13px', display: 'flex', justifyContent: 'space-between' }}>
+          <span style={{ color: C.textSoft }}>Input Tax Credit from expenses (period)</span>
+          <span style={{ fontWeight: 700, color: C.success }}>{formatINR(data.expenseITC)}</span>
+        </div>
+      )}
+
       {data && (
         <Card>
-          <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>TDS / TCS Summary</div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px,1fr))', gap: '12px', padding: '14px 16px' }}>
+          <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>Month-wise GST (cash-flow planning)</div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+              <thead><tr>
+                <th style={{ ...thStyle, textAlign: 'left' }}>Month</th>
+                <th style={thStyle}>Output Tax</th>
+                <th style={thStyle}>Purchase ITC</th>
+                <th style={thStyle}>Expense ITC</th>
+                <th style={thStyle}>Net Payable</th>
+              </tr></thead>
+              <tbody>
+                {data.monthlyRows.length === 0
+                  ? <tr><td colSpan={5} style={{ padding: '18px', textAlign: 'center', color: C.textMuted }}>No taxable activity in this period.</td></tr>
+                  : data.monthlyRows.map(m => (
+                    <tr key={m.month}>
+                      <td style={{ padding: '10px 14px', fontWeight: 600 }}>{monthLabel(m.month)}</td>
+                      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.output)}</td>
+                      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.purchaseITC)}</td>
+                      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.expenseITC)}</td>
+                      <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, color: m.net > 0 ? C.danger : C.success, fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.net)}</td>
+                    </tr>
+                  ))}
+              </tbody>
+              {data.monthlyRows.length > 0 && (
+                <tfoot>
+                  <tr style={{ background: '#f0ebe0' }}>
+                    <td style={{ padding: '10px 14px', fontWeight: 700 }}>Total</td>
+                    <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.output, 0))}</td>
+                    <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.purchaseITC, 0))}</td>
+                    <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.expenseITC, 0))}</td>
+                    <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: C.danger }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.net, 0))}</td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          </div>
+        </Card>
+      )}
+
+    </div>
+  )
+}
+
+// ─── TDS/TCS Report ─────────────────────────────────────────────────────────────
+// Consolidates TDS/TCS across every source that carries it: invoice_payments
+// (TDS/TCS recognized at payment time — the single source of truth for
+// invoices, per the decision to stop recording it at invoice creation),
+// credit_debit_notes (auto-derived from the linked invoice's payment rate),
+// and expenses (own tds_amount/tcs_amount, always payer-side).
+//
+// Direction convention used throughout:
+//   TDS: the payer withholds and owes it to govt (liability); the payee had
+//        it withheld from them and can claim it as credit.
+//   TCS: the payee/seller collects it and owes it to govt (liability); the
+//        payer had it collected from them and can claim it as credit.
+function TdsTcsReport({ entities, fys, defaultEntityId }) {
+  const [entityId, setEntityId] = useState('')
+  useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
+  const [fyId, setFyId]       = useState('')
+  const [data, setData]       = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  async function runReport() {
+    if (!entityId) return
+    setLoading(true)
+    const fyFilter = fys.find(f => f.id === fyId)
+    const inRange = d => !fyFilter || !d || (d >= fyFilter.start_date && d <= fyFilter.end_date)
+
+    const [{ data: ips }, { data: cdns }, { data: exps }] = await Promise.all([
+      supabase.from('invoice_payments')
+        .select('id,invoice_no,actual_payment_date,entity_id,party_entity_id,tds_section,tds_amount,tcs_section,tcs_amount')
+        .eq('is_deleted', false).or(`entity_id.eq.${entityId},party_entity_id.eq.${entityId}`),
+      supabase.from('credit_debit_notes')
+        .select('id,note_no,note_type,note_date,issuer_entity_id,receiver_entity_id,tds_amount,tcs_amount')
+        .eq('is_deleted', false).or(`issuer_entity_id.eq.${entityId},receiver_entity_id.eq.${entityId}`),
+      supabase.from('expenses')
+        .select('id,expense_no,expense_date,entity_id,tds_section,tds_amount,tcs_section,tcs_amount')
+        .eq('entity_id', entityId).eq('is_deleted', false),
+    ])
+
+    let tdsDeducted = 0, tdsCredit = 0, tcsCollected = 0, tcsCredit = 0
+    const rows = []
+
+    for (const p of (ips || [])) {
+      if (!inRange(p.actual_payment_date)) continue
+      const weArePayer = p.entity_id === entityId
+      if (toNum(p.tds_amount) > 0) {
+        if (weArePayer) tdsDeducted += p.tds_amount; else tdsCredit += p.tds_amount
+        rows.push({ source: 'Invoice Payment', doc: p.invoice_no, date: p.actual_payment_date, section: p.tds_section, kind: 'TDS', direction: weArePayer ? 'Liability' : 'Credit', amount: p.tds_amount })
+      }
+      if (toNum(p.tcs_amount) > 0) {
+        if (weArePayer) tcsCredit += p.tcs_amount; else tcsCollected += p.tcs_amount
+        rows.push({ source: 'Invoice Payment', doc: p.invoice_no, date: p.actual_payment_date, section: p.tcs_section, kind: 'TCS', direction: weArePayer ? 'Credit' : 'Liability', amount: p.tcs_amount })
+      }
+    }
+
+    for (const n of (cdns || [])) {
+      if (!inRange(n.note_date)) continue
+      const sign = n.note_type === 'debit_note' ? 1 : -1
+      const weAreIssuer = n.issuer_entity_id === entityId // issuer ≈ seller side, same as invoices
+      if (toNum(n.tds_amount) > 0) {
+        const amt = sign * n.tds_amount
+        if (weAreIssuer) tdsCredit += amt; else tdsDeducted += amt
+        rows.push({ source: `${n.note_type === 'debit_note' ? 'Debit' : 'Credit'} Note`, doc: n.note_no, date: n.note_date, section: '—', kind: 'TDS', direction: weAreIssuer ? 'Credit' : 'Liability', amount: amt })
+      }
+      if (toNum(n.tcs_amount) > 0) {
+        const amt = sign * n.tcs_amount
+        if (weAreIssuer) tcsCollected += amt; else tcsCredit += amt
+        rows.push({ source: `${n.note_type === 'debit_note' ? 'Debit' : 'Credit'} Note`, doc: n.note_no, date: n.note_date, section: '—', kind: 'TCS', direction: weAreIssuer ? 'Liability' : 'Credit', amount: amt })
+      }
+    }
+
+    for (const e of (exps || [])) {
+      if (!inRange(e.expense_date)) continue
+      if (toNum(e.tds_amount) > 0) {
+        tdsDeducted += e.tds_amount
+        rows.push({ source: 'Expense', doc: e.expense_no, date: e.expense_date, section: e.tds_section, kind: 'TDS', direction: 'Liability', amount: e.tds_amount })
+      }
+      if (toNum(e.tcs_amount) > 0) {
+        tcsCredit += e.tcs_amount
+        rows.push({ source: 'Expense', doc: e.expense_no, date: e.expense_date, section: e.tcs_section, kind: 'TCS', direction: 'Credit', amount: e.tcs_amount })
+      }
+    }
+
+    rows.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
+    setData({ tdsDeducted, tdsCredit, tcsCollected, tcsCredit, rows })
+    setLoading(false)
+  }
+
+  const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <FormRow label='Entity'>
+          <Select value={entityId} onChange={e => setEntityId(e.target.value)} style={{ minWidth: '200px' }}>
+            <option value=''>Select entity</option>
+            {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+          </Select>
+        </FormRow>
+        <FormRow label='Financial Year'>
+          <Select value={fyId} onChange={e => setFyId(e.target.value)} style={{ minWidth: '160px' }}>
+            <option value=''>All time</option>
+            {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+          </Select>
+        </FormRow>
+        <button onClick={runReport} disabled={!entityId || loading}
+          style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
+          {loading ? 'Running…' : 'Run Report'}
+        </button>
+      </div>
+
+      {data && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px,1fr))', gap: '12px' }}>
             <StatCard label='TDS Deducted (payable to govt)' value={formatINR(data.tdsDeducted)} color={data.tdsDeducted > 0 ? C.danger : C.textMuted} />
             <StatCard label='TDS Credit (deducted by others)' value={formatINR(data.tdsCredit)} color={data.tdsCredit > 0 ? C.success : C.textMuted} />
             <StatCard label='TCS Collected (payable to govt)' value={formatINR(data.tcsCollected)} color={data.tcsCollected > 0 ? C.danger : C.textMuted} />
             <StatCard label='TCS Credit (collected by others)' value={formatINR(data.tcsCredit)} color={data.tcsCredit > 0 ? C.success : C.textMuted} />
           </div>
-        </Card>
+
+          <Card>
+            <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>Detail (all contributing entries)</div>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                <thead><tr>
+                  <th style={{ ...th, textAlign: 'left' }}>Date</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Source</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Document</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Section</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Type</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Direction</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Amount</th>
+                </tr></thead>
+                <tbody>
+                  {data.rows.length === 0
+                    ? <tr><td colSpan={7} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No TDS/TCS activity for this selection.</td></tr>
+                    : data.rows.map((r, i) => (
+                      <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
+                        <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{fmtDate(r.date)}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.source}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace', fontSize: '12px' }}>{r.doc || '—'}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.section || '—'}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>
+                          <span style={{ fontSize: '11px', background: r.kind === 'TDS' ? '#f3ede8' : '#e8f0f3', color: r.kind === 'TDS' ? C.warning : '#1a4a6a', padding: '2px 7px', borderRadius: '4px', fontWeight: 600 }}>{r.kind}</span>
+                        </td>
+                        <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', color: r.direction === 'Liability' ? C.danger : C.success }}>{r.direction}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>{formatINR(r.amount)}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
+      {!loading && !data && (
+        <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Select an entity, then Run Report.</div>
       )}
     </div>
   )
@@ -875,6 +1092,121 @@ function AgeingReport({ entities, defaultEntityId }) {
   )
 }
 
+// ─── Party Ledger ───────────────────────────────────────────────────────────────
+// A vendor ledger for a party from the global parties master, scoped to one of
+// our entities: expenses booked (what we owe) vs party_payments (what we paid),
+// with a running outstanding balance. Distinct from the entity-vs-entity Ledger.
+function PartyLedger({ entities, parties, fys, defaultEntityId }) {
+  const [entityId, setEntityId] = useState('')
+  useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
+  const [partyId, setPartyId]   = useState('')
+  const [fyId, setFyId]         = useState('')
+  const [rows, setRows]         = useState(null)
+  const [loading, setLoading]   = useState(false)
+
+  async function runReport() {
+    if (!entityId || !partyId) return
+    setLoading(true)
+    const fyFilter = fys.find(f => f.id === fyId)
+    let expQ = supabase.from('expenses')
+      .select('id,expense_no,expense_date,description,total_amount,net_payable')
+      .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
+    let payQ = supabase.from('party_payments')
+      .select('id,payment_date,amount,reference,mode')
+      .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
+    if (fyFilter) {
+      expQ = expQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
+      payQ = payQ.gte('payment_date', fyFilter.start_date).lte('payment_date', fyFilter.end_date)
+    }
+    const [{ data: exps }, { data: pays }] = await Promise.all([expQ, payQ])
+
+    const ledger = [
+      ...(exps || []).map(e => ({ date: e.expense_date, doc: e.expense_no, type: 'Expense', desc: e.description, bill: (e.net_payable ?? e.total_amount) || 0, paid: 0 })),
+      ...(pays || []).map(p => ({ date: p.payment_date, doc: p.reference || '—', type: 'Payment', desc: p.mode || '', bill: 0, paid: p.amount || 0 })),
+    ].sort((a, b) => new Date(a.date) - new Date(b.date))
+
+    let bal = 0
+    setRows(ledger.map(r => { bal += r.bill - r.paid; return { ...r, balance: bal } }))
+    setLoading(false)
+  }
+
+  const totalBill = (rows || []).reduce((s, r) => s + r.bill, 0)
+  const totalPaid = (rows || []).reduce((s, r) => s + r.paid, 0)
+  const outstanding = totalBill - totalPaid
+  const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <FormRow label='Entity'>
+          <Select value={entityId} onChange={e => setEntityId(e.target.value)} style={{ minWidth: '180px' }}>
+            <option value=''>Select entity</option>
+            {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+          </Select>
+        </FormRow>
+        <FormRow label='Party'>
+          <Select value={partyId} onChange={e => setPartyId(e.target.value)} style={{ minWidth: '200px' }}>
+            <option value=''>Select party</option>
+            {parties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </Select>
+        </FormRow>
+        <FormRow label='Financial Year'>
+          <Select value={fyId} onChange={e => setFyId(e.target.value)} style={{ minWidth: '160px' }}>
+            <option value=''>All time</option>
+            {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+          </Select>
+        </FormRow>
+        <button onClick={runReport} disabled={!entityId || !partyId || loading}
+          style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: (!entityId || !partyId) ? 'not-allowed' : 'pointer', opacity: (!entityId || !partyId) ? 0.5 : 1, fontFamily: 'inherit' }}>
+          {loading ? 'Running…' : 'Run Report'}
+        </button>
+      </div>
+
+      {rows && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px' }}>
+            <StatCard label='Total Billed' value={formatINR(totalBill)} />
+            <StatCard label='Total Paid'   value={formatINR(totalPaid)} color={C.success} />
+            <StatCard label='Outstanding'  value={formatINR(Math.abs(outstanding))} sub={outstanding > 0 ? 'We still owe the party' : outstanding < 0 ? 'Advance / overpaid' : 'Settled'} color={outstanding > 0 ? C.danger : C.success} />
+          </div>
+          <Card>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                <thead><tr>
+                  <th style={{ ...th, textAlign: 'left' }}>Date</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Document</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Type</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Billed</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Paid</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Outstanding</th>
+                </tr></thead>
+                <tbody>
+                  {rows.map((r, i) => (
+                    <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{fmtDate(r.date)}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace', fontSize: '12px' }}>{r.doc}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>
+                        <span style={{ fontSize: '11px', background: r.type === 'Payment' ? '#e8f3ec' : '#f3ede8', color: r.type === 'Payment' ? C.success : C.warning, padding: '2px 7px', borderRadius: '4px', fontWeight: 600 }}>{r.type}</span>
+                      </td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.bill > 0 ? C.warning : C.textMuted }}>{r.bill > 0 ? formatINR(r.bill) : '—'}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.paid > 0 ? C.success : C.textMuted }}>{r.paid > 0 ? formatINR(r.paid) : '—'}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: r.balance > 0 ? C.danger : C.text }}>{formatINR(Math.abs(r.balance))}</td>
+                    </tr>
+                  ))}
+                  {rows.length === 0 && <tr><td colSpan={6} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No expenses or payments for this party under this entity.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
+      {!loading && rows === null && (
+        <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Select an entity and party, then Run Report.</div>
+      )}
+    </div>
+  )
+}
+
 // ─── Reports Shell ────────────────────────────────────────────────────────────
 export default function Reports() {
   const [tab, setTab]           = useState('P&L')
@@ -883,9 +1215,11 @@ export default function Reports() {
   // full of entities whose reports RLS would return empty for anyway.
   const { entities, defaultEntityId } = useEntityAccess()
   const [fys, setFys]           = useState([])
+  const [parties, setParties]   = useState([]) // CHANGED: global party master, for the Party Ledger tab
 
   useEffect(() => {
     supabase.from('financial_years').select('*').order('start_date', { ascending: false }).then(({ data }) => setFys(data || []))
+    supabase.from('parties').select('id,name').eq('is_deleted', false).eq('is_active', true).order('name').then(({ data }) => setParties(data || []))
   }, [])
 
   return (
@@ -895,25 +1229,35 @@ export default function Reports() {
         <p style={{ fontSize: '13px', color: C.textMuted, margin: '4px 0 0' }}>Financial and operational reports</p>
       </div>
 
-      {/* Tabs */}
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '24px', borderBottom: `2px solid ${C.border}`, paddingBottom: '0' }}>
-        {TABS.map(t => (
-          <button key={t} onClick={() => setTab(t)}
-            style={{
-              padding: '8px 20px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
-              fontWeight: tab === t ? 700 : 500, fontSize: '13px',
-              color: tab === t ? C.text : C.textSoft,
-              background: 'transparent',
-              borderBottom: tab === t ? `2px solid ${C.accent}` : '2px solid transparent',
-              marginBottom: '-2px', transition: 'all 0.15s',
-            }}>
-            {t}
-          </button>
-        ))}
-      </div>
+      {/* CHANGED: tabs are grouped — Compliance (GST Summary, TDS/TCS Report)
+          first, then the rest, unlabeled — instead of one flat row. */}
+      {TAB_GROUPS.map((group, gi) => (
+        <div key={gi} style={{ marginBottom: gi === TAB_GROUPS.length - 1 ? '24px' : '8px' }}>
+          {group.label && (
+            <div style={{ fontSize: '10px', fontWeight: 700, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '4px' }}>{group.label}</div>
+          )}
+          <div style={{ display: 'flex', gap: '4px', borderBottom: `2px solid ${C.border}`, paddingBottom: '0' }}>
+            {group.tabs.map(t => (
+              <button key={t} onClick={() => setTab(t)}
+                style={{
+                  padding: '8px 20px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
+                  fontWeight: tab === t ? 700 : 500, fontSize: '13px',
+                  color: tab === t ? C.text : C.textSoft,
+                  background: 'transparent',
+                  borderBottom: tab === t ? `2px solid ${C.accent}` : '2px solid transparent',
+                  marginBottom: '-2px', transition: 'all 0.15s',
+                }}>
+                {t}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
 
       {tab === 'P&L'         && <PLReport entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'GST Summary' && <GSTSummary entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
+      {tab === 'TDS/TCS Report' && <TdsTcsReport entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
+      {tab === 'Party Ledger' && <PartyLedger entities={entities} parties={parties} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Ledger'      && <Ledger entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Profitability' && <ProfitabilityReport entities={entities} fys={fys} />}
       {tab === 'Actual Stock'    && <ActualStockReport entities={entities} defaultEntityId={defaultEntityId} />}
