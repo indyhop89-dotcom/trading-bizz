@@ -703,7 +703,6 @@ function NewInvoice() {
   async function handleSave(skipStockCheck = false) {
     if (!form.seller_entity_id || !form.buyer_entity_id) return setToast({ message: 'Seller and Buyer are required', type: 'error' })
     if (lines.length === 0) return setToast({ message: 'At least one line item is required', type: 'error' })
-    if (!isValidEwayBill(form.eway_bill_no)) return setToast({ message: EWAY_BILL_ERROR, type: 'error' })
 
     // CHANGED: every stock-affecting line must carry a product_id — otherwise
     // it's invisible to Actual Stock / Stock Position. Hard block.
@@ -761,6 +760,14 @@ function NewInvoice() {
     }
     if (!payload.tds_amount)    delete payload.tds_amount
     if (!payload.tcs_amount)    delete payload.tcs_amount
+    // CHANGED: eway_bill_no/eway_bill_date must never be set at creation —
+    // unconditionally, not just when blank. saveEwbForm's stock/purchase-mirror/
+    // cargo-status side effects only fire on the false→true transition of
+    // eway_bill_no; if it arrived already-set from creation, that transition
+    // (and both side effects) would silently never happen. Every invoice must
+    // start EWB-less and get it exclusively through that one dedicated flow.
+    delete payload.eway_bill_no
+    delete payload.eway_bill_date
 
     const { data: inv, error } = await supabase.from('invoices').insert(payload).select().single()
     if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
@@ -895,7 +902,14 @@ function NewInvoice() {
         </Card>
 
         <Card style={{ padding: '20px' }}>
-          <SectionDivider label='Billing, Shipping & E-way Bill' />
+          {/* CHANGED: E-way Bill entry removed from here — it must only ever be
+              added via the dedicated flow on the invoice detail page
+              (saveEwbForm). That's the ONLY path that auto-creates the buyer's
+              purchase-register mirror and syncs the order leg's movement/cargo
+              status on the false→true transition; entering it here at creation
+              time would set eway_bill_no from the start, so that transition
+              (and both side effects) would silently never fire. */}
+          <SectionDivider label='Billing & Shipping' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '12px' }}>
             <FormRow label='Bill From'>
               <Input value={form.bill_from} onChange={e => setF('bill_from', e.target.value)} placeholder='Billing address of seller' />
@@ -908,12 +922,6 @@ function NewInvoice() {
             </FormRow>
             <FormRow label='Ship To'>
               <Input value={form.ship_to} onChange={e => setF('ship_to', e.target.value)} placeholder='Delivery location' />
-            </FormRow>
-            <FormRow label='E-way Bill No' error={!isValidEwayBill(form.eway_bill_no) ? EWAY_BILL_ERROR : undefined}>
-              <Input value={form.eway_bill_no} onChange={e => setF('eway_bill_no', e.target.value)} placeholder='EWB number' />
-            </FormRow>
-            <FormRow label='E-way Bill Date' hint='Can differ from invoice date'>
-              <Input type='date' value={form.eway_bill_date} onChange={e => setF('eway_bill_date', e.target.value)} />
             </FormRow>
           </div>
         </Card>

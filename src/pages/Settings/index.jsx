@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
@@ -20,6 +21,59 @@ import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/va
 // If a better version turns up in git history, prefer that over this file.
 
 const TABS = ['My Profile', 'Financial Years', 'Entity Groups', 'HSN Master', 'Parties', 'Users']
+
+// ─── Row Actions Menu ───────────────────────────────────────────────────────────
+// A dropdown rendered via a portal into document.body, positioned by the
+// trigger button's own on-screen coordinates — immune to being clipped by any
+// ancestor's `overflow: hidden` (e.g. Card, which sets that for rounded
+// corners). The previous inline `position: absolute` version got cut off for
+// rows near the bottom of a table, since it was clipped by the Card's box.
+function ActionsMenu({ items }) {
+  const [open, setOpen] = useState(false)
+  const [pos, setPos] = useState(null)
+  const btnRef = useRef(null)
+
+  function toggle() {
+    if (!open && btnRef.current) {
+      const r = btnRef.current.getBoundingClientRect()
+      setPos({ top: r.bottom + 4, right: window.innerWidth - r.right })
+    }
+    setOpen(o => !o)
+  }
+
+  return (
+    <div onClick={e => e.stopPropagation()}>
+      {/* Btn doesn't forward refs — wrap it so we can measure its position */}
+      <span ref={btnRef} style={{ display: 'inline-block' }}>
+        <Btn size='sm' variant='ghost' onClick={toggle}>Actions ▾</Btn>
+      </span>
+      {open && pos && createPortal(
+        <>
+          <div style={{ position: 'fixed', inset: 0, zIndex: 1000 }} onClick={() => setOpen(false)} />
+          <div style={{
+            position: 'fixed', top: pos.top, right: pos.right, zIndex: 1001,
+            background: C.surface, border: `1px solid ${C.border}`, borderRadius: '6px',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.12)', minWidth: '160px', overflow: 'hidden',
+          }}>
+            {items.map(item => (
+              <button key={item.label} onClick={() => { item.onClick(); setOpen(false) }}
+                style={{
+                  display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px',
+                  border: 'none', background: 'none', cursor: 'pointer', fontFamily: 'inherit',
+                  fontSize: '13px', color: item.danger ? C.danger : C.text,
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = C.bg}
+                onMouseLeave={e => e.currentTarget.style.background = 'none'}>
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </>,
+        document.body
+      )}
+    </div>
+  )
+}
 
 // ─── My Profile Tab ─────────────────────────────────────────────────────────────
 // Self-service name/phone editing, available to every role (master included) —
@@ -167,7 +221,7 @@ function FinancialYears() {
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
         <Btn onClick={openNew}>+ New Financial Year</Btn>
       </div>
-      <Card>
+      <Card style={{ maxHeight: '65vh', overflowY: 'auto' }}>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={rows}
@@ -271,7 +325,7 @@ function EntityGroups() {
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
         <Btn onClick={openNew}>+ New Group</Btn>
       </div>
-      <Card>
+      <Card style={{ maxHeight: '65vh', overflowY: 'auto' }}>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={rows}
@@ -328,7 +382,6 @@ function HsnMaster() {
   const [historyFor, setHistoryFor]     = useState(null) // hsn_code currently shown, or null
   const [historyRows, setHistoryRows]   = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
-  const [openActionsFor, setOpenActionsFor] = useState(null) // CHANGED: row id whose Actions menu is open
   const [confirmHardDelete, setConfirmHardDelete] = useState(null) // CHANGED: real delete, distinct from Deactivate
 
   // Only the current (open-ended) version of each code shows in the main
@@ -475,39 +528,16 @@ function HsnMaster() {
     { label: 'Status',     render: r => <Badge status={r.is_active ? 'active' : 'cancelled'} label={r.is_active ? 'Active' : 'Inactive'} /> },
     { label: 'Effective From', render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{fmtDate(r.effective_from)}</span> },
     // CHANGED: consolidated into a single Actions dropdown (New Version,
-    // History, Deactivate/Reactivate, Delete) instead of four separate buttons.
+    // History, Deactivate/Reactivate, Delete) instead of four separate
+    // buttons — rendered via a portal (ActionsMenu) so it's never clipped by
+    // the surrounding Card's overflow:hidden, unlike the earlier inline version.
     { label: 'Actions', render: r => (
-      <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
-        <Btn size='sm' variant='ghost' onClick={() => setOpenActionsFor(id => id === r.id ? null : r.id)}>Actions ▾</Btn>
-        {openActionsFor === r.id && (
-          <>
-            <div style={{ position: 'fixed', inset: 0, zIndex: 10 }} onClick={() => setOpenActionsFor(null)} />
-            <div style={{
-              position: 'absolute', right: 0, top: '100%', marginTop: '4px', zIndex: 11,
-              background: C.surface, border: `1px solid ${C.border}`, borderRadius: '6px',
-              boxShadow: '0 4px 12px rgba(0,0,0,0.12)', minWidth: '160px', overflow: 'hidden',
-            }}>
-              {[
-                { label: 'New Version', onClick: () => openEdit(r) },
-                { label: 'History', onClick: () => openHistory(r.hsn_code) },
-                { label: r.is_active ? 'Deactivate' : 'Reactivate', onClick: () => setConfirmDelete(r), danger: r.is_active },
-                { label: 'Delete', onClick: () => setConfirmHardDelete(r), danger: true },
-              ].map(item => (
-                <button key={item.label} onClick={() => { item.onClick(); setOpenActionsFor(null) }}
-                  style={{
-                    display: 'block', width: '100%', textAlign: 'left', padding: '9px 14px',
-                    border: 'none', background: 'none', cursor: 'pointer', fontFamily: 'inherit',
-                    fontSize: '13px', color: item.danger ? C.danger : C.text,
-                  }}
-                  onMouseEnter={e => e.currentTarget.style.background = C.bg}
-                  onMouseLeave={e => e.currentTarget.style.background = 'none'}>
-                  {item.label}
-                </button>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
+      <ActionsMenu items={[
+        { label: 'New Version', onClick: () => openEdit(r) },
+        { label: 'History', onClick: () => openHistory(r.hsn_code) },
+        { label: r.is_active ? 'Deactivate' : 'Reactivate', onClick: () => setConfirmDelete(r), danger: r.is_active },
+        { label: 'Delete', onClick: () => setConfirmHardDelete(r), danger: true },
+      ]} />
     )},
   ]
 
@@ -520,7 +550,7 @@ function HsnMaster() {
         <Btn onClick={openNew}>+ New HSN Entry</Btn>
       </div>
 
-      <Card>
+      <Card style={{ maxHeight: '65vh', overflowY: 'auto' }}>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={filtered}
@@ -887,7 +917,7 @@ function Users() {
           <Btn onClick={openAddUser}>+ Add User</Btn>
         </div>
       )}
-      <Card>
+      <Card style={{ maxHeight: '65vh', overflowY: 'auto' }}>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={rows}
@@ -1147,7 +1177,7 @@ function Parties() {
       {!canManage && (
         <div style={{ fontSize: '12px', color: C.textMuted, marginBottom: '12px' }}>Only master/admin can add or edit parties.</div>
       )}
-      <Card>
+      <Card style={{ maxHeight: '65vh', overflowY: 'auto' }}>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={filtered}

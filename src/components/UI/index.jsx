@@ -524,6 +524,11 @@ export function Table({ columns, rows, onRowClick, emptyState, sortKey, sortDir,
                   borderBottom: '1px solid var(--border)',
                   borderTop: '1px solid var(--border)',
                   whiteSpace: 'nowrap',
+                  // CHANGED: stays pinned when this table sits inside a
+                  // scrollable container (e.g. a Card with maxHeight+overflowY)
+                  // — harmless no-op otherwise, since a non-scrolling ancestor
+                  // never triggers the sticky behavior.
+                  position: 'sticky', top: 0, zIndex: 1,
                 }}
               >
                 {col.label}<SortIcon col={col} />
