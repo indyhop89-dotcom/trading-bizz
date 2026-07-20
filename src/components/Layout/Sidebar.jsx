@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { NavLink, useNavigate } from 'react-router-dom'
 import { useAuth } from '../../hooks/useAuth'
 import { supabase } from '../../supabaseClient'
@@ -65,6 +66,7 @@ export default function Sidebar({ collapsed, onToggle }) {
   const [confirmPassword, setConfirmPassword] = useState('')
   const [pwSaving, setPwSaving] = useState(false)
   const [pwToast, setPwToast] = useState(null)
+  const [hoverTip, setHoverTip] = useState(null)
 
   async function handleSignOut() {
     await signOut()
@@ -184,6 +186,11 @@ export default function Sidebar({ collapsed, onToggle }) {
                 borderLeft: isActive && !collapsed ? '2px solid #2490ef' : '2px solid transparent',
               })}
               className='sidebar-nav-item'
+              onMouseEnter={collapsed ? (e => {
+                const r = e.currentTarget.getBoundingClientRect()
+                setHoverTip({ label: item.label, top: r.top + r.height / 2, left: r.right + 10 })
+              }) : undefined}
+              onMouseLeave={collapsed ? (() => setHoverTip(null)) : undefined}
             >
               {({ isActive }) => (
                 <>
@@ -195,9 +202,6 @@ export default function Sidebar({ collapsed, onToggle }) {
                     <IconComp />
                   </span>
                   {!collapsed && <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</span>}
-                  {collapsed && (
-                    <span className='sidebar-tooltip'>{item.label}</span>
-                  )}
                 </>
               )}
             </NavLink>
@@ -277,6 +281,25 @@ export default function Sidebar({ collapsed, onToggle }) {
         </div>
       </Modal>
       {pwToast && <Toast message={pwToast.message} type={pwToast.type} onClose={() => setPwToast(null)} />}
+      {hoverTip && createPortal(
+        <div style={{
+          position: 'fixed',
+          top: hoverTip.top, left: hoverTip.left,
+          transform: 'translateY(-50%)',
+          background: '#1a1208',
+          color: '#f5f0e8',
+          fontSize: '12px', fontWeight: 600,
+          padding: '4px 8px',
+          borderRadius: '5px',
+          whiteSpace: 'nowrap',
+          pointerEvents: 'none',
+          zIndex: 1000,
+          boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+        }}>
+          {hoverTip.label}
+        </div>,
+        document.body
+      )}
     </div>
   )
 }

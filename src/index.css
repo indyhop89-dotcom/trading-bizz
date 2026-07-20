@@ -282,27 +282,6 @@ input[type=number] { -moz-appearance: textfield; }
   font-weight: 600;
 }
 
-/* ─── Sidebar collapsed state ───────────────────────────────────────────────── */
-.sidebar-tooltip {
-  position: absolute;
-  left: calc(100% + 10px);
-  top: 50%;
-  transform: translateY(-50%);
-  background: var(--dark);
-  color: var(--text-inverse);
-  font-size: var(--text-xs);
-  font-weight: 600;
-  padding: 4px 8px;
-  border-radius: var(--radius);
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity var(--transition-fast);
-  z-index: 100;
-}
-
-.sidebar-nav-item:hover .sidebar-tooltip { opacity: 1; }
-
 /* ─── Workspace module cards ────────────────────────────────────────────────── */
 .workspace-card {
   background: var(--surface-raised);
