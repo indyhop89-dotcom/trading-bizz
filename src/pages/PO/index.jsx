@@ -885,7 +885,7 @@ function PODetail() {
     if (!poNo) return setToast({ message: 'PO number cannot be blank', type: 'error' })
     setSaving(true)
     if (poNo.toLowerCase() !== (po.po_no || '').toLowerCase()) {
-      const { data: dup } = await supabase.from('purchase_orders').select('id').ilike('po_no', poNo).neq('id', id).limit(1)
+      const { data: dup } = await supabase.from('purchase_orders').select('id').ilike('po_no', poNo).eq('is_deleted', false).neq('id', id).limit(1)
       if (dup?.length) { setSaving(false); return setToast({ message: `PO number "${poNo}" is already in use`, type: 'error' }) }
     }
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))

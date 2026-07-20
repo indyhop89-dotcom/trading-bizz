@@ -782,7 +782,7 @@ function NewInvoice() {
     const fyCode = fyCodeForDate(form.invoice_date)
     let invoiceNo = (form.invoice_no || '').trim()
     if (invoiceNo) {
-      const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).limit(1)
+      const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).eq('is_deleted', false).limit(1)
       if (dup?.length) { setSaving(false); return setToast({ message: `Invoice number "${invoiceNo}" is already in use`, type: 'error' }) }
     } else {
       const sellerEntity = entities.find(e => e.id === form.seller_entity_id)
@@ -1347,7 +1347,7 @@ function InvoiceDetail() {
     if (missing.length > 0) return setToast({ message: `Line ${missing.map(l => l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`, type: 'error' })
     setSaving(true)
     if (invoiceNo.toLowerCase() !== (inv.invoice_no || '').toLowerCase()) {
-      const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).neq('id', id).limit(1)
+      const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).eq('is_deleted', false).neq('id', id).limit(1)
       if (dup?.length) { setSaving(false); return setToast({ message: `Invoice number "${invoiceNo}" is already in use`, type: 'error' }) }
     }
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
