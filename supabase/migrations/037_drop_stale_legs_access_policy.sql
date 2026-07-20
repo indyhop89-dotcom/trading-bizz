@@ -1,0 +1,32 @@
+-- ============================================================================
+-- 037_drop_stale_legs_access_policy.sql
+--
+-- Root-causes the 500 "infinite recursion detected in policy for relation
+-- orders" (and "order_legs") that started immediately after 036 shipped —
+-- affecting every role, including master, not just entity-scoped users.
+--
+-- order_legs still carries its very first RLS policy, "legs_access"
+-- (001_phase1.sql). It was meant to be superseded by order_legs_select/
+-- order_legs_write in 012_enable_access_control_rls.sql /
+-- 014_child_and_missing_table_rls.sql — but those migrations only run
+-- `DROP POLICY IF EXISTS order_legs_select` / `order_legs_write` (the *new*
+-- names), so the differently-named old "legs_access" policy was never
+-- actually dropped. It has been sitting there ever since, silently OR'd in
+-- alongside order_legs_select/write, and it queries `orders` from inside
+-- order_legs' own RLS:
+--   EXISTS (SELECT 1 FROM orders o WHERE o.id = order_id AND (...))
+--
+-- That was harmless as a one-way reference (order_legs -> orders) until 036
+-- made orders_select also query order_legs (to grant intermediate leg
+-- parties visibility into the parent order) — closing the loop:
+-- orders -> order_legs (evaluates legs_access) -> orders -> ... Postgres's
+-- RLS engine detects that cycle and refuses to plan the query at all,
+-- 500-ing every request against either table for every role.
+--
+-- Fix: drop the stale policy. order_legs_select/order_legs_write already
+-- cover everything legs_access did, correctly, via has_entity_grant().
+--
+-- Idempotent — safe to re-run.
+-- ============================================================================
+
+DROP POLICY IF EXISTS "legs_access" ON order_legs;
