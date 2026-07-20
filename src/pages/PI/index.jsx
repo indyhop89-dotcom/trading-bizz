@@ -395,7 +395,7 @@ function PIList() {
       }
     }
 
-    for (const [key, group] of Object.entries(groups)) {
+    for (const group of Object.values(groups)) {
       const { meta, lines: gLines } = group
       const fromE = entities.find(e => e.short_name?.toLowerCase() === meta.from_entity?.toLowerCase() || e.name?.toLowerCase() === meta.from_entity?.toLowerCase())
       const toE   = entities.find(e => e.short_name?.toLowerCase() === meta.to_entity?.toLowerCase()   || e.name?.toLowerCase() === meta.to_entity?.toLowerCase())

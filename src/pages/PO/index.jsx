@@ -366,7 +366,7 @@ function POList() {
       }
     }
 
-    for (const [key, group] of Object.entries(groups)) {
+    for (const group of Object.values(groups)) {
       const { meta, lines: gLines } = group
       const buyerE  = entities.find(e => e.short_name?.toLowerCase() === meta.buyer_entity?.toLowerCase()  || e.name?.toLowerCase() === meta.buyer_entity?.toLowerCase())
       const sellerE = entities.find(e => e.short_name?.toLowerCase() === meta.seller_entity?.toLowerCase() || e.name?.toLowerCase() === meta.seller_entity?.toLowerCase())
@@ -444,7 +444,7 @@ function POList() {
       p.buyer?.name?.toLowerCase().includes(search.toLowerCase()) ||
       p.seller?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter === 'all' || p.status === statusFilter
-    return ms && mst
+    return ms && mst && mdf && mdt
   })
 
   function toggleSelect(id) {

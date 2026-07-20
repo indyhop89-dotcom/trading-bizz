@@ -280,7 +280,7 @@ function InvoiceList() {
       }
     }
 
-    for (const [key, group] of Object.entries(groups)) {
+    for (const group of Object.values(groups)) {
       const { meta, lines: gLines } = group
       const sellerE = entities.find(e => e.short_name?.toLowerCase() === meta.seller_entity?.toLowerCase() || e.name?.toLowerCase() === meta.seller_entity?.toLowerCase())
       const buyerE  = entities.find(e => e.short_name?.toLowerCase() === meta.buyer_entity?.toLowerCase()  || e.name?.toLowerCase() === meta.buyer_entity?.toLowerCase())
@@ -545,6 +545,10 @@ function NewInvoice() {
   // be invoiced twice by accident.
   const [usedPiIds, setUsedPiIds] = useState(new Set())
   const [usedPoIds, setUsedPoIds] = useState(new Set())
+  // setter-only: loadLegs() populates this for a leg-picker that was never
+  // wired into the form; kept as-is rather than guessing at the missing UI
+  // or deleting a fetch something else may still depend on.
+  // eslint-disable-next-line no-unused-vars
   const [legs, setLegs]         = useState([])
   const [lines, setLines]       = useState([])
   const [hsnMap, setHsnMap]     = useState(new Map())
@@ -596,6 +600,10 @@ function NewInvoice() {
     fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id', fromPiId).order('line_no')).then(({ data }) => {
       if (data) setLines(data.map(l => ({ ...l, _id: l.id })))
     })
+    // setF is intentionally omitted below: it's a plain (unmemoized) function
+    // recreated every render, so including it would rerun this effect on
+    // every render instead of only when fromPiId/pis actually change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fromPiId, pis])
 
   // CHANGED: refresh available stock whenever the seller entity changes.
@@ -609,6 +617,11 @@ function NewInvoice() {
   // conversion) so a single-entity user doesn't have to pick from a list of one.
   useEffect(() => {
     if (defaultEntityId && !form.seller_entity_id) setF('seller_entity_id', defaultEntityId)
+    // Intentionally fires only when defaultEntityId (re)resolves, not on
+    // every manual edit to form.seller_entity_id or every render (setF is
+    // unmemoized) — the `!form.seller_entity_id` guard already makes this a
+    // one-time default, not an ongoing sync.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [defaultEntityId])
 
   function setF(k, v) {
