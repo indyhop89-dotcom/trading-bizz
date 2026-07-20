@@ -11,6 +11,7 @@ import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
+import { calcLineTax } from '../../utils/tax'
 import { withTimeout } from '../../utils/query'
 import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
 import DocumentAttachments from '../../components/DocumentAttachments'
@@ -323,10 +324,13 @@ function InvoiceList() {
         // literal truth. Falls back to the CSV's own gst_rate (or 18) only
         // when HSN master has no resolvable rate.
         const resolved = r.hsn_code ? resolveGSTRate(r.hsn_code, rate, hsnMap, invoiceDate) : { gst_rate: null }
-        const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(r.gst_rate) || 18); const half = gstRate / 2
-        const igst = interstate ? round2(taxable * gstRate / 100) : 0
-        const cgst = !interstate ? round2(taxable * half / 100) : 0
-        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: round2(taxable+igst+cgst+cgst) }
+        const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(r.gst_rate) || 18)
+        // CHANGED: use the shared calcLineTax (same math the interactive
+        // editor uses via computeLine) instead of a separately duplicated
+        // inline formula — see PI/index.jsx's handleCSV for the full
+        // rationale.
+        const tax = calcLineTax(taxable, gstRate, interstate)
+        return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, ...tax, total_amount: round2(taxable+tax.total_tax) }
       })
       if (lineErr) continue
       const rawTotals = invLines.reduce((acc, l) => ({ taxable_amount: acc.taxable_amount+l.taxable_amount, cgst_amount: acc.cgst_amount+l.cgst_amount, sgst_amount: acc.sgst_amount+l.sgst_amount, igst_amount: acc.igst_amount+l.igst_amount, total_amount: acc.total_amount+l.total_amount, total_qty: acc.total_qty+l.qty }), { taxable_amount:0,cgst_amount:0,sgst_amount:0,igst_amount:0,total_amount:0,total_qty:0 })

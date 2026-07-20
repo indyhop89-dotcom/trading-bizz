@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { isInterstate, calcLineTax, calcInvoiceTotals } from '../tax.js'
+import { round2 } from '../money.js'
 
 // ─── isInterstate ─────────────────────────────────────────────────────────────
 
@@ -142,6 +143,51 @@ describe('calcLineTax — local / intrastate (CGST + SGST)', () => {
     expect(result.cgst_amount).toBe(280)
     expect(result.sgst_amount).toBe(280)
     expect(result.total_tax).toBe(560)
+  })
+})
+
+// ─── calcLineTax — rounding convention (round total first, then split) ────────
+//
+// These lock in the "match Excel calculations" fix: the line's total is
+// rounded once from the precise value, then CGST/SGST are each derived from
+// that already-rounded total — instead of rounding taxable*rate/200
+// independently per component. Verified against real rows pulled from a
+// user-supplied bulk-upload CSV whose own cgst/sgst/total_amount columns
+// were computed this same way.
+
+describe('calcLineTax — rounds the total first, then derives CGST/SGST from it', () => {
+  it('matches a verified real-data row where independent-component rounding would differ (taxable=11173.6, 18%)', () => {
+    // taxable*1.18 = 13184.848 → total rounds to 13184.85; half of the
+    // resulting 2011.25 tax is 1005.625, which rounds up to 1005.63 — the
+    // old convention (round2(11173.6 * 9/100) = round2(1005.624)) also gives
+    // 1005.62, one paisa short of the source data's stated 1005.63.
+    const result = calcLineTax(11173.6, 18, false)
+    expect(result.cgst_amount).toBe(1005.63)
+    expect(result.sgst_amount).toBe(1005.63)
+    expect(result.total_tax).toBe(2011.25)
+  })
+
+  it('matches a verified real-data row (taxable=9014.04, 18%)', () => {
+    const result = calcLineTax(9014.04, 18, false)
+    expect(result.cgst_amount).toBe(811.27)
+    expect(result.sgst_amount).toBe(811.27)
+    expect(result.total_tax).toBe(1622.53)
+  })
+
+  it('matches a verified real-data row at 5% GST (taxable=10443.4)', () => {
+    const result = calcLineTax(10443.4, 5, false)
+    expect(result.cgst_amount).toBe(261.09)
+    expect(result.sgst_amount).toBe(261.09)
+  })
+
+  it('derives total_amount (taxable + total_tax) exactly, even when cgst+sgst lands a paisa off total_tax', () => {
+    // 11173.6 + 2011.25 = 13184.85 — matches the source row's total_amount
+    // even though cgst_amount + sgst_amount (1005.63*2 = 2011.26) is one
+    // paisa more than total_tax (2011.25). total_amount is always derived
+    // from total_tax directly (see computeLine in LineItemsEditor.jsx), so
+    // it stays exact regardless of that split-level rounding artifact.
+    const result = calcLineTax(11173.6, 18, false)
+    expect(round2(11173.6 + result.total_tax)).toBe(13184.85)
   })
 })
 

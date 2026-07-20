@@ -129,10 +129,11 @@ describe('roundRupees', () => {
 // ─── round2 ───────────────────────────────────────────────────────────────────
 
 describe('round2', () => {
-  // NOTE: IEEE 754 float: 1.005 * 100 = 100.4999... → Math.round → 100 → 1.00
-  // round2 uses Math.round on floating-point intermediates; not banker's rounding.
-  it('documents float precision: 1.005 rounds to 1.00 due to IEEE 754', () => {
-    expect(round2(1.005)).toBe(1.00)
+  // round2 goes through toFixed(4) before Math.round specifically to avoid the
+  // classic IEEE 754 trap (1.005*100 === 100.4999...999 in raw float math) —
+  // this keeps half-up rounding consistent, matching Excel/Tally convention.
+  it('rounds a value exactly on a 2dp boundary up, despite float representation noise', () => {
+    expect(round2(1.005)).toBe(1.01)
   })
 
   it('leaves 2dp values unchanged', () => {
@@ -155,8 +156,7 @@ describe('round2', () => {
     expect(round2('3.14159')).toBe(3.14)
   })
 
-  // NOTE: -5.555 * 100 = -555.4999... → Math.round → -555 → -5.55 (float precision)
-  it('documents float precision: -5.555 rounds to -5.55', () => {
+  it('rounds a negative value toward zero at the 2dp boundary consistently', () => {
     expect(round2(-5.555)).toBe(-5.55)
   })
 })

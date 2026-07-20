@@ -59,7 +59,15 @@ export function roundRupees(val) {
 /**
  * Round to 2 decimal places (for intermediate calculations).
  * Used on rate, taxable amount before final rounding.
+ *
+ * Goes through toFixed() before Math.round() rather than `Math.round(val*100)/100`
+ * directly: IEEE 754 floats can't represent most 2dp decimals exactly, so a value
+ * that's conceptually exactly on a rounding boundary (e.g. 261.085) is often stored
+ * as something like 261.08499999999998 — Math.round then rounds it the wrong way.
+ * toFixed(4) collapses that noise before Math.round sees it, so half-up rounding is
+ * consistent — matching the convention used by Excel/Tally-generated reference data.
  */
 export function round2(val) {
-  return Math.round((Number(val) || 0) * 100) / 100
+  const n = Number(val) || 0
+  return Math.round(Number((n * 100).toFixed(4))) / 100
 }

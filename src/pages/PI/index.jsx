@@ -12,6 +12,7 @@ import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/da
 import { suggestNextNo } from '../../utils/numbering'
 import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
+import { calcLineTax } from '../../utils/tax'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { calcSellRate } from '../../utils/margin'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
@@ -446,18 +447,19 @@ function PIList() {
         // still works for HSN codes not in the master table.
         const resolved = r.hsn_code ? resolveGSTRate(r.hsn_code, rate, hsnMap, piDate) : { gst_rate: null }
         const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(r.gst_rate) || 18)
-        const half    = gstRate / 2
-        const igst    = interstate ? round2(taxable * gstRate / 100) : 0
-        const cgst    = !interstate ? round2(taxable * half / 100) : 0
-        const sgst    = cgst
+        // CHANGED: use the shared calcLineTax (same math the interactive
+        // editor uses via computeLine) instead of a separately duplicated
+        // inline formula — keeps CSV-upload tax math from drifting out of
+        // sync with the editor again, and matches the rounding convention
+        // (round the line total first, then split) that this app's bulk
+        // CSV/Excel source data itself uses.
+        const tax = calcLineTax(taxable, gstRate, interstate)
         return {
           line_no: i + 1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code,
           qty, unit: r.unit || 'Nos', rate, gst_rate: gstRate,
           taxable_amount: taxable,
-          cgst_rate: half, cgst_amount: cgst,
-          sgst_rate: half, sgst_amount: sgst,
-          igst_rate: interstate ? gstRate : 0, igst_amount: igst,
-          total_amount: round2(taxable + igst + cgst + sgst),
+          ...tax,
+          total_amount: round2(taxable + tax.total_tax),
         }
       })
       if (lineErr) continue

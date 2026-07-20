@@ -19,27 +19,44 @@ export function isInterstate(sellerGstin, buyerGstin) {
  * All returned amounts are rounded to 2dp (not whole rupees) — the DB column
  * is numeric(15,2), and rounding to a whole rupee per line before storage/
  * summation is what causes header totals to drift from the true value.
+ *
+ * Rounds the line's TOTAL first (taxable + tax, as one precise figure), then
+ * derives CGST/SGST/IGST from that already-rounded total — matching how
+ * externally generated GST documents/spreadsheets conventionally compute
+ * (round the whole line once, split into components after), rather than
+ * rounding taxable*rate/200 independently per component. The two conventions
+ * agree almost everywhere but can differ by a paisa on lines that land right
+ * on a rounding boundary; this keeps totals in agreement with bulk-uploaded
+ * reference files instead of silently recomputing to a different (though
+ * individually valid) figure. Because CGST and SGST are each independently
+ * rounded from the same precise half below, their sum can occasionally land
+ * a paisa off from total_tax — an accepted artifact of this convention, not
+ * a bug: total_amount is always derived from total_tax directly (see
+ * computeLine in LineItemsEditor.jsx), never from cgst_amount + sgst_amount,
+ * so it stays exact.
  */
 export function calcLineTax(taxableAmount, gstRate, interstate) {
   const rate = Number(gstRate) || 0
   const base = Number(taxableAmount) || 0
 
+  const total = round2(base + (base * rate / 100))
+  const totalTax = round2(total - base)
+
   if (interstate) {
-    const igst = round2(base * rate / 100)
     return {
       cgst_rate: 0, cgst_amount: 0,
       sgst_rate: 0, sgst_amount: 0,
-      igst_rate: rate, igst_amount: igst,
-      total_tax: igst,
+      igst_rate: rate, igst_amount: totalTax,
+      total_tax: totalTax,
     }
   } else {
-    const half  = round2(rate / 2)
-    const each  = round2(base * half / 100)
+    const half = round2(rate / 2)
+    const each = round2(totalTax / 2)
     return {
       cgst_rate: half, cgst_amount: each,
       sgst_rate: half, sgst_amount: each,
       igst_rate: 0,    igst_amount: 0,
-      total_tax: round2(each * 2),
+      total_tax: totalTax,
     }
   }
 }
