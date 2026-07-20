@@ -207,6 +207,11 @@ function PIList() {
   }
 
   const [piLines, setPILines] = useState([])
+  // CHANGED: lets the user pin round_off_amount to a specific value instead
+  // of always auto-computing it — needed when correcting a PI's lines from
+  // an externally-sourced Excel/CSV whose own total doesn't land on the
+  // auto-rounded figure exactly (see computeTotals in LineItemsEditor.jsx).
+  const [roundOffOverride, setRoundOffOverride] = useState('')
   // CHANGED: PI planned qty exceeding the from-entity's actual available
   // stock is a warning, not a hard block — the seller may already have more
   // incoming, or plan to fulfil from a future purchase. handleSave(true)
@@ -231,7 +236,7 @@ function PIList() {
       }
     }
 
-    const totals = computeTotals(piLines.map(l => computeLine(l, form.is_interstate)))
+    const totals = computeTotals(piLines.map(l => computeLine(l, form.is_interstate)), roundOffOverride)
     setSaving(true)
     // CHANGED: use the manually-entered PI number if the user supplied one,
     // otherwise suggest one via suggestNextNo(). FY code is now computed
@@ -264,7 +269,7 @@ function PIList() {
     }
     setSaving(false)
     setToast({ message: 'PI created', type: 'success' })
-    setModalOpen(false); setPILines([])
+    setModalOpen(false); setPILines([]); setRoundOffOverride('')
     navigate(`/pi/${pi.id}`)
   }
 
@@ -552,7 +557,7 @@ function PIList() {
           <div style={{ display: 'flex', gap: '8px' }}>
             <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
             <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
-            <Btn onClick={() => { setForm({ ...EMPTY_FORM, from_entity_id: defaultEntityId }); setPILines([]); setModalOpen(true) }}>+ New PI</Btn>
+            <Btn onClick={() => { setForm({ ...EMPTY_FORM, from_entity_id: defaultEntityId }); setPILines([]); setRoundOffOverride(''); setModalOpen(true) }}>+ New PI</Btn>
           </div>
         }
       />
@@ -726,7 +731,7 @@ function PIList() {
           <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'-4px'}}>
             <Btn size='sm' variant='ghost' onClick={openCopyModal}>📋 Copy from previous leg PI…</Btn>
           </div>
-          <LineItemsEditor lines={piLines} setLines={setPILines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.pi_date} showMargin={true} stockMap={stockMap} products={products}/>
+          <LineItemsEditor lines={piLines} setLines={setPILines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.pi_date} showMargin={true} stockMap={stockMap} products={products} roundOffOverride={roundOffOverride} onRoundOffOverrideChange={setRoundOffOverride}/>
 
           <SectionDivider label='Billing & Shipping (optional)' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -775,6 +780,9 @@ function PIDetail() {
   const [lines, setLines]   = useState([])
   const [editLines, setEditLines] = useState([])
   const [editing, setEditing]     = useState(false)
+  // CHANGED: manual round_off_amount override for the edit flow — see
+  // computeTotals in LineItemsEditor.jsx for why this is sometimes needed.
+  const [editRoundOffOverride, setEditRoundOffOverride] = useState('')
   const [editForm, setEditForm]   = useState({})
   const [hsnMap, setHsnMap]       = useState(new Map())
   const [orders, setOrders]       = useState([])
@@ -835,6 +843,7 @@ function PIDetail() {
     }
     setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||'',order_id:pi.order_id||'',order_leg_id:pi.order_leg_id||'',payment_terms:pi.payment_terms||'',delivery_timeline:pi.delivery_timeline||'',mode_of_transport:pi.mode_of_transport||'Road'})
     setEditLines(lines.map(l=>({...l,_id:l.id,_hsn_resolved_rate:null,_hsn_override:false,_hsn_manually_set:false,_cost_rate:null,_margin_pct:''})))
+    setEditRoundOffOverride('')
     if (pi.order_id) loadLegs(pi.order_id)
     setEditing(true)
   }
@@ -854,7 +863,7 @@ function PIDetail() {
       if (dup?.length) { setSaving(false); return setToast({message:`PI number "${piNo}" is already in use`,type:'error'}) }
     }
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
-    const totals = computeTotals(computedLines)
+    const totals = computeTotals(computedLines, editRoundOffOverride)
     // order_id/order_leg_id are uuid columns and valid_upto is a date column
     // — an empty string (cleared in the dropdown, or a PI that never had a
     // valid_upto set so startEdit() seeded editForm with '') must be sent as
@@ -1082,6 +1091,8 @@ function PIDetail() {
           readOnly={!editing}
           showMargin={true}
           products={editing?products:undefined}
+          roundOffOverride={editing?editRoundOffOverride:''}
+          onRoundOffOverrideChange={editing?setEditRoundOffOverride:undefined}
         />
       </Card>
 

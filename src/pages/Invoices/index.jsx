@@ -551,6 +551,18 @@ function NewInvoice() {
   // eslint-disable-next-line no-unused-vars
   const [legs, setLegs]         = useState([])
   const [lines, setLines]       = useState([])
+  // CHANGED: lets the user pin round_off_amount to a specific value instead
+  // of always auto-computing it — see computeTotals in LineItemsEditor.jsx.
+  const [roundOffOverride, setRoundOffOverride] = useState('')
+  // CHANGED: bulk-CSV correction for this in-progress invoice's lines —
+  // same pattern as PI's edit-page "Load Into Editor", adapted to the
+  // create flow since Invoices has no post-save edit mode. Useful right
+  // after lines are auto-copied in from a linked PI/PO and just need bulk
+  // corrections instead of hand-editing every row.
+  const [linesCsvModal, setLinesCsvModal]     = useState(false)
+  const [linesCsvText, setLinesCsvText]       = useState('')
+  const [linesCsvResult, setLinesCsvResult]   = useState(null)
+  const [linesCsvSaving, setLinesCsvSaving]   = useState(false)
   const [hsnMap, setHsnMap]     = useState(new Map())
   // CHANGED: the existing product catalog — feeds LineItemsEditor's product
   // dropdown so lines reference an existing product_id (the same one stock was
@@ -757,7 +769,7 @@ function NewInvoice() {
     }
 
     const computedLines = lines.map(l => computeLine(l, form.is_interstate))
-    const totals = computeTotals(computedLines)
+    const totals = computeTotals(computedLines, roundOffOverride)
     setSaving(true)
 
     // CHANGED: invoice_no was previously never set here at all (not a hard
@@ -839,6 +851,58 @@ function NewInvoice() {
     navigate(`/invoices/${inv.id}`)
   }
 
+  function handleExportLines() {
+    if (!lines.length) return
+    const rows = lines.map(l => ({ ...l, product: products.find(p => p.id === l.product_id)?.name || '' }))
+    downloadCSV(`invoice_lines_${today()}.csv`, ['line_no','product','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'], rows)
+  }
+
+  // CHANGED: bulk-CSV correction for this in-progress invoice's lines — same
+  // approach as PI's handleBulkLinesCsv (edit page), adapted to the create
+  // flow since Invoices has no post-save edit mode. Replaces `lines`
+  // entirely (a corrections file represents the full corrected set).
+  // Product resolution: match by `product` column name (case-insensitive);
+  // if blank, inherit product_id from the existing line at the same
+  // line_no — so a file that only touches qty/rate doesn't need to
+  // restate every product.
+  async function handleBulkLinesCsv() {
+    setLinesCsvSaving(true)
+    const rows = linesCsvText.trim().split('\n').filter(l => l.trim())
+    if (rows.length < 2) { setLinesCsvSaving(false); return setLinesCsvResult({ loaded: 0, errors: ['Need header + data rows'] }) }
+    const delim = detectDelimiter(rows[0])
+    const header = parseCSVLine(rows[0], delim).map(h => h.trim().toLowerCase())
+    const byName = new Map(products.map(p => [p.name.trim().toLowerCase(), p]))
+    const byLineNo = new Map(lines.map(l => [String(l.line_no), l]))
+    const errors = []
+    const newLines = []
+    for (let i = 1; i < rows.length; i++) {
+      const cols = parseCSVLine(rows[i], delim)
+      const row = {}
+      header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
+      if (!row.description && !row.qty && !row.rate) continue // blank row
+      const existing = row.line_no ? byLineNo.get(row.line_no) : null
+      const matchedProduct = row.product ? byName.get(row.product.toLowerCase()) : null
+      if (row.product && !matchedProduct) errors.push(`Row ${i + 1}: product "${row.product}" not found — line added without a product, pick one manually before saving.`)
+      const productId = matchedProduct?.id || (!row.product ? existing?.product_id : null) || ''
+      const hsnCode = row.hsn_code || existing?.hsn_code || ''
+      const rowRate = toNum(row.rate)
+      const resolved = hsnCode ? resolveGSTRate(hsnCode, rowRate, hsnMap, form.invoice_date) : { gst_rate: null }
+      const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(row.gst_rate) || existing?.gst_rate || 18)
+      newLines.push({
+        _id: existing?.id || Date.now() + i, line_no: newLines.length + 1,
+        product_id: productId, description: row.description || existing?.description || '',
+        hsn_code: hsnCode, qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
+        rate: rowRate, gst_rate: gstRate,
+        taxable_amount: 0, cgst_rate: 0, cgst_amount: 0, sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,
+        _hsn_resolved_rate: resolved.gst_rate, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '',
+      })
+    }
+    const computed = newLines.map(l => computeLine(l, form.is_interstate))
+    setLines(computed)
+    setLinesCsvSaving(false)
+    setLinesCsvResult({ loaded: computed.length, errors })
+  }
+
   return (
     <div>
       <button onClick={() => navigate('/invoices')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '13px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', marginBottom: '4px' }}>← Invoices</button>
@@ -915,8 +979,14 @@ function NewInvoice() {
               Loading line items from the linked PI/PO…
             </div>
           )}
+          {lines.length > 0 && (
+            <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+              <Btn size='sm' variant='ghost' onClick={handleExportLines}>↓ Download Lines as CSV</Btn>
+              <Btn size='sm' variant='ghost' onClick={() => { setLinesCsvText(''); setLinesCsvResult(null); setLinesCsvModal(true) }}>↑ Bulk Correct Lines from CSV</Btn>
+            </div>
+          )}
           <div style={{ marginTop: '12px' }}>
-            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.invoice_date} stockMap={stockMap} products={products} />
+            <LineItemsEditor lines={lines} setLines={setLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.invoice_date} stockMap={stockMap} products={products} roundOffOverride={roundOffOverride} onRoundOffOverrideChange={setRoundOffOverride} />
           </div>
         </Card>
 
@@ -977,6 +1047,29 @@ function NewInvoice() {
         onConfirm={() => { setStockWarning(null); handleSave(true) }}
         title='Billed Quantity Exceeds Stock' message={stockWarning || ''} danger />
 
+      <Modal open={linesCsvModal} onClose={() => setLinesCsvModal(false)} title='Bulk Correct Line Items' width={560}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div style={{ fontSize: '12px', color: C.textMid }}>
+            Columns: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>line_no,product,description,hsn_code,qty,unit,rate,gst_rate</code><br />
+            This <b>replaces every line</b> currently below with the rows in this file — download the current lines first (e.g. right after picking a linked PI/PO),
+            correct the numbers in Excel/Sheets, then re-upload. <code>line_no</code> matches a row back to its existing product/line;
+            leave <code>product</code> blank on a row to keep that line's current product. Extra columns (taxable_amount, etc.) are ignored — they're recomputed.
+          </div>
+          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Paste CSV data here…'
+            style={{ padding: '8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '11px', fontFamily: 'monospace', resize: 'vertical' }} />
+          {linesCsvResult && (
+            <div style={{ background: linesCsvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${linesCsvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
+              {linesCsvResult.loaded} line(s) loaded{linesCsvResult.errors.length ? ` — ${linesCsvResult.errors.length} warning(s)` : ''}. Review below, then Create Invoice.
+              {linesCsvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setLinesCsvModal(false)}>Close</Btn>
+            <Btn onClick={handleBulkLinesCsv} disabled={linesCsvSaving || !linesCsvText.trim()}>{linesCsvSaving ? 'Loading…' : 'Load Into Editor'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
@@ -1003,10 +1096,25 @@ function InvoiceDetail() {
   const [irnForm, setIrnForm]   = useState({})
   const [sectSaving, setSectSaving] = useState(false)
   const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
+  // CHANGED: post-save editing of header fields + line items — same
+  // pattern as PI's edit flow. Gated separately from `isLocked` above
+  // (which only governs the EWB/IRN inline sections) — see linesEditLocked
+  // below for why this one also locks the moment an E-way Bill exists.
+  const [editing, setEditing]       = useState(false)
+  const [editForm, setEditForm]     = useState({})
+  const [editLines, setEditLines]   = useState([])
+  const [editRoundOffOverride, setEditRoundOffOverride] = useState('')
+  const [hsnMap, setHsnMap]         = useState(new Map())
+  const [products, setProducts]     = useState([])
+  const [saving, setSaving]         = useState(false)
+  const [linesCsvModal, setLinesCsvModal]   = useState(false)
+  const [linesCsvText, setLinesCsvText]     = useState('')
+  const [linesCsvResult, setLinesCsvResult] = useState(null)
+  const [linesCsvSaving, setLinesCsvSaving] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: i }, { data: ls }, { data: tds }] = await Promise.all([
+    const [{ data: i }, { data: ls }, { data: tds }, { data: hsnRows }, { data: prods }] = await Promise.all([
       supabase.from('invoices')
         // CHANGED: `type` on buyer/seller is needed to decide whether an
         // auto purchase-mirror entry should be created when the E-way Bill
@@ -1020,10 +1128,14 @@ function InvoiceDetail() {
       // total_amount columns (recomputed directly in Postgres, no REST cap).
       fetchAllPages(() => supabase.from('invoice_lines').select('*').eq('invoice_id', id).order('line_no')),
       supabase.from('tds_tcs_entries').select('*').eq('invoice_id', id),  // CHANGED
+      supabase.from('hsn_master').select('*').eq('is_active', true),
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
     setInv(i)
     setLines(ls || [])
     setTdsRows(tds || [])  // CHANGED
+    setHsnMap(buildHSNMap(hsnRows || []))
+    setProducts(prods || [])
     setLoading(false)
   }, [id])
 
@@ -1167,6 +1279,97 @@ function InvoiceDetail() {
     load()
   }
 
+  function startEdit() {
+    setEditForm({
+      invoice_no: inv.invoice_no || '', invoice_date: inv.invoice_date || '', due_date: inv.due_date || '',
+      status: inv.status || 'draft', notes: inv.notes || '', is_interstate: inv.is_interstate,
+      bill_from: inv.bill_from || '', bill_to: inv.bill_to || '', ship_from: inv.ship_from || '', ship_to: inv.ship_to || '',
+    })
+    setEditLines(lines.map(l => ({ ...l, _id: l.id, _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '' })))
+    setEditRoundOffOverride('')
+    setEditing(true)
+  }
+
+  function handleExportEditLines() {
+    if (!lines.length) return
+    const rows = lines.map(l => ({ ...l, product: products.find(p => p.id === l.product_id)?.name || '' }))
+    downloadCSV(`${inv.invoice_no || 'invoice'}_lines_${today()}.csv`, ['line_no','product','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'], rows)
+  }
+
+  // CHANGED: bulk-CSV correction while editing — identical approach to
+  // PI's handleBulkLinesCsv (see PI/index.jsx for the full rationale).
+  async function handleBulkLinesCsv() {
+    setLinesCsvSaving(true)
+    const rows = linesCsvText.trim().split('\n').filter(l => l.trim())
+    if (rows.length < 2) { setLinesCsvSaving(false); return setLinesCsvResult({ loaded: 0, errors: ['Need header + data rows'] }) }
+    const delim = detectDelimiter(rows[0])
+    const header = parseCSVLine(rows[0], delim).map(h => h.trim().toLowerCase())
+    const byName = new Map(products.map(p => [p.name.trim().toLowerCase(), p]))
+    const byLineNo = new Map(editLines.map(l => [String(l.line_no), l]))
+    const errors = []
+    const newLines = []
+    for (let i = 1; i < rows.length; i++) {
+      const cols = parseCSVLine(rows[i], delim)
+      const row = {}
+      header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
+      if (!row.description && !row.qty && !row.rate) continue
+      const existing = row.line_no ? byLineNo.get(row.line_no) : null
+      const matchedProduct = row.product ? byName.get(row.product.toLowerCase()) : null
+      if (row.product && !matchedProduct) errors.push(`Row ${i + 1}: product "${row.product}" not found — line added without a product, pick one manually before saving.`)
+      const productId = matchedProduct?.id || (!row.product ? existing?.product_id : null) || ''
+      const hsnCode = row.hsn_code || existing?.hsn_code || ''
+      const rowRate = toNum(row.rate)
+      const resolved = hsnCode ? resolveGSTRate(hsnCode, rowRate, hsnMap, editForm.invoice_date) : { gst_rate: null }
+      const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(row.gst_rate) || existing?.gst_rate || 18)
+      newLines.push({
+        _id: existing?.id || Date.now() + i, line_no: newLines.length + 1,
+        product_id: productId, description: row.description || existing?.description || '',
+        hsn_code: hsnCode, qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
+        rate: rowRate, gst_rate: gstRate,
+        taxable_amount: 0, cgst_rate: 0, cgst_amount: 0, sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,
+        _hsn_resolved_rate: resolved.gst_rate, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '',
+      })
+    }
+    const computed = newLines.map(l => computeLine(l, editForm.is_interstate))
+    setEditLines(computed)
+    setLinesCsvSaving(false)
+    setLinesCsvResult({ loaded: computed.length, errors })
+  }
+
+  async function handleSaveEdit() {
+    const invoiceNo = (editForm.invoice_no || '').trim()
+    if (!invoiceNo) return setToast({ message: 'Invoice number cannot be blank', type: 'error' })
+    // CHANGED: same rule the create flow enforces — a line with no
+    // product_id is invisible to stock tracking.
+    const missing = findLinesMissingProductId(editLines)
+    if (missing.length > 0) return setToast({ message: `Line ${missing.map(l => l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`, type: 'error' })
+    setSaving(true)
+    if (invoiceNo.toLowerCase() !== (inv.invoice_no || '').toLowerCase()) {
+      const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).neq('id', id).limit(1)
+      if (dup?.length) { setSaving(false); return setToast({ message: `Invoice number "${invoiceNo}" is already in use`, type: 'error' }) }
+    }
+    const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
+    const totals = computeTotals(computedLines, editRoundOffOverride)
+    // outstanding_amount tracks total_amount minus whatever's already been
+    // paid — recompute it from the invoice's own paid_amount rather than
+    // resetting it, so an edit after partial payment doesn't wipe that out.
+    const outstanding = round2(totals.total_amount - (Number(inv.paid_amount) || 0))
+    const { error: invErr } = await supabase.from('invoices').update({
+      ...editForm, invoice_no: invoiceNo, due_date: editForm.due_date || null,
+      ...totals, outstanding_amount: outstanding, updated_at: new Date(),
+    }).eq('id', id)
+    if (invErr) { setSaving(false); return setToast({ message: invErr.message, type: 'error' }) }
+    const { error: delErr } = await supabase.from('invoice_lines').delete().eq('invoice_id', id)
+    if (delErr) { setSaving(false); return setToast({ message: `Could not clear old line items: ${delErr.message}. Invoice header was updated but lines were left unchanged to avoid duplicates.`, type: 'error' }) }
+    const linesPayload = computedLines.map((l, i) => toInvoiceLinePayload(l, id, i + 1))
+    if (linesPayload.length) {
+      const { error: lErr } = await supabase.from('invoice_lines').insert(linesPayload)
+      if (lErr) { setSaving(false); return setToast({ message: lErr.message, type: 'error' }) }
+    }
+    setSaving(false); setEditing(false)
+    setToast({ message: 'Invoice updated', type: 'success' }); load()
+  }
+
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!inv)    return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>Invoice not found.</div>
 
@@ -1176,6 +1379,12 @@ function InvoiceDetail() {
   // stock, which shouldn't happen for a settled or cancelled invoice).
   // Master/admin can still override the lock when a correction is genuinely needed.
   const isLocked = !hasFullAccess(profile) && ['cancelled', 'paid'].includes(inv.status)
+  // CHANGED: editing header fields + line items is locked the moment an
+  // E-way Bill exists — an EWB auto-creates a buyer-side purchase entry and
+  // stock movements (see saveEwbForm above), which an edit here wouldn't
+  // reconcile. Stricter than `isLocked` above (which only guards the
+  // EWB/IRN sections themselves and doesn't check eway_bill_no).
+  const linesEditLocked = !hasFullAccess(profile) && (!!inv.eway_bill_no || ['cancelled', 'paid'].includes(inv.status))
 
   return (
     <div>
@@ -1187,16 +1396,20 @@ function InvoiceDetail() {
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
             <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
-            {inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
-            {inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
-            {!['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
-            {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
+            {!editing && !linesEditLocked && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
+            {editing && <Btn size='sm' variant='ghost' onClick={() => setEditing(false)}>Discard</Btn>}
+            {editing && <Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
+            {!editing && inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
+            {!editing && inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
+            {!editing && !['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            {!editing && canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={inv.invoice_type} label={inv.invoice_type === 'sales' ? 'Sales Invoice' : 'Purchase Invoice'} />
             <Badge status={inv.status} />
             {(() => { const s = getInvoiceLifecycleStage(inv); return <Badge status={s.key} label={s.label} /> })()}
           </div>
         }
       />
+      {editing && <div style={{background:'#fffbf0',border:`1px solid #e6c040`,borderRadius:'6px',padding:'8px 14px',fontSize:'12px',color:'#7a5000',marginBottom:'16px'}}>✏ Editing mode — click "Save Changes" to confirm</div>}
 
       {/* Seller / Buyer */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '24px' }}>
@@ -1235,8 +1448,43 @@ function InvoiceDetail() {
         <StatCard label='Outstanding' value={formatINR(inv.outstanding_amount)} color={inv.outstanding_amount > 0 ? C.warning : C.success} />
       </div>
 
+      {editing && (
+        <Card style={{ marginBottom: '16px', padding: '16px' }}>
+          <SectionDivider label='Edit Details' />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px', marginTop: '12px' }}>
+            <FormRow label='Invoice Date' required><Input type='date' value={editForm.invoice_date} onChange={e=>setEditForm(f=>({...f,invoice_date:e.target.value}))}/></FormRow>
+            <FormRow label='Invoice Number' required><Input value={editForm.invoice_no} onChange={e=>setEditForm(f=>({...f,invoice_no:e.target.value}))}/></FormRow>
+            <FormRow label='Due Date'><Input type='date' value={editForm.due_date} onChange={e=>setEditForm(f=>({...f,due_date:e.target.value}))}/></FormRow>
+            <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{INV_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
+            <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
+            <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>
+            <FormRow label='Bill To'><Input value={editForm.bill_to} onChange={e=>setEditForm(f=>({...f,bill_to:e.target.value}))}/></FormRow>
+            <FormRow label='Ship From'><Input value={editForm.ship_from} onChange={e=>setEditForm(f=>({...f,ship_from:e.target.value}))}/></FormRow>
+            <FormRow label='Ship To'><Input value={editForm.ship_to} onChange={e=>setEditForm(f=>({...f,ship_to:e.target.value}))}/></FormRow>
+          </div>
+          <div style={{marginTop:'8px'}}><FormRow label='Notes'><Textarea value={editForm.notes} onChange={e=>setEditForm(f=>({...f,notes:e.target.value}))} rows={2}/></FormRow></div>
+        </Card>
+      )}
+
       <Card>
-        <LineItemsEditor lines={lines.map(l => ({ ...l, _id: l.id }))} setLines={() => {}} interstate={inv.is_interstate} readOnly />
+        {editing && (
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={handleExportEditLines}>↓ CSV</Btn>
+            <Btn size='sm' variant='ghost' onClick={() => { setLinesCsvText(''); setLinesCsvResult(null); setLinesCsvModal(true) }}>↑ Bulk Correct Lines from CSV</Btn>
+          </div>
+        )}
+        <LineItemsEditor
+          lines={editing ? editLines : lines.map(l => ({ ...l, _id: l.id }))}
+          setLines={editing ? setEditLines : () => {}}
+          interstate={editing ? editForm.is_interstate : inv.is_interstate}
+          hsnMap={hsnMap}
+          asOfDate={editing ? editForm.invoice_date : inv.invoice_date}
+          readOnly={!editing}
+          showMargin={true}
+          products={editing ? products : undefined}
+          roundOffOverride={editing ? editRoundOffOverride : ''}
+          onRoundOffOverrideChange={editing ? setEditRoundOffOverride : undefined}
+        />
       </Card>
 
       {(inv.bill_from || inv.bill_to || inv.ship_from || inv.ship_to || inv.eway_bill_no) && (
@@ -1454,6 +1702,31 @@ function InvoiceDetail() {
         danger />
       <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
         title='Delete Invoice' message={`Delete ${inv.invoice_no || 'this invoice'}? This cannot be undone.`} danger />
+
+      <Modal open={linesCsvModal} onClose={() => setLinesCsvModal(false)} title='Bulk Upload — Correct Line Items' width={560}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div style={{ fontSize: '12px', color: C.textMid }}>
+            Columns: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>line_no,product,description,hsn_code,qty,unit,rate,gst_rate</code><br />
+            This <b>replaces every line</b> currently in the editor below with the rows in this file — download your current lines first,
+            correct the numbers in Excel/Sheets, then re-upload. <code>line_no</code> matches a row back to its existing product/line;
+            leave <code>product</code> blank on a row to keep that line's current product. Extra columns (taxable_amount, etc.) are ignored — they're recomputed.
+          </div>
+          <Btn size='sm' variant='ghost' onClick={handleExportEditLines}>↓ Download Current Lines as Template</Btn>
+          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Paste CSV data here…'
+            style={{ padding: '8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '11px', fontFamily: 'monospace', resize: 'vertical' }} />
+          {linesCsvResult && (
+            <div style={{ background: linesCsvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${linesCsvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
+              {linesCsvResult.loaded} line(s) loaded into the editor{linesCsvResult.errors.length ? ` — ${linesCsvResult.errors.length} warning(s)` : ''}. Review below, then Save Changes.
+              {linesCsvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setLinesCsvModal(false)}>Close</Btn>
+            <Btn onClick={handleBulkLinesCsv} disabled={linesCsvSaving || !linesCsvText.trim()}>{linesCsvSaving ? 'Loading…' : 'Load Into Editor'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

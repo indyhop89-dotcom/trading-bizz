@@ -120,6 +120,9 @@ function POList() {
   const [form, setForm]     = useState(EMPTY_FORM)
   const [legs, setLegs]     = useState([])
   const [poLines, setPOLines] = useState([])
+  // CHANGED: lets the user pin round_off_amount to a specific value instead
+  // of always auto-computing it — see computeTotals in LineItemsEditor.jsx.
+  const [roundOffOverride, setRoundOffOverride] = useState('')
   const [linesLoading, setLinesLoading] = useState(false)  // CHANGED: PI line-item fetch in progress
   const [saving, setSaving] = useState(false)
   const [toast, setToast]   = useState(null)
@@ -127,6 +130,16 @@ function POList() {
   const [csvText, setCsvText]     = useState('')
   const [csvResult, setCsvResult] = useState(null)
   const [csvSaving, setCsvSaving] = useState(false)
+  // CHANGED: bulk-CSV correction for THIS PO's in-progress line items —
+  // same pattern as PI's edit-page "Load Into Editor" (see PI/index.jsx's
+  // handleBulkLinesCsv), adapted to the create flow since PO has no
+  // post-save edit mode. Lets a PO whose lines were auto-copied from a
+  // linked PI (see handlePISelect below) be bulk-corrected from a CSV
+  // instead of hand-editing every row.
+  const [linesCsvModal, setLinesCsvModal]     = useState(false)
+  const [linesCsvText, setLinesCsvText]       = useState('')
+  const [linesCsvResult, setLinesCsvResult]   = useState(null)
+  const [linesCsvSaving, setLinesCsvSaving]   = useState(false)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo]     = useState('')
 
@@ -250,7 +263,7 @@ function POList() {
 
   async function handleSave() {
     if (!form.buyer_entity_id || !form.seller_entity_id) return setToast({ message: 'Buyer and Seller are required', type: 'error' })
-    const totals = computeTotals(poLines.map(l => computeLine(l, form.is_interstate)))
+    const totals = computeTotals(poLines.map(l => computeLine(l, form.is_interstate)), roundOffOverride)
     setSaving(true)
     // CHANGED: use the manually-entered PO number if supplied, else suggest
     // one via suggestNextNo(). FY code computed directly from the PO's own
@@ -290,7 +303,61 @@ function POList() {
     setToast({ message: 'PO created', type: 'success' })
     setModalOpen(false)
     setPOLines([])
+    setRoundOffOverride('')
     navigate(`/po/${po.id}`)
+  }
+
+  function handleExportLines() {
+    if (!poLines.length) return
+    const rows = poLines.map(l => ({ ...l, product: products.find(p => p.id === l.product_id)?.name || '' }))
+    downloadCSV(`po_lines_${today()}.csv`, ['line_no','product','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'], rows)
+  }
+
+  // CHANGED: bulk-CSV correction for this in-progress PO's lines — same
+  // approach as PI's handleBulkLinesCsv (edit page), adapted to the create
+  // flow since PO has no post-save edit mode. Replaces poLines entirely
+  // (a corrections file represents the full corrected set). Product
+  // resolution: match by `product` column name (case-insensitive); if
+  // blank, inherit product_id from the existing line at the same line_no
+  // (so a file that only touches qty/rate doesn't need to restate every
+  // product) — useful right after "Linked PI" auto-copies lines in and you
+  // just want to tweak a handful of rows via CSV instead of by hand.
+  async function handleBulkLinesCsv() {
+    setLinesCsvSaving(true)
+    const rows = linesCsvText.trim().split('\n').filter(l => l.trim())
+    if (rows.length < 2) { setLinesCsvSaving(false); return setLinesCsvResult({ loaded: 0, errors: ['Need header + data rows'] }) }
+    const delim = detectDelimiter(rows[0])
+    const header = parseCSVLine(rows[0], delim).map(h => h.trim().toLowerCase())
+    const byName = new Map(products.map(p => [p.name.trim().toLowerCase(), p]))
+    const byLineNo = new Map(poLines.map(l => [String(l.line_no), l]))
+    const errors = []
+    const newLines = []
+    for (let i = 1; i < rows.length; i++) {
+      const cols = parseCSVLine(rows[i], delim)
+      const row = {}
+      header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
+      if (!row.description && !row.qty && !row.rate) continue // blank row
+      const existing = row.line_no ? byLineNo.get(row.line_no) : null
+      const matchedProduct = row.product ? byName.get(row.product.toLowerCase()) : null
+      if (row.product && !matchedProduct) errors.push(`Row ${i + 1}: product "${row.product}" not found — line added without a product, pick one manually before saving.`)
+      const productId = matchedProduct?.id || (!row.product ? existing?.product_id : null) || ''
+      const hsnCode = row.hsn_code || existing?.hsn_code || ''
+      const rowRate = toNum(row.rate)
+      const resolved = hsnCode ? resolveGSTRate(hsnCode, rowRate, hsnMap, form.po_date) : { gst_rate: null }
+      const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(row.gst_rate) || existing?.gst_rate || 18)
+      newLines.push({
+        _id: existing?.id || Date.now() + i, line_no: newLines.length + 1,
+        product_id: productId, description: row.description || existing?.description || '',
+        hsn_code: hsnCode, qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
+        rate: rowRate, gst_rate: gstRate,
+        taxable_amount: 0, cgst_rate: 0, cgst_amount: 0, sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,
+        _hsn_resolved_rate: resolved.gst_rate, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '',
+      })
+    }
+    const computed = newLines.map(l => computeLine(l, form.is_interstate))
+    setPOLines(computed)
+    setLinesCsvSaving(false)
+    setLinesCsvResult({ loaded: computed.length, errors })
   }
 
   // ── CSV handler ───────────────────────────────────────────────────────────────
@@ -466,7 +533,7 @@ function POList() {
 
   // CHANGED: live totals for the New PO modal — shown at top and bottom so the
   // buyer can confirm the figures before creating the PO.
-  const modalTotals = computeTotals(poLines.map(l => computeLine(l, form.is_interstate)))
+  const modalTotals = computeTotals(poLines.map(l => computeLine(l, form.is_interstate)), roundOffOverride)
 
   const columns = [
     ...(canDelete ? [{
@@ -495,7 +562,7 @@ function POList() {
           <div style={{ display: 'flex', gap: '8px' }}>
             <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
             <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
-            <Btn onClick={() => { setForm({ ...EMPTY_FORM, buyer_entity_id: defaultEntityId }); setPOLines([]); setModalOpen(true) }}>+ New PO</Btn>
+            <Btn onClick={() => { setForm({ ...EMPTY_FORM, buyer_entity_id: defaultEntityId }); setPOLines([]); setRoundOffOverride(''); setModalOpen(true) }}>+ New PO</Btn>
           </div>
         }
       />
@@ -653,11 +720,41 @@ function POList() {
               Loading line items from the linked PI…
             </div>
           )}
-          <LineItemsEditor lines={poLines} setLines={setPOLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.po_date} products={products} />
+          {poLines.length > 0 && (
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+              <Btn size='sm' variant='ghost' onClick={handleExportLines}>↓ Download Lines as CSV</Btn>
+              <Btn size='sm' variant='ghost' onClick={() => { setLinesCsvText(''); setLinesCsvResult(null); setLinesCsvModal(true) }}>↑ Bulk Correct Lines from CSV</Btn>
+            </div>
+          )}
+          <LineItemsEditor lines={poLines} setLines={setPOLines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.po_date} products={products} roundOffOverride={roundOffOverride} onRoundOffOverrideChange={setRoundOffOverride} />
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
             <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Create PO'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal open={linesCsvModal} onClose={() => setLinesCsvModal(false)} title='Bulk Correct Line Items' width={560}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div style={{ fontSize: '12px', color: C.textMid }}>
+            Columns: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>line_no,product,description,hsn_code,qty,unit,rate,gst_rate</code><br />
+            This <b>replaces every line</b> currently below with the rows in this file — download the current lines first (e.g. right after picking a Linked PI),
+            correct the numbers in Excel/Sheets, then re-upload. <code>line_no</code> matches a row back to its existing product/line;
+            leave <code>product</code> blank on a row to keep that line's current product. Extra columns (taxable_amount, etc.) are ignored — they're recomputed.
+          </div>
+          <CsvFileDrop onText={setLinesCsvText} />
+          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Or paste CSV data here…'
+            style={{ padding: '8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '11px', fontFamily: 'monospace', resize: 'vertical' }} />
+          {linesCsvResult && (
+            <div style={{ background: linesCsvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${linesCsvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
+              {linesCsvResult.loaded} line(s) loaded{linesCsvResult.errors.length ? ` — ${linesCsvResult.errors.length} warning(s)` : ''}. Review below, then Create PO.
+              {linesCsvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setLinesCsvModal(false)}>Close</Btn>
+            <Btn onClick={handleBulkLinesCsv} disabled={linesCsvSaving || !linesCsvText.trim()}>{linesCsvSaving ? 'Loading…' : 'Load Into Editor'}</Btn>
           </div>
         </div>
       </Modal>
@@ -681,10 +778,25 @@ function PODetail() {
   const [toast, setToast] = useState(null)
   const [confirmCancel, setConfirmCancel] = useState(false)
   const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
+  // CHANGED: post-save editing — same pattern as PI's edit flow. Gated to
+  // 'open'/'partial' status (see isLocked below); no stock/ledger side
+  // effects are tied to a PO's own status or lines, so this is a pure
+  // workflow guard rather than a data-integrity one.
+  const [editing, setEditing]       = useState(false)
+  const [editForm, setEditForm]     = useState({})
+  const [editLines, setEditLines]   = useState([])
+  const [editRoundOffOverride, setEditRoundOffOverride] = useState('')
+  const [hsnMap, setHsnMap]         = useState(new Map())
+  const [products, setProducts]     = useState([])
+  const [saving, setSaving]         = useState(false)
+  const [linesCsvModal, setLinesCsvModal]   = useState(false)
+  const [linesCsvText, setLinesCsvText]     = useState('')
+  const [linesCsvResult, setLinesCsvResult] = useState(null)
+  const [linesCsvSaving, setLinesCsvSaving] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: p }, { data: ls }] = await Promise.all([
+    const [{ data: p }, { data: ls }, { data: hsnRows }, { data: prods }] = await Promise.all([
       supabase.from('purchase_orders')
         .select('*, buyer:buyer_entity_id(name,short_name,gstin,city), seller:seller_entity_id(name,short_name,gstin,city), orders(name)')
         .eq('id', id).single(),
@@ -693,9 +805,13 @@ function PODetail() {
       // rest, undercounting totals here vs the DB-side total_qty/total_amount
       // columns (recomputed directly in Postgres, no REST cap). Same fix as PI.
       fetchAllPages(() => supabase.from('purchase_order_lines').select('*').eq('po_id', id).order('line_no')),
+      supabase.from('hsn_master').select('*').eq('is_active', true),
+      fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
     setPO(p)
     setLines(ls || [])
+    setHsnMap(buildHSNMap(hsnRows || []))
+    setProducts(prods || [])
     setLoading(false)
   }, [id])
 
@@ -705,6 +821,88 @@ function PODetail() {
     await supabase.from('purchase_orders').update({ status }).eq('id', id)
     setToast({ message: `PO marked as ${status}`, type: 'success' })
     load()
+  }
+
+  function startEdit() {
+    setEditForm({
+      po_no: po.po_no || '', po_date: po.po_date || '', delivery_date: po.delivery_date || '',
+      status: po.status || 'open', notes: po.notes || '', is_interstate: po.is_interstate,
+      payment_terms: po.payment_terms || '', delivery_timeline: po.delivery_timeline || '', mode_of_transport: po.mode_of_transport || 'Road',
+    })
+    setEditLines(lines.map(l => ({ ...l, _id: l.id, _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '' })))
+    setEditRoundOffOverride('')
+    setEditing(true)
+  }
+
+  function handleExportEditLines() {
+    if (!lines.length) return
+    const rows = lines.map(l => ({ ...l, product: products.find(p => p.id === l.product_id)?.name || '' }))
+    downloadCSV(`${po.po_no || 'po'}_lines_${today()}.csv`, ['line_no','product','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'], rows)
+  }
+
+  // CHANGED: bulk-CSV correction while editing — identical approach to
+  // PI's handleBulkLinesCsv (see PI/index.jsx for the full rationale).
+  async function handleBulkLinesCsv() {
+    setLinesCsvSaving(true)
+    const rows = linesCsvText.trim().split('\n').filter(l => l.trim())
+    if (rows.length < 2) { setLinesCsvSaving(false); return setLinesCsvResult({ loaded: 0, errors: ['Need header + data rows'] }) }
+    const delim = detectDelimiter(rows[0])
+    const header = parseCSVLine(rows[0], delim).map(h => h.trim().toLowerCase())
+    const byName = new Map(products.map(p => [p.name.trim().toLowerCase(), p]))
+    const byLineNo = new Map(editLines.map(l => [String(l.line_no), l]))
+    const errors = []
+    const newLines = []
+    for (let i = 1; i < rows.length; i++) {
+      const cols = parseCSVLine(rows[i], delim)
+      const row = {}
+      header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
+      if (!row.description && !row.qty && !row.rate) continue
+      const existing = row.line_no ? byLineNo.get(row.line_no) : null
+      const matchedProduct = row.product ? byName.get(row.product.toLowerCase()) : null
+      if (row.product && !matchedProduct) errors.push(`Row ${i + 1}: product "${row.product}" not found — line added without a product, pick one manually before saving.`)
+      const productId = matchedProduct?.id || (!row.product ? existing?.product_id : null) || ''
+      const hsnCode = row.hsn_code || existing?.hsn_code || ''
+      const rowRate = toNum(row.rate)
+      const resolved = hsnCode ? resolveGSTRate(hsnCode, rowRate, hsnMap, editForm.po_date) : { gst_rate: null }
+      const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(row.gst_rate) || existing?.gst_rate || 18)
+      newLines.push({
+        _id: existing?.id || Date.now() + i, line_no: newLines.length + 1,
+        product_id: productId, description: row.description || existing?.description || '',
+        hsn_code: hsnCode, qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
+        rate: rowRate, gst_rate: gstRate,
+        taxable_amount: 0, cgst_rate: 0, cgst_amount: 0, sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,
+        _hsn_resolved_rate: resolved.gst_rate, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '',
+      })
+    }
+    const computed = newLines.map(l => computeLine(l, editForm.is_interstate))
+    setEditLines(computed)
+    setLinesCsvSaving(false)
+    setLinesCsvResult({ loaded: computed.length, errors })
+  }
+
+  async function handleSaveEdit() {
+    const poNo = (editForm.po_no || '').trim()
+    if (!poNo) return setToast({ message: 'PO number cannot be blank', type: 'error' })
+    setSaving(true)
+    if (poNo.toLowerCase() !== (po.po_no || '').toLowerCase()) {
+      const { data: dup } = await supabase.from('purchase_orders').select('id').ilike('po_no', poNo).neq('id', id).limit(1)
+      if (dup?.length) { setSaving(false); return setToast({ message: `PO number "${poNo}" is already in use`, type: 'error' }) }
+    }
+    const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
+    const totals = computeTotals(computedLines, editRoundOffOverride)
+    const { error: poErr } = await supabase.from('purchase_orders').update({
+      ...editForm, po_no: poNo, delivery_date: editForm.delivery_date || null, ...totals, updated_at: new Date(),
+    }).eq('id', id)
+    if (poErr) { setSaving(false); return setToast({ message: poErr.message, type: 'error' }) }
+    const { error: delErr } = await supabase.from('purchase_order_lines').delete().eq('po_id', id)
+    if (delErr) { setSaving(false); return setToast({ message: `Could not clear old line items: ${delErr.message}. PO header was updated but lines were left unchanged to avoid duplicates.`, type: 'error' }) }
+    const linesPayload = computedLines.map((l, i) => toPOLinePayload(l, id, i + 1))
+    if (linesPayload.length) {
+      const { error: lErr } = await supabase.from('purchase_order_lines').insert(linesPayload)
+      if (lErr) { setSaving(false); return setToast({ message: lErr.message, type: 'error' }) }
+    }
+    setSaving(false); setEditing(false)
+    setToast({ message: 'PO updated', type: 'success' }); load()
   }
 
   async function handleDelete() {
@@ -732,6 +930,11 @@ function PODetail() {
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!po)     return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>PO not found.</div>
 
+  // CHANGED: editable while 'open'/'partial'; locked once 'completed' or
+  // 'cancelled' — full-access users can still override, same convention as
+  // PI's isLocked.
+  const isLocked = !hasFullAccess(profile) && ['completed', 'cancelled'].includes(po.status)
+
   return (
     <div>
       <button onClick={() => navigate('/po')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '13px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', marginBottom: '4px' }}>← Purchase Orders</button>
@@ -739,16 +942,20 @@ function PODetail() {
         title={po.po_no || `PO — ${fmtDate(po.po_date)}`}
         subtitle={`${po.buyer?.name} ← ${po.seller?.name} · ${fmtDate(po.po_date)}`}
         action={
-          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
             <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
-            {po.status === 'open' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('completed')}>Mark Completed</Btn>}
-            {!['cancelled','completed'].includes(po.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
-            {canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
+            {!editing && !isLocked && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
+            {editing && <Btn size='sm' variant='ghost' onClick={() => setEditing(false)}>Discard</Btn>}
+            {editing && <Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
+            {!editing && po.status === 'open' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('completed')}>Mark Completed</Btn>}
+            {!editing && !['cancelled','completed'].includes(po.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
+            {!editing && canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
             <Badge status={po.status} />
           </div>
         }
       />
+      {editing && <div style={{background:'#fffbf0',border:`1px solid #e6c040`,borderRadius:'6px',padding:'8px 14px',fontSize:'12px',color:'#7a5000',marginBottom:'16px'}}>✏ Editing mode — click "Save Changes" to confirm</div>}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '24px' }}>
         <Card style={{ padding: '16px' }}>
@@ -763,15 +970,58 @@ function PODetail() {
         </Card>
       </div>
 
-      <div style={{ display: 'flex', gap: '16px', marginBottom: '24px', flexWrap: 'wrap', fontSize: '13px' }}>
-        <div><span style={{ color: C.textMuted }}>PO Date:</span> <strong>{fmtDate(po.po_date)}</strong></div>
-        {po.delivery_date && <div><span style={{ color: C.textMuted }}>Delivery:</span> <strong>{fmtDate(po.delivery_date)}</strong></div>}
-        <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={po.is_interstate ? 'export' : 'domestic'} label={po.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
-        {po.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{po.orders.name}</strong></div>}
-      </div>
+      {!editing && (
+        <div style={{ display: 'flex', gap: '16px', marginBottom: '24px', flexWrap: 'wrap', fontSize: '13px' }}>
+          <div><span style={{ color: C.textMuted }}>PO Date:</span> <strong>{fmtDate(po.po_date)}</strong></div>
+          {po.delivery_date && <div><span style={{ color: C.textMuted }}>Delivery:</span> <strong>{fmtDate(po.delivery_date)}</strong></div>}
+          <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={po.is_interstate ? 'export' : 'domestic'} label={po.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
+          {po.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{po.orders.name}</strong></div>}
+        </div>
+      )}
+
+      {editing && (
+        <Card style={{ marginBottom: '16px', padding: '16px' }}>
+          <SectionDivider label='Edit Details' />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px', marginTop: '12px' }}>
+            <FormRow label='PO Date' required><Input type='date' value={editForm.po_date} onChange={e=>setEditForm(f=>({...f,po_date:e.target.value}))}/></FormRow>
+            <FormRow label='PO Number' required><Input value={editForm.po_no} onChange={e=>setEditForm(f=>({...f,po_no:e.target.value}))}/></FormRow>
+            <FormRow label='Delivery Date'><Input type='date' value={editForm.delivery_date} onChange={e=>setEditForm(f=>({...f,delivery_date:e.target.value}))}/></FormRow>
+            <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{PO_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
+            <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
+            <FormRow label='Payment Terms' hint='Shown on the generated PO PDF/Excel'>
+              <Input list='po-edit-payment-terms' value={editForm.payment_terms} onChange={e=>setEditForm(f=>({...f,payment_terms:e.target.value}))} placeholder='e.g. Net 30 Days'/>
+              <datalist id='po-edit-payment-terms'>{PAYMENT_TERMS_OPTIONS.map(o=><option key={o} value={o}/>)}</datalist>
+            </FormRow>
+            <FormRow label='Delivery Timeline' hint='Shown on the generated PO PDF/Excel'>
+              <Input value={editForm.delivery_timeline} onChange={e=>setEditForm(f=>({...f,delivery_timeline:e.target.value}))} placeholder='e.g. 7-10 working days from confirmation'/>
+            </FormRow>
+            <FormRow label='Mode of Transport'>
+              <Select value={editForm.mode_of_transport} onChange={e=>setEditForm(f=>({...f,mode_of_transport:e.target.value}))}>{TRANSPORT_MODES.map(m=><option key={m} value={m}>{m}</option>)}</Select>
+            </FormRow>
+          </div>
+          <div style={{marginTop:'8px'}}><FormRow label='Notes'><Textarea value={editForm.notes} onChange={e=>setEditForm(f=>({...f,notes:e.target.value}))} rows={2}/></FormRow></div>
+        </Card>
+      )}
 
       <Card>
-        <LineItemsEditor lines={lines.map(l => ({ ...l, _id: l.id }))} setLines={() => {}} interstate={po.is_interstate} readOnly />
+        {editing && (
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+            <Btn size='sm' variant='ghost' onClick={handleExportEditLines}>↓ CSV</Btn>
+            <Btn size='sm' variant='ghost' onClick={() => { setLinesCsvText(''); setLinesCsvResult(null); setLinesCsvModal(true) }}>↑ Bulk Correct Lines from CSV</Btn>
+          </div>
+        )}
+        <LineItemsEditor
+          lines={editing ? editLines : lines.map(l => ({ ...l, _id: l.id }))}
+          setLines={editing ? setEditLines : () => {}}
+          interstate={editing ? editForm.is_interstate : po.is_interstate}
+          hsnMap={hsnMap}
+          asOfDate={editing ? editForm.po_date : po.po_date}
+          readOnly={!editing}
+          showMargin={true}
+          products={editing ? products : undefined}
+          roundOffOverride={editing ? editRoundOffOverride : ''}
+          onRoundOffOverrideChange={editing ? setEditRoundOffOverride : undefined}
+        />
       </Card>
 
       <div style={{ marginTop: '20px' }}>
@@ -788,6 +1038,32 @@ function PODetail() {
         title='Cancel PO' message='Cancel this purchase order?' danger />
       <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
         title='Delete PO' message={`Delete ${po.po_no || 'this PO'}? This cannot be undone.`} danger />
+
+      <Modal open={linesCsvModal} onClose={() => setLinesCsvModal(false)} title='Bulk Upload — Correct Line Items' width={560}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <div style={{ fontSize: '12px', color: C.textMid }}>
+            Columns: <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>line_no,product,description,hsn_code,qty,unit,rate,gst_rate</code><br />
+            This <b>replaces every line</b> currently in the editor below with the rows in this file — download your current lines first,
+            correct the numbers in Excel/Sheets, then re-upload. <code>line_no</code> matches a row back to its existing product/line;
+            leave <code>product</code> blank on a row to keep that line's current product. Extra columns (taxable_amount, etc.) are ignored — they're recomputed.
+          </div>
+          <Btn size='sm' variant='ghost' onClick={handleExportEditLines}>↓ Download Current Lines as Template</Btn>
+          <CsvFileDrop onText={setLinesCsvText} />
+          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Or paste CSV data here…'
+            style={{ padding: '8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '11px', fontFamily: 'monospace', resize: 'vertical' }} />
+          {linesCsvResult && (
+            <div style={{ background: linesCsvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${linesCsvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
+              {linesCsvResult.loaded} line(s) loaded into the editor{linesCsvResult.errors.length ? ` — ${linesCsvResult.errors.length} warning(s)` : ''}. Review below, then Save Changes.
+              {linesCsvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
+            </div>
+          )}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setLinesCsvModal(false)}>Close</Btn>
+            <Btn onClick={handleBulkLinesCsv} disabled={linesCsvSaving || !linesCsvText.trim()}>{linesCsvSaving ? 'Loading…' : 'Load Into Editor'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

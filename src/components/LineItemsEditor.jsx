@@ -21,7 +21,14 @@ export function computeLine(line, interstate) {
   }
 }
 
-export function computeTotals(lines) {
+// CHANGED: optional `roundOffOverride` (raw string/number from a manual
+// input) lets the user pin round_off_amount to a specific value instead of
+// always auto-computing it — for correcting an externally-sourced document
+// (an Excel/CSV a client already sent) whose own rounding doesn't land on
+// GST Rule 46's "nearest rupee from the precise subtotal" exactly, so the
+// auto value would otherwise force a mismatch no amount of line-editing can
+// close. Blank/undefined/NaN falls through to the original auto behaviour.
+export function computeTotals(lines, roundOffOverride) {
   const sum = lines.reduce((acc, l) => ({
     taxable_amount: acc.taxable_amount + (Number(l.taxable_amount) || 0),
     cgst_amount:    acc.cgst_amount    + (Number(l.cgst_amount)    || 0),
@@ -38,8 +45,9 @@ export function computeTotals(lines) {
   const sgst_amount    = round2(sum.sgst_amount)
   const igst_amount    = round2(sum.igst_amount)
   const subtotal       = round2(taxable_amount + cgst_amount + sgst_amount + igst_amount)
-  const total_amount   = roundRupees(subtotal)
-  const round_off_amount = round2(total_amount - subtotal)
+  const hasOverride = roundOffOverride !== '' && roundOffOverride !== null && roundOffOverride !== undefined && !isNaN(Number(roundOffOverride))
+  const round_off_amount = hasOverride ? round2(Number(roundOffOverride)) : round2(roundRupees(subtotal) - subtotal)
+  const total_amount     = hasOverride ? round2(subtotal + round_off_amount) : roundRupees(subtotal)
   // NOTE: `subtotal` is deliberately not included below — this object gets
   // spread directly into PI/PO/Invoice insert/update payloads, and none of
   // those tables have a `subtotal` column (only total_amount/round_off_amount
@@ -47,8 +55,9 @@ export function computeTotals(lines) {
   return { taxable_amount, cgst_amount, sgst_amount, igst_amount, round_off_amount, total_amount, total_qty: sum.total_qty }
 }
 
-function TotalsBar({ totals, interstate }) {
+function TotalsBar({ totals, interstate, roundOffOverride, onRoundOffOverrideChange }) {
   if (!totals || totals.total_amount === 0) return null
+  const editableRoundOff = typeof onRoundOffOverrideChange === 'function'
   return (
     <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 18px', minWidth: '260px' }}>
       <TotRow label='Total Qty' val={totals.total_qty} />
@@ -61,7 +70,25 @@ function TotalsBar({ totals, interstate }) {
           </>
       }
       <TotRow label='Total' val={formatINR(totals.total_amount - totals.round_off_amount)} />
-      <TotRow label='Round Off' val={formatINR(totals.round_off_amount)} />
+      {editableRoundOff ? (
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', color: C.textSoft, marginBottom: '5px', gap: '8px' }}>
+          <span>
+            Round Off
+            {roundOffOverride !== '' && roundOffOverride != null && (
+              <span title='Manually overridden — clear the box to auto-calculate again' style={{ color: '#c0820a', marginLeft: '4px' }}>✎</span>
+            )}
+          </span>
+          <input
+            type='number' step='0.01'
+            value={roundOffOverride ?? ''}
+            onChange={e => onRoundOffOverrideChange(e.target.value)}
+            placeholder={totals.round_off_amount.toFixed(2)}
+            style={{ width: '86px', textAlign: 'right', padding: '2px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontSize: '12px', fontFamily: 'inherit', background: '#fffdf6' }}
+          />
+        </div>
+      ) : (
+        <TotRow label='Round Off' val={formatINR(totals.round_off_amount)} />
+      )}
       <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '15px', color: C.text, paddingTop: '6px', marginTop: '4px', borderTop: `1px solid ${C.border}` }}>
         <span>Final Amount</span>
         <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatINR(totals.total_amount)}</span>
@@ -110,7 +137,7 @@ const ROW_HEIGHT = 56
 const OVERSCAN = 15
 const VIEWPORT_HEIGHT = 600
 
-export default function LineItemsEditor({ lines, setLines, interstate, products = [], hsnMap, asOfDate, readOnly, showMargin = false, stockMap }) {
+export default function LineItemsEditor({ lines, setLines, interstate, products = [], hsnMap, asOfDate, readOnly, showMargin = false, stockMap, roundOffOverride = '', onRoundOffOverrideChange }) {
 
   const [applyMarginPct, setApplyMarginPct] = useState('')
   const [scrollTop, setScrollTop] = useState(0)
@@ -297,7 +324,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
     })
   }
 
-  const totals = computeTotals(lines)
+  const totals = computeTotals(lines, roundOffOverride)
 
   const th = { padding: '8px 10px', fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', background: C.bg, borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }
   const td  = { padding: '6px 8px', borderBottom: `1px solid #f0e8d8`, verticalAlign: 'top' }
@@ -329,7 +356,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
             </div>
           )}
           <div style={{ marginLeft: 'auto' }}>
-            <TotalsBar totals={totals} interstate={interstate} />
+            <TotalsBar totals={totals} interstate={interstate} roundOffOverride={roundOffOverride} onRoundOffOverrideChange={!readOnly ? onRoundOffOverrideChange : undefined} />
           </div>
         </div>
       )}
@@ -550,7 +577,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
 
       {lines.length > 0 && (
         <div style={{ marginTop: '12px', display: 'flex', justifyContent: 'flex-end' }}>
-          <TotalsBar totals={totals} interstate={interstate} />
+          <TotalsBar totals={totals} interstate={interstate} roundOffOverride={roundOffOverride} onRoundOffOverrideChange={!readOnly ? onRoundOffOverrideChange : undefined} />
         </div>
       )}
     </div>
