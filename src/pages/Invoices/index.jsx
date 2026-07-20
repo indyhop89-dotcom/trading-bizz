@@ -1099,9 +1099,8 @@ function InvoiceDetail() {
   const [sectSaving, setSectSaving] = useState(false)
   const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
   // CHANGED: post-save editing of header fields + line items — same
-  // pattern as PI's edit flow. Gated separately from `isLocked` above
-  // (which only governs the EWB/IRN inline sections) — see linesEditLocked
-  // below for why this one also locks the moment an E-way Bill exists.
+  // pattern as PI's edit flow. Available to any role at any status/EWB
+  // state; `isLocked` above (EWB/IRN inline sections) is unrelated.
   const [editing, setEditing]       = useState(false)
   const [editForm, setEditForm]     = useState({})
   const [editLines, setEditLines]   = useState([])
@@ -1381,12 +1380,6 @@ function InvoiceDetail() {
   // stock, which shouldn't happen for a settled or cancelled invoice).
   // Master/admin can still override the lock when a correction is genuinely needed.
   const isLocked = !hasFullAccess(profile) && ['cancelled', 'paid'].includes(inv.status)
-  // CHANGED: editing header fields + line items is locked the moment an
-  // E-way Bill exists — an EWB auto-creates a buyer-side purchase entry and
-  // stock movements (see saveEwbForm above), which an edit here wouldn't
-  // reconcile. Stricter than `isLocked` above (which only guards the
-  // EWB/IRN sections themselves and doesn't check eway_bill_no).
-  const linesEditLocked = !hasFullAccess(profile) && (!!inv.eway_bill_no || ['cancelled', 'paid'].includes(inv.status))
 
   return (
     <div>
@@ -1398,7 +1391,7 @@ function InvoiceDetail() {
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
             <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
-            {!editing && !linesEditLocked && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
+            {!editing && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing && <Btn size='sm' variant='ghost' onClick={() => setEditing(false)}>Discard</Btn>}
             {editing && <Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
             {!editing && inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}

@@ -778,10 +778,9 @@ function PODetail() {
   const [toast, setToast] = useState(null)
   const [confirmCancel, setConfirmCancel] = useState(false)
   const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
-  // CHANGED: post-save editing — same pattern as PI's edit flow. Gated to
-  // 'open'/'partial' status (see isLocked below); no stock/ledger side
-  // effects are tied to a PO's own status or lines, so this is a pure
-  // workflow guard rather than a data-integrity one.
+  // CHANGED: post-save editing — same pattern as PI's edit flow. Available
+  // to any role at any status; no stock/ledger side effects are tied to a
+  // PO's own status or lines.
   const [editing, setEditing]       = useState(false)
   const [editForm, setEditForm]     = useState({})
   const [editLines, setEditLines]   = useState([])
@@ -930,11 +929,6 @@ function PODetail() {
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
   if (!po)     return <div style={{ padding: '48px', textAlign: 'center', color: C.danger }}>PO not found.</div>
 
-  // CHANGED: editable while 'open'/'partial'; locked once 'completed' or
-  // 'cancelled' — full-access users can still override, same convention as
-  // PI's isLocked.
-  const isLocked = !hasFullAccess(profile) && ['completed', 'cancelled'].includes(po.status)
-
   return (
     <div>
       <button onClick={() => navigate('/po')} style={{ background: 'none', border: 'none', color: C.textMuted, fontSize: '13px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', marginBottom: '4px' }}>← Purchase Orders</button>
@@ -945,7 +939,7 @@ function PODetail() {
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
             <Btn size='sm' variant='ghost' onClick={handleDownloadPDF} disabled={!!docBusy}>{docBusy==='pdf'?'Generating…':'⎙ Download PDF'}</Btn>
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
-            {!editing && !isLocked && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
+            {!editing && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing && <Btn size='sm' variant='ghost' onClick={() => setEditing(false)}>Discard</Btn>}
             {editing && <Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
             {!editing && po.status === 'open' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('completed')}>Mark Completed</Btn>}

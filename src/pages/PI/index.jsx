@@ -274,11 +274,15 @@ function PIList() {
   }
 
 
+  // CHANGED: no longer restricted to the currently selected order — a leg's
+  // rate often carries over from a leg on a *different* order (e.g. the same
+  // buyer/route reused across order chains), so the source list now spans
+  // every order. Sorted with the current order's own PIs first (still the
+  // most likely match) since the list can otherwise get long.
   async function openCopyModal() {
-    let q = supabase.from('proforma_invoices').select('id,pi_no,pi_date,total_amount,from_entity:from_entity_id(name,short_name),to_entity:to_entity_id(name,short_name)').eq('is_deleted',false).order('pi_date',{ascending:false}).limit(60)
-    if (form.order_id) q = q.eq('order_id', form.order_id)
-    const { data } = await q
-    setPrevPIs(data||[]); setCopyPiId(data?.[0]?.id||''); setCopyModal(true)
+    const { data } = await supabase.from('proforma_invoices').select('id,pi_no,pi_date,total_amount,order_id,orders(name),from_entity:from_entity_id(name,short_name),to_entity:to_entity_id(name,short_name)').eq('is_deleted',false).order('pi_date',{ascending:false}).limit(150)
+    const sorted = form.order_id ? [...(data||[])].sort((a,b) => (b.order_id===form.order_id)-(a.order_id===form.order_id)) : (data||[])
+    setPrevPIs(sorted); setCopyPiId(sorted?.[0]?.id||''); setCopyModal(true)
   }
 
   async function handleCopyLines() {
@@ -639,16 +643,16 @@ function PIList() {
       </Modal>
 
 
-      {/* Copy from previous leg PI */}
-      <Modal open={copyModal} onClose={()=>setCopyModal(false)} title='Copy Lines from Previous Leg PI' width={640} zIndex={1100}>
+      {/* Copy lines from another PI, any order/leg */}
+      <Modal open={copyModal} onClose={()=>setCopyModal(false)} title='Copy Lines from Another PI' width={640} zIndex={1100}>
         <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
           <div style={{background:'#fffbf0',border:`1px solid #e6c040`,borderRadius:'6px',padding:'10px 14px',fontSize:'12px',color:C.textMid}}>
-            Lines are copied with the margin you specify. HSN rates are re-evaluated from the current master.
+            Lines are copied with the margin you specify. HSN rates are re-evaluated from the current master. Source list spans every order — PIs on the current order are listed first.
           </div>
           <FormRow label='Source PI'>
             <Select value={copyPiId} onChange={e=>setCopyPiId(e.target.value)}>
               <option value=''>Select a PI to copy from</option>
-              {prevPIs.map(p=><option key={p.id} value={p.id}>{p.pi_no||p.id.slice(0,8)} — {p.from_entity?.short_name||p.from_entity?.name} → {p.to_entity?.short_name||p.to_entity?.name} · {fmtDate(p.pi_date)} · {formatINR(p.total_amount)}</option>)}
+              {prevPIs.map(p=><option key={p.id} value={p.id}>{p.pi_no||p.id.slice(0,8)} — {p.from_entity?.short_name||p.from_entity?.name} → {p.to_entity?.short_name||p.to_entity?.name} · {p.orders?.name?`${p.orders.name} · `:''}{fmtDate(p.pi_date)} · {formatINR(p.total_amount)}</option>)}
             </Select>
           </FormRow>
           <FormRow label='Margin %' hint='Positive or negative. Use 0 to copy at same rate.'>
@@ -729,7 +733,7 @@ function PIList() {
 
           <SectionDivider label='Line Items' />
           <div style={{display:'flex',justifyContent:'flex-end',marginBottom:'-4px'}}>
-            <Btn size='sm' variant='ghost' onClick={openCopyModal}>📋 Copy from previous leg PI…</Btn>
+            <Btn size='sm' variant='ghost' onClick={openCopyModal}>📋 Copy lines from another PI…</Btn>
           </div>
           <LineItemsEditor lines={piLines} setLines={setPILines} interstate={form.is_interstate} hsnMap={hsnMap} asOfDate={form.pi_date} showMargin={true} stockMap={stockMap} products={products} roundOffOverride={roundOffOverride} onRoundOffOverrideChange={setRoundOffOverride}/>
 
@@ -1008,7 +1012,7 @@ function PIDetail() {
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             <Btn size='sm' variant='ghost' onClick={handleExportLines}>↓ CSV</Btn>
             {editing&&<Btn size='sm' variant='ghost' onClick={()=>{setBulkCsvText('');setBulkCsvResult(null);setBulkCsvModal(true)}}>↑ Bulk Upload</Btn>}
-            {!editing&&!isLocked&&<Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
+            {!editing&&<Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing&&<Btn size='sm' variant='ghost' onClick={()=>setEditing(false)}>Discard</Btn>}
             {editing&&<Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving?'Saving…':'Save Changes'}</Btn>}
             {!editing&&pi.status==='draft'&&<Btn size='sm' variant='ghost' onClick={()=>updateStatus('sent')}>Mark Sent</Btn>}
