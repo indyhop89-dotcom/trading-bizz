@@ -10,7 +10,7 @@ import LineItemsEditor, { computeLine, computeTotals } from '../../components/Li
 import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
-import { buildHSNMap } from '../../utils/hsn'
+import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import { withTimeout } from '../../utils/query'
 import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
 import DocumentAttachments from '../../components/DocumentAttachments'
@@ -49,6 +49,9 @@ export async function buildPODoc(po, lines) {
     interstate: po.is_interstate,
     bankDetails: buyer,
     notes: po.notes,
+    // CHANGED: see PI/index.jsx's buildPIDoc for the full rationale — these
+    // were captured on the form but never reached the printed document.
+    dispatchInfo: { billFrom: po.bill_from, billTo: po.bill_to, shipFrom: po.ship_from, shipTo: po.ship_to },
   }
 }
 
@@ -345,7 +348,7 @@ function POList() {
       const near = findNearMatchProduct(products, { name: r.product, hsn_code: r.hsn_code, rate: r.rate, gst_rate: r.gst_rate })
       if (near) {
         productMap.set(k, near)
-        nearMatchNotes.push(`${r.product} @ ₹${r.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
+        nearMatchNotes.push(`${r.product} @ ${formatINR(toNum(r.rate))} → matched to existing "${near.name}" @ ${formatINR(near.default_rate)} (rate close enough, not creating a duplicate)`)
         continue
       }
       missingKeys.add(k); missingRows.push(r)
@@ -399,7 +402,13 @@ function POList() {
         if (r.product?.trim() && !product) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
         if (!r.product?.trim()) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = round2(qty * rate)
-        const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
+        // CHANGED: resolve GST rate from HSN master using this row's own
+        // po_date (same as PI's CSV upload fix — see that file for the full
+        // rationale) instead of taking the CSV's gst_rate column as literal
+        // truth. Falls back to the CSV's own gst_rate (or 18) only when HSN
+        // master has no resolvable rate.
+        const resolved = r.hsn_code ? resolveGSTRate(r.hsn_code, rate, hsnMap, poDate) : { gst_rate: null }
+        const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(r.gst_rate) || 18); const half = gstRate / 2
         const igst = interstate ? round2(taxable * gstRate / 100) : 0
         const cgst = !interstate ? round2(taxable * half / 100) : 0
         return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: round2(taxable+igst+cgst+cgst) }

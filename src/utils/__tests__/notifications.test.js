@@ -10,6 +10,7 @@ vi.mock('../../supabaseClient.js', () => ({
 }))
 
 import { generateNotifications } from '../notifications.js'
+import { formatINR, formatNumberIN } from '../money.js'
 
 // ─── Query builder helper ─────────────────────────────────────────────────────
 // Returns a chainable object that resolves to { data, error } when awaited.
@@ -142,41 +143,51 @@ describe('deduplication key logic', () => {
 })
 
 // ─── message format (pure logic, no DB) ──────────────────────────────────────
+// Templates below are copied verbatim from notifications.js's generateNotifications
+// (not reimplemented) and exercise the real formatINR/formatNumberIN from
+// money.js, so these actually catch drift from the shared formatter instead
+// of just re-asserting a hand-rolled string. All amounts show 2 decimal
+// places — the same convention every other money display in the app follows
+// — not rounded to whole rupees.
 
 describe('notification message format', () => {
   it('overdue invoice message with invoice_no', () => {
-    const r = { id: 'aabbccdd-1111', invoice_no: 'INV-001', amount: 5000, currency: 'INR' }
-    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} payment of ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} is past due.`
-    expect(msg).toBe('Invoice INV-001 payment of INR 5,000 is past due.')
+    const r = { id: 'aabbccdd-1111', invoice_no: 'INV-001' }
+    const pending = 5000
+    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} — ${formatINR(pending)} pending, past due.`
+    expect(msg).toBe('Invoice INV-001 — ₹5,000.00 pending, past due.')
   })
 
   it('overdue invoice message falls back to id slice when no invoice_no', () => {
-    const r = { id: 'xxyyzz00-2222', invoice_no: null, amount: 1000, currency: 'INR' }
-    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} payment of ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} is past due.`
+    const r = { id: 'xxyyzz00-2222', invoice_no: null }
+    const pending = 1000
+    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} — ${formatINR(pending)} pending, past due.`
     expect(msg).toContain('xxyyzz00')
   })
 
   it('due-soon invoice message includes due_date', () => {
-    const r = { invoice_no: 'INV-042', amount: 8000, currency: 'USD', due_date: '2025-06-30', id: 'aabb-ccdd' }
-    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} — ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} due on ${r.due_date}.`
-    expect(msg).toBe('Invoice INV-042 — USD 8,000 due on 2025-06-30.')
+    const r = { invoice_no: 'INV-042', due_date: '2025-06-30', id: 'aabb-ccdd' }
+    const pending = 8000
+    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} — ${formatINR(pending)} due on ${r.due_date}.`
+    expect(msg).toBe('Invoice INV-042 — ₹8,000.00 due on 2025-06-30.')
   })
 
-  it('expense overdue message includes category and amount', () => {
+  it('expense overdue message includes category, currency, and amount', () => {
     const r = { expense_category: 'Freight', amount: 2500, currency: 'INR' }
-    const msg = `${r.expense_category} expense of ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} is past due.`
-    expect(msg).toBe('Freight expense of INR 2,500 is past due.')
+    const msg = `${r.expense_category} expense of ${r.currency} ${formatNumberIN(r.amount)} is past due.`
+    expect(msg).toBe('Freight expense of INR 2,500.00 is past due.')
   })
 
   it('bill discounting message includes bank, amount, and maturity date', () => {
     const r = { bank_name: 'HDFC Bank', outstanding_amount: 100000, maturity_date: '2025-07-15' }
-    const msg = `${r.bank_name} — outstanding ${Math.round(r.outstanding_amount).toLocaleString('en-IN')} matures on ${r.maturity_date}.`
-    expect(msg).toBe('HDFC Bank — outstanding 1,00,000 matures on 2025-07-15.')
+    const msg = `${r.bank_name} — outstanding ${formatINR(r.outstanding_amount)} matures on ${r.maturity_date}.`
+    expect(msg).toBe('HDFC Bank — outstanding ₹1,00,000.00 matures on 2025-07-15.')
   })
 
-  it('amounts are rounded to whole rupees in messages', () => {
-    const r = { invoice_no: 'INV-099', amount: 1000.75, currency: 'INR', id: 'zz' }
-    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} payment of ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} is past due.`
-    expect(msg).toContain('1,001') // 1000.75 rounds to 1001
+  it('amounts show 2 decimal places in messages, not rounded to whole rupees', () => {
+    const r = { invoice_no: 'INV-099', id: 'zz' }
+    const pending = 1000.75
+    const msg = `Invoice ${r.invoice_no || r.id.slice(0, 8)} — ${formatINR(pending)} pending, past due.`
+    expect(msg).toContain('1,000.75')
   })
 })

@@ -128,3 +128,40 @@ describe('buildDocumentExcelXML', () => {
     expect(() => buildDocumentExcelXML(unconfigured)).toThrow(/no document format has been configured for "siddhi trading co"/i)
   })
 })
+
+describe('dispatchInfo (Bill From/To, Ship From/To)', () => {
+  it('shows only the populated Bill/Ship From/To rows, omitting blank ones', () => {
+    const html = buildDocumentHTML({ ...baseDoc, dispatchInfo: { billFrom: 'VVGTL, Panvel', billTo: '', shipFrom: 'DHL Warehouse, Panvel', shipTo: '' } })
+    expect(html).toContain('Bill From')
+    expect(html).toContain('VVGTL, Panvel')
+    expect(html).toContain('Ship From')
+    expect(html).toContain('DHL Warehouse, Panvel')
+    // The dispatch-info block itself only renders the populated rows — the
+    // pre-existing addr-grid "Bill To" label (a different feature) is
+    // expected to still be present, so check specifically for the absence
+    // of a dispatch-row for the blank fields, not "Bill To" anywhere at all.
+    expect(html).not.toContain('dispatch-lbl">Bill To<')
+    expect(html).not.toContain('dispatch-lbl">Ship To<')
+  })
+
+  it('omits the whole block when dispatchInfo is absent or all fields are blank', () => {
+    const html = buildDocumentHTML(baseDoc)
+    expect(html).not.toContain('dispatch-info')
+    const blank = buildDocumentHTML({ ...baseDoc, dispatchInfo: { billFrom: '', billTo: '', shipFrom: '', shipTo: '' } })
+    expect(blank).not.toContain('dispatch-info')
+  })
+})
+
+describe('entity-level Terms & Conditions', () => {
+  it('renders the seller entity\'s configured terms, only when set', () => {
+    const withTerms = buildDocumentHTML({ ...baseDoc, sellerEntity: { ...baseDoc.sellerEntity, terms_and_conditions: 'Goods once sold will not be taken back.' } })
+    expect(withTerms).toContain('Goods once sold will not be taken back.')
+    const without = buildDocumentHTML(baseDoc)
+    expect(without).not.toContain('tv-extra')
+  })
+
+  it('preserves line breaks in the terms text', () => {
+    const html = buildDocumentHTML({ ...baseDoc, sellerEntity: { ...baseDoc.sellerEntity, terms_and_conditions: 'Line one.\nLine two.' } })
+    expect(html).toContain('Line one.<br>Line two.')
+  })
+})

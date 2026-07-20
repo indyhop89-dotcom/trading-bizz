@@ -23,6 +23,15 @@ const ADJUSTMENT_REASONS = [
   { value: 'damage',    label: 'Damage / write-off' },
   { value: 'found',     label: 'Found stock (found more than expected)' },
   { value: 'recount',   label: 'Physical recount correction' },
+  // CHANGED: distinct from the correction reasons above — this tool tracks
+  // transactions, not a full ERP's physical inventory lifecycle. Once a
+  // batch of stock is done being tracked here (sold outside the tool,
+  // disposed of, given away), this reason removes it from Actual Stock
+  // without mislabeling it as a miscount. Always a decrease — enforced by a
+  // DB check constraint too (033_stock_offload_reason.sql). Doesn't touch
+  // P&L: Reports' P&L/Profitability tabs are computed purely from
+  // invoice/expense data and never read stock_adjustments at all.
+  { value: 'offloaded', label: 'Offloaded (moved out of system, not sold via this tool)' },
   { value: 'other',     label: 'Other' },
 ]
 // CHANGED: parseCSVLine moved to utils/csvTemplate.js so PI/PO/Invoices CSV
@@ -573,10 +582,25 @@ function StockAdjustments() {
           .select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name')
         setEntities(es || [])
       } else {
-        const { data: grants } = await supabase.from('user_entity_access')
-          .select('entity:entity_id(id,name,short_name)').eq('user_id', profile.id)
-        const granted = (grants || []).map(g => g.entity).filter(Boolean).sort((a, b) => (a.name || '').localeCompare(b.name || ''))
-        setEntities(granted)
+        // CHANGED: union of direct entity grants AND every entity in a
+        // granted group (see useEntityAccess.js for the same pattern) — a
+        // user with only group-wise access previously saw an empty
+        // dropdown here.
+        const [{ data: grants }, { data: groupGrants }] = await Promise.all([
+          supabase.from('user_entity_access').select('entity:entity_id(id,name,short_name)').eq('user_id', profile.id),
+          supabase.from('user_group_access').select('group_id').eq('user_id', profile.id),
+        ])
+        const directEntities = (grants || []).map(g => g.entity).filter(Boolean)
+        const groupIds = (groupGrants || []).map(g => g.group_id)
+        let groupEntities = []
+        if (groupIds.length) {
+          const { data } = await supabase.from('entities')
+            .select('id,name,short_name').in('group_id', groupIds).eq('is_active', true).eq('is_deleted', false)
+          groupEntities = data || []
+        }
+        const byId = new Map()
+        for (const e of [...directEntities, ...groupEntities]) byId.set(e.id, e)
+        setEntities([...byId.values()].sort((a, b) => (a.name || '').localeCompare(b.name || '')))
       }
     }
     loadEntities()
@@ -595,6 +619,12 @@ function StockAdjustments() {
 
   function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
   function openNew()  { setEditing(null); setForm(EMPTY_ADJUSTMENT); setModalOpen(true) }
+  // CHANGED: "offloaded" was previously only reachable by opening the
+  // generic Add Adjustment modal and finding it in the Reason dropdown —
+  // easy to miss. A dedicated entry point makes the single most common use
+  // of this feature (bulk-removing stock that's done being tracked here)
+  // directly discoverable from the toolbar.
+  function openNewOffload() { setEditing(null); setForm({ ...EMPTY_ADJUSTMENT, direction: 'decrease', reason: 'offloaded' }); setModalOpen(true) }
   function openEdit(r) {
     setEditing(r)
     setForm({
@@ -660,6 +690,9 @@ function StockAdjustments() {
       if (!product) { errors.push(`Row ${rowNum}: product "${row.product}" not found — add it under Stock > Products first`); continue }
       if (!qty)     { errors.push(`Row ${rowNum}: qty must be a non-zero number`); continue }
       if (!validReasons.includes(reason)) { errors.push(`Row ${rowNum}: reason must be one of ${validReasons.join(', ')}`); continue }
+      // Offloading can only remove stock (matches the DB check constraint) —
+      // catch it here with a clear message rather than a raw insert error.
+      if (reason === 'offloaded' && qty > 0) { errors.push(`Row ${rowNum}: "offloaded" qty must be negative (it can only remove stock, e.g. -5)`); continue }
       payloads.push({
         entity_id: entity.id, product_id: product.id, qty_delta: qty, reason,
         adjustment_date: row.adjustment_date || today(), notes: row.notes || null,
@@ -731,6 +764,7 @@ function StockAdjustments() {
         </select>
         <div style={{ flex: 1 }} />
         <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
+        <Btn variant='ghost' onClick={openNewOffload}>⤓ Offload Stock</Btn>
         <Btn onClick={openNew}>+ Add Adjustment</Btn>
       </div>
 
@@ -738,7 +772,7 @@ function StockAdjustments() {
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={filtered}
-              emptyState={<EmptyState icon='⚖️' title='No adjustments' message='Record a correction when a physical count finds a shortfall, damage, or stock that was never billed.' action={<Btn onClick={openNew}>+ Add Adjustment</Btn>} />}
+              emptyState={<EmptyState icon='⚖️' title='No adjustments' message='Record a correction when a physical count finds a shortfall or damage, or offload stock that is done being tracked here.' action={<Btn onClick={openNew}>+ Add Adjustment</Btn>} />}
             />
         }
       </Card>
@@ -769,9 +803,12 @@ function StockAdjustments() {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='Direction' required>
-              <Select value={form.direction} onChange={e => setF('direction', e.target.value)}>
-                <option value='decrease'>Decrease (shortfall / damage)</option>
-                <option value='increase'>Increase (found stock)</option>
+              {/* CHANGED: offloading can only ever remove stock (enforced by
+                  a DB check constraint too) — locked to Decrease and
+                  disabled rather than left selectable and rejected on save. */}
+              <Select value={form.direction} onChange={e => setF('direction', e.target.value)} disabled={form.reason === 'offloaded'}>
+                <option value='decrease'>{form.reason === 'offloaded' ? 'Decrease (offloaded)' : 'Decrease (shortfall / damage)'}</option>
+                {form.reason !== 'offloaded' && <option value='increase'>Increase (found stock)</option>}
               </Select>
             </FormRow>
             <FormRow label='Quantity' required>
@@ -789,7 +826,10 @@ function StockAdjustments() {
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='Reason' required>
-              <Select value={form.reason} onChange={e => setF('reason', e.target.value)}>
+              <Select value={form.reason} onChange={e => {
+                const reason = e.target.value
+                setForm(f => ({ ...f, reason, direction: reason === 'offloaded' ? 'decrease' : f.direction }))
+              }}>
                 {ADJUSTMENT_REASONS.map(r => <option key={r.value} value={r.value}>{r.label}</option>)}
               </Select>
             </FormRow>
@@ -818,7 +858,8 @@ function StockAdjustments() {
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>entity,product,qty,reason,adjustment_date,notes</code><br />
             <strong>Example:</strong><br />
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>Siddi,T-Shirt Basic Round Neck,-5,shortfall,2025-04-30,Physical count came up short</code><br />
-            Entity = short name or full name. Product must match an existing product exactly — it will NOT be auto-created (add it under Products first if missing). Qty is signed: negative = decrease (shortfall/damage), positive = increase (found stock). Reason = one of <code>shortfall</code>, <code>damage</code>, <code>found</code>, <code>recount</code>, <code>other</code>. Each row is inserted as its own adjustment — re-uploading the same file adds duplicates rather than overwriting.
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>Siddi,T-Shirt Basic Round Neck,-40,offloaded,2025-04-30,Sold outside the tool — batch closed out</code><br />
+            Entity = short name or full name. Product must match an existing product exactly — it will NOT be auto-created (add it under Products first if missing). Qty is signed: negative = decrease (shortfall/damage/offloaded), positive = increase (found stock). Reason = one of <code>shortfall</code>, <code>damage</code>, <code>found</code>, <code>recount</code>, <code>offloaded</code>, <code>other</code> — use <code>offloaded</code> to bulk-remove stock that's done being tracked here (must be negative). Each row is inserted as its own adjustment — re-uploading the same file adds duplicates rather than overwriting. Offloading (like every adjustment reason) only changes Actual Stock — it never affects the P&amp;L report, which is computed purely from invoice/expense transactions.
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -910,16 +951,27 @@ function StockPosition() {
         setEntities(es || [])
         setEntityFilter('')
       } else {
-        // CHANGED: everyone else only sees entities they've been explicitly
-        // granted via user_entity_access. No "All entities" option for them —
-        // the dropdown is built purely from their grants, and if they only
-        // have one grant, it's frozen to that entity (see select below).
-        const { data: grants } = await supabase
-          .from('user_entity_access')
-          .select('entity:entity_id(id,name,short_name)')
-          .eq('user_id', profile.id)
-        const granted = (grants || []).map(g => g.entity).filter(Boolean)
-          .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+        // CHANGED: everyone else only sees the union of entities they've
+        // been explicitly granted via user_entity_access AND every entity
+        // in a group they've been granted via user_group_access. No "All
+        // entities" option for them — the dropdown is built purely from
+        // their grants, and if that union is exactly one entity, it's
+        // frozen to that entity (see select below).
+        const [{ data: grants }, { data: groupGrants }] = await Promise.all([
+          supabase.from('user_entity_access').select('entity:entity_id(id,name,short_name)').eq('user_id', profile.id),
+          supabase.from('user_group_access').select('group_id').eq('user_id', profile.id),
+        ])
+        const directEntities = (grants || []).map(g => g.entity).filter(Boolean)
+        const groupIds = (groupGrants || []).map(g => g.group_id)
+        let groupEntities = []
+        if (groupIds.length) {
+          const { data } = await supabase.from('entities')
+            .select('id,name,short_name').in('group_id', groupIds).eq('is_active', true).eq('is_deleted', false)
+          groupEntities = data || []
+        }
+        const byId = new Map()
+        for (const e of [...directEntities, ...groupEntities]) byId.set(e.id, e)
+        const granted = [...byId.values()].sort((a, b) => (a.name || '').localeCompare(b.name || ''))
         setEntities(granted)
         setEntityFilter(granted[0]?.id || '')
       }

@@ -14,6 +14,15 @@ describe('resolveEntityTheme', () => {
     expect(resolveEntityTheme('  29aajcv0573f1z4  ')).toBeTruthy()
   })
 
+  it('resolves MVL to the same "tally" family as Kirti — a mirrored format, not a separate template', () => {
+    const kirti = resolveEntityTheme('29AKNPK1819J1ZR')
+    const mvl = resolveEntityTheme('29AANCM1499F1ZY')
+    expect(mvl).toBeTruthy()
+    expect(mvl.label).toBe('MVL')
+    expect(mvl.family).toBe(kirti.family)
+    expect(mvl.family).toBe('tally')
+  })
+
   it('returns null for an entity with no registered theme', () => {
     expect(resolveEntityTheme('29AABCU9603R1ZM')).toBeNull()
   })

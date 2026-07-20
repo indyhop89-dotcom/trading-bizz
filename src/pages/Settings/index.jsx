@@ -685,22 +685,29 @@ function Users() {
 
   const [rows, setRows]         = useState([])
   const [entities, setEntities] = useState([])
+  const [groups, setGroups]     = useState([])
   const [accessMap, setAccessMap] = useState({}) // user_id -> [entity_id, ...]
   // CHANGED: separate, additive map for time-bound access — kept apart from
   // accessMap so grantableEntities/entityLabel/column rendering (all built on
   // accessMap's array shape) don't need to change at all.
   const [accessExpiryMap, setAccessExpiryMap] = useState({}) // user_id -> {entity_id: expires_at | null}
+  // CHANGED: group-wise access — same shape as the entity maps above, kept as
+  // its own parallel set (not merged into accessMap) since a group grant and
+  // an entity grant are different rows/tables even though they both feed
+  // has_entity_grant() server-side.
+  const [groupAccessMap, setGroupAccessMap] = useState({}) // user_id -> [group_id, ...]
+  const [groupAccessExpiryMap, setGroupAccessExpiryMap] = useState({}) // user_id -> {group_id: expires_at | null}
   const [loading, setLoading]   = useState(true)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing]   = useState(null)
-  const [form, setForm]         = useState({ role: 'entity_user', is_active: true, entityIds: [], expiryByEntity: {} })
+  const [form, setForm]         = useState({ role: 'entity_user', is_active: true, entityIds: [], expiryByEntity: {}, groupIds: [], expiryByGroup: {} })
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
 
   // New-user modal state — separate from the edit modal above since the
   // fields (email, password) and the save path (Edge Function vs. direct
   // table update) are different.
-  const EMPTY_NEW_USER = { full_name: '', email: '', role: 'entity_user', entityIds: [], expiryByEntity: {}, password: '' }
+  const EMPTY_NEW_USER = { full_name: '', email: '', role: 'entity_user', entityIds: [], expiryByEntity: {}, groupIds: [], expiryByGroup: {}, password: '' }
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [newUser, setNewUser]   = useState(EMPTY_NEW_USER)
   const [adding, setAdding]     = useState(false)
@@ -712,16 +719,21 @@ function Users() {
   // themselves have been granted (accessMap[me.id] — already scoped correctly
   // by RLS, since a non-master can only ever see their own access rows).
   const grantableEntities = iAmMaster ? entities : entities.filter(e => (accessMap[me?.id] || []).includes(e.id))
+  // Same restriction, mirrored for groups.
+  const grantableGroups = iAmMaster ? groups : groups.filter(g => (groupAccessMap[me?.id] || []).includes(g.id))
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: profiles }, { data: es }, { data: access }] = await Promise.all([
+    const [{ data: profiles }, { data: es }, { data: gs }, { data: access }, { data: groupAccess }] = await Promise.all([
       supabase.from('profiles').select('*').order('full_name'),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
+      supabase.from('entity_groups').select('id,name').order('name'),
       supabase.from('user_entity_access').select('user_id, entity_id, expires_at'),
+      supabase.from('user_group_access').select('user_id, group_id, expires_at'),
     ])
     setRows(profiles || [])
     setEntities(es || [])
+    setGroups(gs || [])
     const map = {}
     const expiryMap = {}
     for (const a of (access || [])) {
@@ -732,6 +744,16 @@ function Users() {
     }
     setAccessMap(map)
     setAccessExpiryMap(expiryMap)
+    const groupMap = {}
+    const groupExpiryMap = {}
+    for (const a of (groupAccess || [])) {
+      if (!groupMap[a.user_id]) groupMap[a.user_id] = []
+      groupMap[a.user_id].push(a.group_id)
+      if (!groupExpiryMap[a.user_id]) groupExpiryMap[a.user_id] = {}
+      groupExpiryMap[a.user_id][a.group_id] = a.expires_at
+    }
+    setGroupAccessMap(groupMap)
+    setGroupAccessExpiryMap(groupExpiryMap)
     setLoading(false)
   }, [])
 
@@ -739,13 +761,18 @@ function Users() {
 
   function openEdit(r) {
     setEditing(r)
-    // Prefill each granted entity's expiry as a plain YYYY-MM-DD for the date
-    // input; a still-permanent (null expires_at) entity is simply absent here.
+    // Prefill each granted entity's/group's expiry as a plain YYYY-MM-DD for
+    // the date input; a still-permanent (null expires_at) one is simply
+    // absent here.
     const expiryByEntity = {}
     for (const [entityId, expiresAt] of Object.entries(accessExpiryMap[r.id] || {})) {
       if (expiresAt) expiryByEntity[entityId] = expiresAt.slice(0, 10)
     }
-    setForm({ role: r.role || 'entity_user', is_active: r.is_active !== false, entityIds: accessMap[r.id] || [], expiryByEntity })
+    const expiryByGroup = {}
+    for (const [groupId, expiresAt] of Object.entries(groupAccessExpiryMap[r.id] || {})) {
+      if (expiresAt) expiryByGroup[groupId] = expiresAt.slice(0, 10)
+    }
+    setForm({ role: r.role || 'entity_user', is_active: r.is_active !== false, entityIds: accessMap[r.id] || [], expiryByEntity, groupIds: groupAccessMap[r.id] || [], expiryByGroup })
     setModalOpen(true)
   }
 
@@ -753,13 +780,26 @@ function Users() {
     setForm(f => ({ ...f, entityIds: f.entityIds.includes(id) ? f.entityIds.filter(x => x !== id) : [...f.entityIds, id] }))
   }
 
-  // CHANGED: optional per-entity expiry — blank means permanent (unchanged
-  // behavior). Stored as end-of-day so access holds through the chosen date.
+  function toggleGroup(id) {
+    setForm(f => ({ ...f, groupIds: f.groupIds.includes(id) ? f.groupIds.filter(x => x !== id) : [...f.groupIds, id] }))
+  }
+
+  // CHANGED: optional per-entity/per-group expiry — blank means permanent
+  // (unchanged behavior). Stored as end-of-day so access holds through the
+  // chosen date.
   function setExpiry(entityId, dateStr) {
     setForm(f => {
       const next = { ...f.expiryByEntity }
       if (dateStr) next[entityId] = dateStr; else delete next[entityId]
       return { ...f, expiryByEntity: next }
+    })
+  }
+
+  function setGroupExpiry(groupId, dateStr) {
+    setForm(f => {
+      const next = { ...f.expiryByGroup }
+      if (dateStr) next[groupId] = dateStr; else delete next[groupId]
+      return { ...f, expiryByGroup: next }
     })
   }
 
@@ -785,6 +825,21 @@ function Users() {
         }))
       )
       if (insErr) { setSaving(false); return setToast({ message: `Role saved, but entity access failed: ${insErr.message}`, type: 'error' }) }
+    }
+
+    // CHANGED: same replace-wholesale approach for group grants, kept as a
+    // separate delete/insert pass against user_group_access rather than
+    // merged into the entity-access rows above.
+    const { error: delGroupErr } = await supabase.from('user_group_access').delete().eq('user_id', editing.id)
+    if (delGroupErr) { setSaving(false); return setToast({ message: `Role and entity access saved, but group access failed: ${delGroupErr.message}`, type: 'error' }) }
+    if (form.groupIds.length > 0) {
+      const { error: insGroupErr } = await supabase.from('user_group_access').insert(
+        form.groupIds.map(group_id => ({
+          user_id: editing.id, group_id,
+          expires_at: form.expiryByGroup[group_id] ? `${form.expiryByGroup[group_id]}T23:59:59` : null,
+        }))
+      )
+      if (insGroupErr) { setSaving(false); return setToast({ message: `Role and entity access saved, but group access failed: ${insGroupErr.message}`, type: 'error' }) }
     }
 
     setSaving(false)
@@ -829,7 +884,11 @@ function Users() {
     setNewUser(f => ({ ...f, entityIds: f.entityIds.includes(id) ? f.entityIds.filter(x => x !== id) : [...f.entityIds, id] }))
   }
 
-  // CHANGED: optional per-entity expiry for a brand-new user, same idea as setExpiry() above.
+  function toggleNewUserGroup(id) {
+    setNewUser(f => ({ ...f, groupIds: f.groupIds.includes(id) ? f.groupIds.filter(x => x !== id) : [...f.groupIds, id] }))
+  }
+
+  // CHANGED: optional per-entity/per-group expiry for a brand-new user, same idea as setExpiry() above.
   function setNewUserExpiry(entityId, dateStr) {
     setNewUser(f => {
       const next = { ...f.expiryByEntity }
@@ -838,19 +897,35 @@ function Users() {
     })
   }
 
+  function setNewUserGroupExpiry(groupId, dateStr) {
+    setNewUser(f => {
+      const next = { ...f.expiryByGroup }
+      if (dateStr) next[groupId] = dateStr; else delete next[groupId]
+      return { ...f, expiryByGroup: next }
+    })
+  }
+
   async function handleAddUser() {
     if (!newUser.full_name.trim() || !newUser.email.trim()) {
       return setToast({ message: 'Name and email are required', type: 'error' })
     }
-    if (newUser.role !== 'master' && newUser.entityIds.length === 0) {
-      return setToast({ message: 'Select at least one entity for this role', type: 'error' })
+    // CHANGED: access can come from entity grants, group grants, or both —
+    // only block if BOTH are empty (matches the create-user Edge Function's
+    // own relaxed check).
+    if (newUser.role !== 'master' && newUser.entityIds.length === 0 && newUser.groupIds.length === 0) {
+      return setToast({ message: 'Select at least one entity or group for this role', type: 'error' })
     }
     setAdding(true)
-    // CHANGED: entity_expiries is optional and additive — omitting an entity
-    // id from it (or the whole field) means permanent access, same as before.
+    // CHANGED: entity_expiries/group_expiries are optional and additive —
+    // omitting an id from them (or the whole field) means permanent access,
+    // same as before.
     const entity_expiries = {}
     for (const [entityId, dateStr] of Object.entries(newUser.expiryByEntity)) {
       if (dateStr) entity_expiries[entityId] = `${dateStr}T23:59:59`
+    }
+    const group_expiries = {}
+    for (const [groupId, dateStr] of Object.entries(newUser.expiryByGroup)) {
+      if (dateStr) group_expiries[groupId] = `${dateStr}T23:59:59`
     }
     const { data, error } = await supabase.functions.invoke('create-user', {
       body: {
@@ -859,6 +934,8 @@ function Users() {
         role: newUser.role,
         entity_ids: newUser.entityIds,
         entity_expiries,
+        group_ids: newUser.groupIds,
+        group_expiries,
         password: newUser.password.trim() || undefined,
       },
     })
@@ -888,11 +965,17 @@ function Users() {
     load()
   }
 
-  function entityLabel(entityIds, role) {
+  // CHANGED: a user's access can now come from direct entity grants, group
+  // grants, or both — "None assigned" must only fire when BOTH are empty,
+  // otherwise a group-only user (a perfectly valid setup) shows as having no
+  // access at all in this list.
+  function entityLabel(entityIds, groupIds, role) {
     if (role === 'master') return <span style={{ color: C.textMuted }}>All (master)</span>
-    if (!entityIds || entityIds.length === 0) return <span style={{ color: C.danger }}>None assigned</span>
-    const names = entityIds.map(id => entities.find(e => e.id === id)?.short_name || entities.find(e => e.id === id)?.name).filter(Boolean)
-    return <span style={{ fontSize: '12px' }}>{names.join(', ')}</span>
+    const entityNames = (entityIds || []).map(id => entities.find(e => e.id === id)?.short_name || entities.find(e => e.id === id)?.name).filter(Boolean)
+    const groupNames = (groupIds || []).map(id => groups.find(g => g.id === id)?.name).filter(Boolean).map(n => `${n} (group)`)
+    const all = [...entityNames, ...groupNames]
+    if (all.length === 0) return <span style={{ color: C.danger }}>None assigned</span>
+    return <span style={{ fontSize: '12px' }}>{all.join(', ')}</span>
   }
 
   const columns = [
@@ -901,7 +984,7 @@ function Users() {
     { label: 'Email',   render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{r.email}</span> },
     { label: 'Phone',   render: r => r.phone || '—' },
     { label: 'Role',    render: r => <Badge status={r.role === 'master' ? 'active' : 'pending'} label={r.role} /> },
-    { label: 'Entities', render: r => entityLabel(accessMap[r.id], r.role) },
+    { label: 'Entities', render: r => entityLabel(accessMap[r.id], groupAccessMap[r.id], r.role) },
     { label: 'Status',  render: r => <Badge status={r.is_active ? 'active' : 'cancelled'} label={r.is_active ? 'Active' : 'Revoked'} /> },
     { label: 'Actions', render: r => (
       <div onClick={e => e.stopPropagation()}>
@@ -982,6 +1065,45 @@ function Users() {
             </div>
           </FormRow>
 
+          <FormRow label={newUser.role === 'master' ? 'Group Access (master sees all)' : 'Group Access'} hint='Grants every entity currently in the group, and any added to it later'>
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '160px', overflowY: 'auto',
+              border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 12px',
+              opacity: newUser.role === 'master' ? 0.5 : 1, pointerEvents: newUser.role === 'master' ? 'none' : 'auto',
+            }}>
+              {grantableGroups.map(grp => {
+                const checked = newUser.groupIds.includes(grp.id)
+                const hasExpiry = !!newUser.expiryByGroup[grp.id]
+                return (
+                  <div key={grp.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer', flex: 1 }}>
+                      <input type='checkbox' checked={checked} onChange={() => toggleNewUserGroup(grp.id)} style={{ width: '14px', height: '14px' }} />
+                      {grp.name}
+                    </label>
+                    {checked && (hasExpiry
+                      ? <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <input type='date' value={newUser.expiryByGroup[grp.id]} onChange={e => setNewUserGroupExpiry(grp.id, e.target.value)}
+                            title='Access expires end of this day'
+                            style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                          <button type='button' onClick={() => setNewUserGroupExpiry(grp.id, '')} title='Make permanent'
+                            style={{ background: 'none', border: 'none', color: C.textMuted, cursor: 'pointer', fontSize: '13px', padding: '0 2px' }}>×</button>
+                        </div>
+                      : <button type='button' onClick={() => setNewUserGroupExpiry(grp.id, today())}
+                          style={{ background: 'none', border: 'none', color: C.accent, fontSize: '11px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+                          + Temporary
+                        </button>
+                    )}
+                  </div>
+                )
+              })}
+              {grantableGroups.length === 0 && (
+                <span style={{ fontSize: '12px', color: C.textMuted }}>
+                  {iAmAdmin ? 'You have no group access yourself to grant from.' : 'No entity groups found.'}
+                </span>
+              )}
+            </div>
+          </FormRow>
+
           <FormRow label='Password' hint='Leave blank to auto-generate a temporary password'>
             <Input type='text' value={newUser.password} onChange={e => setNewUser(f => ({ ...f, password: e.target.value }))} placeholder='Auto-generated if blank' />
           </FormRow>
@@ -1038,6 +1160,41 @@ function Users() {
                 )
               })}
               {entities.length === 0 && <span style={{ fontSize: '12px', color: C.textMuted }}>No active entities found.</span>}
+            </div>
+          </FormRow>
+
+          <FormRow label={form.role === 'master' ? 'Group Access (master sees all)' : 'Group Access'} hint='Grants every entity currently in the group, and any added to it later'>
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '160px', overflowY: 'auto',
+              border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 12px',
+              opacity: form.role === 'master' ? 0.5 : 1, pointerEvents: form.role === 'master' ? 'none' : 'auto',
+            }}>
+              {groups.map(grp => {
+                const checked = form.groupIds.includes(grp.id)
+                const hasExpiry = !!form.expiryByGroup[grp.id]
+                return (
+                  <div key={grp.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', cursor: 'pointer', flex: 1 }}>
+                      <input type='checkbox' checked={checked} onChange={() => toggleGroup(grp.id)} style={{ width: '14px', height: '14px' }} />
+                      {grp.name}
+                    </label>
+                    {checked && (hasExpiry
+                      ? <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          <input type='date' value={form.expiryByGroup[grp.id]} onChange={e => setGroupExpiry(grp.id, e.target.value)}
+                            title='Access expires end of this day'
+                            style={{ fontSize: '11px', padding: '3px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', fontFamily: 'inherit', color: C.textSoft }} />
+                          <button type='button' onClick={() => setGroupExpiry(grp.id, '')} title='Make permanent'
+                            style={{ background: 'none', border: 'none', color: C.textMuted, cursor: 'pointer', fontSize: '13px', padding: '0 2px' }}>×</button>
+                        </div>
+                      : <button type='button' onClick={() => setGroupExpiry(grp.id, today())}
+                          style={{ background: 'none', border: 'none', color: C.accent, fontSize: '11px', cursor: 'pointer', padding: 0, fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+                          + Temporary
+                        </button>
+                    )}
+                  </div>
+                )
+              })}
+              {groups.length === 0 && <span style={{ fontSize: '12px', color: C.textMuted }}>No entity groups found.</span>}
             </div>
           </FormRow>
 

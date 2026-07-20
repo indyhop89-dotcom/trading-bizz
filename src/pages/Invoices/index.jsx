@@ -10,7 +10,7 @@ import LineItemsEditor, { computeLine, computeTotals } from '../../components/Li
 import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
-import { buildHSNMap } from '../../utils/hsn'
+import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import { withTimeout } from '../../utils/query'
 import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
 import DocumentAttachments from '../../components/DocumentAttachments'
@@ -47,6 +47,10 @@ export async function buildInvoiceDoc(inv, lines) {
     bankDetails: seller,
     notes: inv.notes,
     ewayBill: { eway_bill_no: inv.eway_bill_no, vehicle_no: inv.vehicle_no, transporter_name: inv.transporter_name, challan_no: inv.challan_no },
+    // CHANGED: see PI/index.jsx's buildPIDoc for the full rationale — these
+    // were captured on the form (and even shown on this page's own detail
+    // view) but never reached the printed document.
+    dispatchInfo: { billFrom: inv.bill_from, billTo: inv.bill_to, shipFrom: inv.ship_from, shipTo: inv.ship_to },
   }
 }
 
@@ -162,10 +166,15 @@ function InvoiceList() {
   const [csvSaving, setCsvSaving] = useState(false)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo]     = useState('')
+  // CHANGED: needed so the CSV upload below can resolve each row's GST rate
+  // from HSN master as of its own invoice_date (see handleCSV) instead of
+  // taking the CSV's gst_rate column as literal truth, which silently
+  // ignored HSN effective-dated rate changes.
+  const [hsnMap, setHsnMap]     = useState(new Map())
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: invs }, { data: es }, { data: ps }] = await Promise.all([
+    const [{ data: invs }, { data: es }, { data: ps }, { data: hsnRows }] = await Promise.all([
       supabase.from('invoices')
         .select('*, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name)')
         .eq('is_deleted', false).neq('invoice_type', 'intercompany')
@@ -175,10 +184,12 @@ function InvoiceList() {
       // exceed PostgREST's default 1000-row cap, which would otherwise
       // silently drop products past that point from CSV matching.
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
+      supabase.from('hsn_master').select('*').eq('is_active', true),
     ])
     setInvoices(invs || [])
     setEntities(es || [])
     setProducts(ps || [])
+    setHsnMap(buildHSNMap(hsnRows || []))
     setLoading(false)
   }, [])
 
@@ -251,7 +262,7 @@ function InvoiceList() {
       const near = findNearMatchProduct(products, { name: r.product, hsn_code: r.hsn_code, rate: r.rate, gst_rate: r.gst_rate })
       if (near) {
         productMap.set(k, near)
-        nearMatchNotes.push(`${r.product} @ ₹${r.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
+        nearMatchNotes.push(`${r.product} @ ${formatINR(toNum(r.rate))} → matched to existing "${near.name}" @ ${formatINR(near.default_rate)} (rate close enough, not creating a duplicate)`)
         continue
       }
       missingKeys.add(k); missingRows.push(r)
@@ -306,7 +317,13 @@ function InvoiceList() {
         if (r.product?.trim() && !product) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}, line ${i+1}: product "${r.product}" could not be resolved or created`); lineErr = true }
         if (!r.product?.trim()) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}, line ${i+1}: product column is required for stock tracking`); lineErr = true }
         const rate = toNum(r.rate); const qty = toNum(r.qty); const taxable = round2(qty * rate)
-        const gstRate = toNum(r.gst_rate) || 18; const half = gstRate / 2
+        // CHANGED: resolve GST rate from HSN master using this row's own
+        // invoice_date (same as PI's CSV upload fix — see that file for the
+        // full rationale) instead of taking the CSV's gst_rate column as
+        // literal truth. Falls back to the CSV's own gst_rate (or 18) only
+        // when HSN master has no resolvable rate.
+        const resolved = r.hsn_code ? resolveGSTRate(r.hsn_code, rate, hsnMap, invoiceDate) : { gst_rate: null }
+        const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(r.gst_rate) || 18); const half = gstRate / 2
         const igst = interstate ? round2(taxable * gstRate / 100) : 0
         const cgst = !interstate ? round2(taxable * half / 100) : 0
         return { line_no: i+1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code, qty, unit: r.unit||'Nos', rate, gst_rate: gstRate, taxable_amount: taxable, cgst_rate: half, cgst_amount: cgst, sgst_rate: half, sgst_amount: cgst, igst_rate: interstate?gstRate:0, igst_amount: igst, total_amount: round2(taxable+igst+cgst+cgst) }

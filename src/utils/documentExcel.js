@@ -15,6 +15,7 @@
  */
 import { DOC_META, resolveThemeOrThrow } from './documentTemplate'
 import { buildSRPLDocumentExcelXML } from './srplDocumentExcel'
+import { buildKirtiDocumentExcelXML } from './kirtiDocumentExcel'
 
 function xesc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -100,6 +101,7 @@ function buildVananamExcelXML(doc, theme) {
 export function buildDocumentExcelXML(doc) {
   const theme = resolveThemeOrThrow(doc.sellerEntity)
   if (theme.family === 'srpl') return buildSRPLDocumentExcelXML(doc)
+  if (theme.family === 'tally') return buildKirtiDocumentExcelXML(doc)
   return buildVananamExcelXML(doc, theme)
 }
 

@@ -28,20 +28,23 @@
  *
  * This module owns the "vananam" template family only. A theme with a
  * different `family` (see entityDocumentThemes.js) — e.g. SRPL's, a
- * genuinely different layout transcribed from real reference PDFs, not a
- * recolor of this one — is dispatched to its own module (srplDocumentTemplate.js)
- * by the exported buildDocumentHTML/getDocumentStyles/printDocument below,
- * so every calling page (PI/PO/Invoices/Orders) can keep importing these
- * same three names regardless of which entity's document is being built.
+ * genuinely different layout transcribed from real reference PDFs, or
+ * Kirti's, a monochrome Tally-ERP-style layout ported from a standalone
+ * HTML generator tool — is dispatched to its own module
+ * (srplDocumentTemplate.js / kirtiDocumentTemplate.js) by the exported
+ * buildDocumentHTML/getDocumentStyles/printDocument below, so every calling
+ * page (PI/PO/Invoices/Orders) can keep importing these same three names
+ * regardless of which entity's document is being built.
  */
 import { fmtDate } from './dates'
 import { esc, fmtN, fmtInt, numWords, addressLines, paginateLines } from './documentHelpers'
 import { resolveEntityTheme } from './entityDocumentThemes'
 import { buildSRPLDocumentHTML, getSRPLDocumentStyles } from './srplDocumentTemplate'
+import { buildKirtiDocumentHTML, getKirtiDocumentStyles } from './kirtiDocumentTemplate'
 
 // Columns needed from `entities` to render a document header/address block —
 // shared by every page that builds a doc for printDocument/downloadDocumentExcel.
-export const ENTITY_DOC_COLUMNS = 'name,short_name,gstin,pan,city,address,pincode,state_name,bank_name,bank_account_no,bank_ifsc,bank_branch,logo_url,logo_file_id'
+export const ENTITY_DOC_COLUMNS = 'name,short_name,gstin,pan,city,address,pincode,state_name,bank_name,bank_account_no,bank_ifsc,bank_branch,logo_url,logo_file_id,terms_and_conditions'
 
 export const DOC_META = {
   PI: { title: 'Proforma Invoice', short: 'PI', dateLabel: 'Valid Until' },
@@ -88,7 +91,7 @@ function buildVananamHTML(doc, theme) {
     paymentTerms, deliveryTimeline, modeOfTransport = 'Road', placeOfSupply,
     sellerEntity = {}, buyerEntity = {}, shipTo,
     lines = [], totals = {}, interstate = false,
-    bankDetails = {}, notes, ewayBill,
+    bankDetails = {}, notes, ewayBill, dispatchInfo,
   } = doc
   const meta = DOC_META[docType] || DOC_META.PI
   // PO's letterhead/issuer is the BUYER (sellerEntity here, per buildPODoc's
@@ -160,6 +163,24 @@ function buildVananamHTML(doc, theme) {
     </div>`
   }
 
+  // Free-text overrides captured per-document (dispatch location can differ
+  // from the seller's registered address, and Bill From/To can differ from
+  // the counterparty's own name for e.g. a drop-ship arrangement) — distinct
+  // from the structured addr-grid above, which always shows the actual
+  // entity/ship-to addresses. Only rendered when at least one is set.
+  function dispatchInfoHTML() {
+    if (!dispatchInfo) return ''
+    const { billFrom, billTo, shipFrom, shipTo: shipToNote } = dispatchInfo
+    const rows = [
+      ['Bill From', billFrom], ['Bill To', billTo],
+      ['Ship From', shipFrom], ['Ship To', shipToNote],
+    ].filter(([, v]) => v)
+    if (!rows.length) return ''
+    return `<div class="dispatch-info">
+      ${rows.map(([label, value]) => `<div class="dispatch-row"><span class="dispatch-lbl">${esc(label)}</span><span class="dispatch-val">${esc(value)}</span></div>`).join('')}
+    </div>`
+  }
+
   function ewayHTML() {
     if (docType !== 'INVOICE' || !ewayBill) return ''
     const { eway_bill_no, vehicle_no, transporter_name, challan_no } = ewayBill
@@ -204,6 +225,7 @@ function buildVananamHTML(doc, theme) {
           <div class="trow2"><span class="tk">${meta.dateLabel}</span><span class="tv">${fmtDate(validOrDueDate)}</span></div>
           <div class="trow2"><span class="tk">GST</span><span class="tv">Rate changes charged accordingly</span></div>
           <div class="trow2"><span class="tk">Disputes</span><span class="tv">As per Bill To party's jurisdiction</span></div>
+          ${sellerEntity.terms_and_conditions ? `<div class="tv-extra">${esc(sellerEntity.terms_and_conditions).replace(/\n/g, '<br>')}</div>` : ''}
         </div>
       </div>
       <div class="bank-sig">
@@ -256,6 +278,7 @@ function buildVananamHTML(doc, theme) {
             <div class="addr-body"><b>${esc(ship.name)}</b><br>${addressLines(ship)}</div>
           </div>
         </div>
+        ${dispatchInfoHTML()}
         <div class="items-lbl">Line Items${totalPages > 1 ? ` — Page ${num} of ${totalPages}` : ''}</div>
         <table class="po-items">
           <thead><tr>
@@ -330,6 +353,10 @@ body { background: #f0f1f8; font-family: Arial, sans-serif; font-size: 11px; col
 .addr-head.navy { background: ${navy}; }
 .addr-body { padding: 7px 10px; line-height: 1.75; color: #374151; }
 .addr-body b { color: ${navy}; font-size: 9.5px; }
+.dispatch-info { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-bottom: 12px; font-size: 8.5px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px; padding: 6px 10px; }
+.dispatch-row { display: flex; gap: 5px; }
+.dispatch-lbl { color: #6b7280; font-weight: 700; text-transform: uppercase; font-size: 7.5px; letter-spacing: .3px; align-self: center; }
+.dispatch-val { color: #374151; }
 .items-lbl { font-size: 8px; text-transform: uppercase; letter-spacing: .5px; color: #6b7280; font-weight: 700; margin-bottom: 4px; }
 table.po-items { width: 100%; border-collapse: collapse; font-size: 9px; }
 table.po-items thead tr { background: ${navy}; }
@@ -374,6 +401,7 @@ table.po-items tbody tr:nth-child(even) td { background: #f0f1fb; }
 .trow2 { display: flex; gap: 6px; margin-bottom: 3px; line-height: 1.5; }
 .trow2 .tk { min-width: 90px; color: #6b7280; flex-shrink: 0; }
 .trow2 .tv { color: ${navy}; font-weight: 600; }
+.tv-extra { margin-top: 4px; padding-top: 4px; border-top: 1px dashed #d1d5db; color: #374151; line-height: 1.6; font-size: 8px; }
 .bank-sig { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
 .bbox { font-size: 8.5px; border: 1px solid #e5e7eb; border-radius: 5px; padding: 7px 10px; border-top: 3px solid ${orange}; }
 .sbox { font-size: 8.5px; border: 1px solid #e5e7eb; border-radius: 5px; padding: 7px 10px; border-top: 3px solid ${navy}; }
@@ -397,11 +425,13 @@ table.po-items tbody tr:nth-child(even) td { background: #f0f1fb; }
 export function buildDocumentHTML(doc) {
   const theme = resolveThemeOrThrow(doc.sellerEntity)
   if (theme.family === 'srpl') return buildSRPLDocumentHTML(doc)
+  if (theme.family === 'tally') return buildKirtiDocumentHTML(doc)
   return buildVananamHTML(doc, theme)
 }
 
 export function getDocumentStyles(theme) {
   if (theme.family === 'srpl') return getSRPLDocumentStyles(theme)
+  if (theme.family === 'tally') return getKirtiDocumentStyles(theme)
   return getVananamStyles(theme)
 }
 

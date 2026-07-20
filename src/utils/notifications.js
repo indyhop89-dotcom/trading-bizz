@@ -6,6 +6,7 @@
 import { supabase } from '../supabaseClient'
 import { buildActualStockMap, fetchStockMovementData } from './stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from './payments'
+import { formatINR, formatNumberIN } from './money'
 
 /**
  * Generate all notifications for a given user.
@@ -47,7 +48,7 @@ export async function generateNotifications(userId) {
       notifs.push({
         user_id:           userId,
         title:             `Invoice payment overdue`,
-        message:           `Invoice ${inv.invoice_no || inv.id.slice(0,8)} — ${pending.toLocaleString('en-IN')} pending, past due.`,
+        message:           `Invoice ${inv.invoice_no || inv.id.slice(0,8)} — ${formatINR(pending)} pending, past due.`,
         notification_type: 'overdue_invoice',
         source_type:       'invoices',
         source_id:         inv.id,
@@ -57,7 +58,7 @@ export async function generateNotifications(userId) {
       notifs.push({
         user_id:           userId,
         title:             `Invoice payment due soon`,
-        message:           `Invoice ${inv.invoice_no || inv.id.slice(0,8)} — ${pending.toLocaleString('en-IN')} due on ${inv.due_date}.`,
+        message:           `Invoice ${inv.invoice_no || inv.id.slice(0,8)} — ${formatINR(pending)} due on ${inv.due_date}.`,
         notification_type: 'payment_due',
         source_type:       'invoices',
         source_id:         inv.id,
@@ -80,7 +81,7 @@ export async function generateNotifications(userId) {
     notifs.push({
       user_id:           userId,
       title:             `Expense payment overdue`,
-      message:           `${r.expense_category} expense of ${r.currency} ${Math.round(r.amount).toLocaleString('en-IN')} is past due.`,
+      message:           `${r.expense_category} expense of ${r.currency} ${formatNumberIN(r.amount)} is past due.`,
       notification_type: 'overdue_invoice',
       source_type:       'expense_payments',
       source_id:         r.id,
@@ -100,7 +101,7 @@ export async function generateNotifications(userId) {
     notifs.push({
       user_id:           userId,
       title:             `Bill discounting maturing soon`,
-      message:           `${r.bank_name} — outstanding ${Math.round(r.outstanding_amount).toLocaleString('en-IN')} matures on ${r.maturity_date}.`,
+      message:           `${r.bank_name} — outstanding ${formatINR(r.outstanding_amount)} matures on ${r.maturity_date}.`,
       notification_type: 'bill_discounting_due',
       source_type:       'bill_discounting',
       source_id:         r.id,

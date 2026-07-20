@@ -46,6 +46,13 @@ export async function buildPIDoc(pi, lines) {
     interstate: pi.is_interstate,
     bankDetails: fromEntity,
     notes: pi.notes,
+    // CHANGED: these free-text overrides were already captured on the PI
+    // form (and shown on the detail page) but never made it onto the
+    // printed document — wired into the shared doc shape so every template
+    // family can render them. Named distinctly from `shipTo` (the
+    // structured buyer/ship-to address object above) since these are
+    // separate free-text notes, not a replacement for it.
+    dispatchInfo: { billFrom: pi.bill_from, billTo: pi.bill_to, shipFrom: pi.ship_from, shipTo: pi.ship_to },
   }
 }
 
@@ -368,7 +375,7 @@ function PIList() {
       const near = findNearMatchProduct(products, { name: r.product, hsn_code: r.hsn_code, rate: r.rate, gst_rate: r.gst_rate })
       if (near) {
         productMap.set(k, near)
-        nearMatchNotes.push(`${r.product} @ ₹${r.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
+        nearMatchNotes.push(`${r.product} @ ${formatINR(toNum(r.rate))} → matched to existing "${near.name}" @ ${formatINR(near.default_rate)} (rate close enough, not creating a duplicate)`)
         continue
       }
       missingKeys.add(k); missingRows.push(r)
@@ -428,7 +435,17 @@ function PIList() {
         const rate    = toNum(r.rate)
         const qty     = toNum(r.qty)
         const taxable = round2(qty * rate)
-        const gstRate = toNum(r.gst_rate) || 18
+        // CHANGED: resolve the GST rate from HSN master using this row's own
+        // pi_date (same resolveGSTRate the interactive line-items editor
+        // already uses), instead of taking the CSV's gst_rate column as
+        // literal truth — a CSV row previously always got whatever rate was
+        // typed into the file, silently ignoring any HSN effective-dated
+        // rate change that should have applied as of this PI's date. Falls
+        // back to the CSV's own gst_rate (or 18) only when HSN master has no
+        // resolvable rate for this code/date/price, so an explicit value
+        // still works for HSN codes not in the master table.
+        const resolved = r.hsn_code ? resolveGSTRate(r.hsn_code, rate, hsnMap, piDate) : { gst_rate: null }
+        const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(r.gst_rate) || 18)
         const half    = gstRate / 2
         const igst    = interstate ? round2(taxable * gstRate / 100) : 0
         const cgst    = !interstate ? round2(taxable * half / 100) : 0
@@ -901,13 +918,23 @@ function PIDetail() {
       const matchedProduct = row.product ? byName.get(row.product.toLowerCase()) : null
       if (row.product && !matchedProduct) errors.push(`Row ${i + 1}: product "${row.product}" not found — line added without a product, pick one manually before saving.`)
       const productId = matchedProduct?.id || (!row.product ? existing?.product_id : null) || ''
+      const hsnCode = row.hsn_code || existing?.hsn_code || ''
+      const rowRate = toNum(row.rate)
+      // CHANGED: resolve GST rate from HSN master as of this PI's own date
+      // (same as handleCSV above and the interactive editor) instead of
+      // taking the CSV's gst_rate column — or the line it's replacing —
+      // as literal truth. Falls back to the CSV's own gst_rate, then the
+      // line being replaced, then 18, only when HSN master has no
+      // resolvable rate.
+      const resolved = hsnCode ? resolveGSTRate(hsnCode, rowRate, hsnMap, editForm.pi_date) : { gst_rate: null }
+      const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(row.gst_rate) || existing?.gst_rate || 18)
       newLines.push({
         _id: existing?.id || Date.now() + i, line_no: newLines.length + 1,
         product_id: productId, description: row.description || existing?.description || '',
-        hsn_code: row.hsn_code || existing?.hsn_code || '', qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
-        rate: toNum(row.rate), gst_rate: toNum(row.gst_rate) || existing?.gst_rate || 18,
+        hsn_code: hsnCode, qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
+        rate: rowRate, gst_rate: gstRate,
         taxable_amount: 0, cgst_rate: 0, cgst_amount: 0, sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,
-        _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '',
+        _hsn_resolved_rate: resolved.gst_rate, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '',
       })
     }
     const computed = newLines.map(l => computeLine(l, editForm.is_interstate))

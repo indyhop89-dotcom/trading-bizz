@@ -20,11 +20,15 @@ export async function fetchStockMovementData() {
     fetchAllPages(() => supabase.from('invoice_lines')
       .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, invoice_type, is_deleted)')
       .not('invoice', 'is', null)),
-    // CHANGED: manual corrections (shortfall/damage/found/recount) — a signed
-    // qty_delta applied straight into actual_qty, same as opening/invoice
-    // movements. Unlike invoice lines these have no lifecycle gate (no
-    // draft/cancelled/E-way state to check) since an adjustment row only
-    // exists once someone has actually recorded the correction.
+    // CHANGED: manual corrections (shortfall/damage/found/recount/offloaded)
+    // — a signed qty_delta applied straight into actual_qty, same as
+    // opening/invoice movements. Unlike invoice lines these have no
+    // lifecycle gate (no draft/cancelled/E-way state to check) since an
+    // adjustment row only exists once someone has actually recorded the
+    // correction. 'offloaded' rows are stock this tool is done tracking
+    // (sold/disposed of outside it) — they affect Actual Stock exactly like
+    // every other reason, but never P&L (Reports' P&L/Profitability tabs
+    // are computed purely from invoices/expenses, not stock_adjustments).
     fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_id, qty_delta')),
   ])
   return {

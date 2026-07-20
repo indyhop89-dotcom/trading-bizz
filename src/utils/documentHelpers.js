@@ -52,12 +52,18 @@ export function addressLines(entity) {
 
 // Split lines into fixed-size pages up front — simplest thing that renders
 // correctly across browsers, no reliance on CSS Paged Media support.
-export function paginateLines(lines) {
+//
+// capFirst/capNext default to the vananam family's row caps, tuned for its
+// roomier layout (larger font, per-line CGST/SGST breakdown). A family with
+// a visually denser table (e.g. SRPL's single-line 9px rows) should pass
+// its own, larger caps — otherwise it breaks to a new page far earlier than
+// its content actually requires, leaving each page mostly blank.
+export function paginateLines(lines, capFirst = ROWS_PER_PAGE_FIRST, capNext = ROWS_PER_PAGE_NEXT) {
   const pages = []
   const remaining = [...lines]
   let pageNo = 1
   do {
-    const cap = pageNo === 1 ? ROWS_PER_PAGE_FIRST : ROWS_PER_PAGE_NEXT
+    const cap = pageNo === 1 ? capFirst : capNext
     pages.push(remaining.splice(0, cap))
     pageNo++
   } while (remaining.length)

@@ -39,6 +39,31 @@ const ENTITY_THEMES = {
     navy: '#1B4F91',
     orange: '#1B4F91',
   },
+  '29AKNPK1819J1ZR': { // Kirti Sales and Services (KSS)
+    label: 'KSS',
+    family: 'tally',
+    // Replicated from a standalone Tally-style HTML generator tool — the
+    // real Tally ERP sales-voucher print layout is pure black-on-white,
+    // with no accent color at all. Both values are '#000000' only to
+    // satisfy the uniqueness check below; the kirti template ignores them.
+    navy: '#000000',
+    orange: '#000000',
+  },
+  '29AANCM1499F1ZY': { // MVL — Mesindus Ventures Limited
+    label: 'MVL',
+    // Same 'tally' family as Kirti — MVL's format is a direct mirror of
+    // Kirti's (per product request), not a separate hand-built layout. The
+    // kirtiDocumentTemplate.js module is already fully generic (pulls
+    // name/address/GSTIN/PAN/bank/logo from doc.sellerEntity, nothing
+    // hardcoded to Kirti), so sharing the family here is all that's needed
+    // — no new template code.
+    family: 'tally',
+    // Monochrome like Kirti's — these values are otherwise unused by the
+    // tally template, just needs to differ from Kirti's exact '#000000'
+    // pair to pass the uniqueness check below.
+    navy: '#010101',
+    orange: '#010101',
+  },
 }
 
 // Guards against ever configuring two entities with the same color pair —

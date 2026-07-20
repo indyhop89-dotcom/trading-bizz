@@ -18,6 +18,7 @@ const EMPTY_FORM = {
   address: '', city: '', pincode: '', email: '', phone: '',
   bank_name: '', bank_account_no: '', bank_ifsc: '', bank_branch: '',
   logo_url: '', logo_file_id: '',
+  terms_and_conditions: '',
   reliance_vendor_id: '', reliance_sales_id: '',
   reliance_onboarded: false, reliance_notes: '',
   is_active: true,
@@ -87,6 +88,7 @@ export default function Entities() {
       bank_branch:        entity.bank_branch || '',
       logo_url:           entity.logo_url || '',
       logo_file_id:       entity.logo_file_id || '',
+      terms_and_conditions: entity.terms_and_conditions || '',
       reliance_vendor_id: entity.reliance_vendor_id || '',
       reliance_sales_id:  entity.reliance_sales_id || '',
       reliance_onboarded: entity.reliance_onboarded || false,
@@ -395,6 +397,11 @@ export default function Entities() {
               <Input value={form.bank_branch} onChange={e => setF('bank_branch', e.target.value)} />
             </FormRow>
           </div>
+
+          <SectionDivider label='Documents' />
+          <FormRow label='Terms & Conditions' hint='Printed on every PI/PO/Tax Invoice this entity issues — leave blank to omit it from the document'>
+            <Textarea value={form.terms_and_conditions} onChange={e => setF('terms_and_conditions', e.target.value)} rows={3} />
+          </FormRow>
 
           <SectionDivider label='Reliance Portal' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>

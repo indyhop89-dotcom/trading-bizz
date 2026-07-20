@@ -5,7 +5,7 @@ import {
   PageHeader, Card, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import DocumentAttachments from '../../components/DocumentAttachments'
-import { formatINR, toNum, roundRupees } from '../../utils/money'
+import { formatINR, formatNumberIN, toNum, roundRupees } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { useAuth } from '../../hooks/useAuth'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
@@ -115,10 +115,15 @@ function DaysLeft({ days, paid }) {
   return <span style={{ fontSize: '12px', fontWeight: 700, color }}>{days < 0 ? `${Math.abs(days)}d overdue` : `${days}d`}</span>
 }
 
+const CURRENCY_SYMBOLS = { INR: '₹', USD: '$', AED: 'AED ', EUR: '€', GBP: '£' }
+
 function AmtCell({ amount, currency }) {
   if (!amount && amount !== 0) return <span style={{ color: C.textMuted }}>—</span>
-  const sym = { INR: '₹', USD: '$', AED: 'AED ', EUR: '€', GBP: '£' }[currency] || currency + ' '
-  return <span style={{ fontVariantNumeric: 'tabular-nums' }}>{sym}{Math.round(Number(amount)).toLocaleString('en-IN')}</span>
+  const sym = CURRENCY_SYMBOLS[currency] || currency + ' '
+  // CHANGED: was Math.round(...).toLocaleString — whole rupees, no decimals,
+  // inconsistent with the 2-decimal convention formatNumberIN enforces
+  // everywhere else in the app.
+  return <span style={{ fontVariantNumeric: 'tabular-nums' }}>{sym}{formatNumberIN(amount)}</span>
 }
 
 function CurrBadge({ currency }) {
@@ -127,15 +132,17 @@ function CurrBadge({ currency }) {
 
 function BalancePreview({ amount, advance, adjustments, currency, usdRate }) {
   const bal = calcBalance(amount, advance, adjustments)
-  const pendingUSD = usdRate && bal > 0 ? Math.round(bal / toNum(usdRate)) : null
+  // CHANGED: was Math.round(...) — dropped to a whole USD number, inconsistent
+  // with the 2-decimal convention used everywhere else.
+  const pendingUSD = usdRate && bal > 0 ? bal / toNum(usdRate) : null
   if (!toNum(amount)) return null
   return (
     <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '12px 14px', display: 'grid', gridTemplateColumns: `repeat(${pendingUSD != null ? 4 : 3}, 1fr)`, gap: '8px', fontSize: '13px' }}>
       {[
-        { label: 'Amount',      val: `${currency} ${Math.round(toNum(amount)).toLocaleString('en-IN')}`,     color: C.text },
-        { label: 'Advance',     val: `− ${Math.round(toNum(advance)).toLocaleString('en-IN')}`,              color: C.textSoft },
-        { label: 'Balance Due', val: `${currency} ${Math.round(bal).toLocaleString('en-IN')}`,               color: bal > 0 ? C.danger : C.success },
-        pendingUSD != null ? { label: 'Pending USD', val: `$${pendingUSD.toLocaleString('en-IN')}`, color: C.warning } : null,
+        { label: 'Amount',      val: `${currency} ${formatNumberIN(amount)}`,     color: C.text },
+        { label: 'Advance',     val: `− ${formatNumberIN(advance)}`,              color: C.textSoft },
+        { label: 'Balance Due', val: `${currency} ${formatNumberIN(bal)}`,        color: bal > 0 ? C.danger : C.success },
+        pendingUSD != null ? { label: 'Pending USD', val: `$${formatNumberIN(pendingUSD)}`, color: C.warning } : null,
       ].filter(Boolean).map(item => (
         <div key={item.label}>
           <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700, marginBottom: '2px' }}>{item.label}</div>

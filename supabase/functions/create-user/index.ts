@@ -52,7 +52,7 @@ Deno.serve(async (req) => {
     }
 
     const body = await req.json()
-    const { email, full_name, role, entity_ids, entity_expiries, password } = body
+    const { email, full_name, role, entity_ids, entity_expiries, group_ids, group_expiries, password } = body
 
     if (!email || !full_name) {
       return json({ error: 'email and full_name are required' }, 400)
@@ -66,15 +66,21 @@ Deno.serve(async (req) => {
     if (!assignableRoles.includes(role)) {
       return json({ error: `role must be one of: ${assignableRoles.join(', ')}` }, 400)
     }
-    if (role !== 'master' && (!Array.isArray(entity_ids) || entity_ids.length === 0)) {
-      return json({ error: 'entity_ids is required for non-master roles' }, 400)
+    // CHANGED: a non-master user's access can now come from entity grants,
+    // group grants, or both — only reject if BOTH are empty, not just
+    // entity_ids alone (a group-only grant is a valid way to give access).
+    const hasEntityIds = Array.isArray(entity_ids) && entity_ids.length > 0
+    const hasGroupIds = Array.isArray(group_ids) && group_ids.length > 0
+    if (role !== 'master' && !hasEntityIds && !hasGroupIds) {
+      return json({ error: 'Select at least one entity or group for this role' }, 400)
     }
 
     // Admin client — service_role key, server-side only, never sent to the browser.
     const adminClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY)
 
-    // Admins are scoped to their own entities — they can only grant access to
-    // entities they themselves hold a grant for, never entities outside it.
+    // Admins are scoped to their own entities/groups — they can only grant
+    // access to entities/groups they themselves hold a grant for, never
+    // anything outside that.
     if (callerIsAdmin && entity_ids?.length) {
       const { data: callerGrants } = await adminClient
         .from('user_entity_access')
@@ -84,6 +90,17 @@ Deno.serve(async (req) => {
       const outOfScope = entity_ids.filter((id) => !callerEntityIds.has(id))
       if (outOfScope.length > 0) {
         return json({ error: 'You can only grant access to entities you yourself have access to' }, 403)
+      }
+    }
+    if (callerIsAdmin && group_ids?.length) {
+      const { data: callerGroupGrants } = await adminClient
+        .from('user_group_access')
+        .select('group_id')
+        .eq('user_id', caller.id)
+      const callerGroupIds = new Set((callerGroupGrants || []).map((g) => g.group_id))
+      const outOfScope = group_ids.filter((id) => !callerGroupIds.has(id))
+      if (outOfScope.length > 0) {
+        return json({ error: 'You can only grant access to groups you yourself have access to' }, 403)
       }
     }
 
@@ -125,6 +142,19 @@ Deno.serve(async (req) => {
       const { error: grantErr } = await adminClient.from('user_entity_access').insert(grants)
       if (grantErr) {
         return json({ error: `User created but entity grants failed: ${grantErr.message}` }, 500)
+      }
+    }
+
+    if (role !== 'master' && group_ids?.length) {
+      const groupGrants = group_ids.map((group_id) => ({
+        user_id: newUserId,
+        group_id,
+        granted_by: caller.id,
+        expires_at: group_expiries?.[group_id] || null,
+      }))
+      const { error: groupGrantErr } = await adminClient.from('user_group_access').insert(groupGrants)
+      if (groupGrantErr) {
+        return json({ error: `User created but group grants failed: ${groupGrantErr.message}` }, 500)
       }
     }
 
