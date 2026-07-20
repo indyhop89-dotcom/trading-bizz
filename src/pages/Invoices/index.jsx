@@ -4,7 +4,7 @@ import { supabase } from '../../supabaseClient'
 import { fetchAllPages } from '../../utils/query'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
@@ -497,7 +497,8 @@ function InvoiceList() {
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no</code><br /><br />
             Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice. <code>invoice_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing invoices and other rows in this file). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
-          <FormRow label='Paste CSV'>
+          <FormRow label='Upload or Paste CSV'>
+            <CsvFileDrop onText={setCsvText} />
             <textarea value={csvText} onChange={e => setCsvText(e.target.value)} rows={10} placeholder='Paste CSV data here…'
               style={{ padding: '8px 11px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '12px', fontFamily: 'monospace', width: '100%', boxSizing: 'border-box', resize: 'vertical', outline: 'none' }} />
           </FormRow>
@@ -1055,7 +1056,8 @@ function NewInvoice() {
             correct the numbers in Excel/Sheets, then re-upload. <code>line_no</code> matches a row back to its existing product/line;
             leave <code>product</code> blank on a row to keep that line's current product. Extra columns (taxable_amount, etc.) are ignored — they're recomputed.
           </div>
-          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Paste CSV data here…'
+          <CsvFileDrop onText={setLinesCsvText} />
+          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Or paste CSV data here…'
             style={{ padding: '8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '11px', fontFamily: 'monospace', resize: 'vertical' }} />
           {linesCsvResult && (
             <div style={{ background: linesCsvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${linesCsvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
@@ -1712,7 +1714,8 @@ function InvoiceDetail() {
             leave <code>product</code> blank on a row to keep that line's current product. Extra columns (taxable_amount, etc.) are ignored — they're recomputed.
           </div>
           <Btn size='sm' variant='ghost' onClick={handleExportEditLines}>↓ Download Current Lines as Template</Btn>
-          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Paste CSV data here…'
+          <CsvFileDrop onText={setLinesCsvText} />
+          <textarea value={linesCsvText} onChange={e => setLinesCsvText(e.target.value)} rows={8} placeholder='Or paste CSV data here…'
             style={{ padding: '8px', border: `1px solid ${C.border}`, borderRadius: '6px', fontSize: '11px', fontFamily: 'monospace', resize: 'vertical' }} />
           {linesCsvResult && (
             <div style={{ background: linesCsvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${linesCsvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
