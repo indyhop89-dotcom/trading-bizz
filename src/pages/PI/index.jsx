@@ -150,6 +150,11 @@ function PIList() {
   const [prevPIs, setPrevPIs]             = useState([])
   const [copyPiId, setCopyPiId]           = useState('')
   const [copyMarginPct, setCopyMarginPct] = useState('5')
+  // CHANGED: records which PI this one's lines were copied from (any order),
+  // so Order Summary's margin calc can trace real cost across orders instead
+  // of assuming "previous leg of this same order" — see computeLegMargin in
+  // Orders/index.jsx and migration 038_pi_copy_provenance.
+  const [copiedFromPiId, setCopiedFromPiId] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -255,7 +260,7 @@ function PIList() {
     }
     // CHANGED: financial_year_id does NOT exist on the live proforma_invoices
     // table (confirmed via information_schema — only pi_no, no FK column at all).
-    const payload = { ...form, ...totals, pi_no: piNo }
+    const payload = { ...form, ...totals, pi_no: piNo, copied_from_pi_id: copiedFromPiId || null }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
     if (!payload.valid_upto)   delete payload.valid_upto
@@ -269,7 +274,7 @@ function PIList() {
     }
     setSaving(false)
     setToast({ message: 'PI created', type: 'success' })
-    setModalOpen(false); setPILines([]); setRoundOffOverride('')
+    setModalOpen(false); setPILines([]); setRoundOffOverride(''); setCopiedFromPiId('')
     navigate(`/pi/${pi.id}`)
   }
 
@@ -303,7 +308,7 @@ function PIList() {
       }
       return computeLine({_id:Date.now()+i,line_no:i+1,product_id:l.product_id||'',description:l.description||'',hsn_code:l.hsn_code||'',qty:l.qty,unit:l.unit||'Nos',rate:newRate,gst_rate:gstRate,_cost_rate:costRate,_margin_pct:String(pct),_hsn_resolved_rate:hsnRes,_hsn_source:hsnSrc,_hsn_override:false,_hsn_manually_set:false}, form.is_interstate)
     })
-    setPILines(newLines); setCopyModal(false)
+    setPILines(newLines); setCopyModal(false); setCopiedFromPiId(copyPiId)
     setToast({message:`${newLines.length} lines copied with ${pct}% margin. HSN re-evaluated.`,type:'success'})
   }
 
@@ -561,7 +566,7 @@ function PIList() {
           <div style={{ display: 'flex', gap: '8px' }}>
             <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
             <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
-            <Btn onClick={() => { setForm({ ...EMPTY_FORM, from_entity_id: defaultEntityId }); setPILines([]); setRoundOffOverride(''); setModalOpen(true) }}>+ New PI</Btn>
+            <Btn onClick={() => { setForm({ ...EMPTY_FORM, from_entity_id: defaultEntityId }); setPILines([]); setRoundOffOverride(''); setCopiedFromPiId(''); setModalOpen(true) }}>+ New PI</Btn>
           </div>
         }
       />

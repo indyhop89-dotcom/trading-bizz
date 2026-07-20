@@ -126,11 +126,19 @@ function getLegStatus(pi, po, inv) {
 // mid-flow and the entity's own original purchase was never recorded as an
 // invoice here. Every leg after that is priced off what the entity actually
 // paid to acquire the goods — the previous leg's Invoice value.
-function computeLegMargin(leg, legs, invMap, costBasisMap) {
+function computeLegMargin(leg, legs, invMap, costBasisMap, crossOrderCostMap) {
   const inv = invMap[leg.id]
   if (!inv?.taxable_amount) return null
   let cost
-  if (leg.leg_no === 1) {
+  // CHANGED: a leg whose PI was copied from another order's PI isn't a
+  // same-order continuation — its real cost is whatever that source leg
+  // actually invoiced at (see crossOrderCostMap above), not "previous leg
+  // of this order" or Opening Stock. A present-but-null entry means the
+  // source leg isn't invoiced yet, so margin is deliberately left unknown
+  // rather than falling back to an unrelated same-order figure.
+  if (crossOrderCostMap && leg.id in crossOrderCostMap) {
+    cost = crossOrderCostMap[leg.id]
+  } else if (leg.leg_no === 1) {
     cost = costBasisMap?.[leg.id]
   } else {
     const prevLeg = legs.find(l => l.leg_no === leg.leg_no - 1)
@@ -166,7 +174,7 @@ function DocLink({ doc, children }) {
   )
 }
 
-function OrderSummaryTable({ legs, piMap, poMap, invMap, docMap, costBasisMap }) {
+function OrderSummaryTable({ legs, piMap, poMap, invMap, docMap, costBasisMap, crossOrderCostMap }) {
   if (!legs.length) return null
   const en = e=>e?.short_name||e?.name||'—'
   const td = {padding:'8px 10px',borderBottom:`1px solid ${C.border}`}
@@ -194,7 +202,7 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, docMap, costBasisMap })
             const legDocs=docMap?.[leg.id]
             const payStatus=!inv?'—':inv.status==='paid'?'Paid':inv.status==='partial'?'Partial':inv.outstanding_amount>0?'Outstanding':'—'
             const payColor=payStatus==='Paid'?C.success:payStatus==='Partial'?C.warning:payStatus==='Outstanding'?C.danger:C.textMuted
-            const margin=computeLegMargin(leg,legs,invMap,costBasisMap)
+            const margin=computeLegMargin(leg,legs,invMap,costBasisMap,crossOrderCostMap)
             const status=getLegStatus(pi,po,inv)
             return (
               <tr key={leg.id} style={{background:ri%2===0?C.surface:'#faf6ed'}}>
@@ -471,6 +479,12 @@ function OrderDetail() {
   const [invMap, setInvMap]     = useState({})
   const [docMap, setDocMap]     = useState({})
   const [costBasisMap, setCostBasisMap] = useState({}) // CHANGED: leg-1's real acquisition cost, keyed by leg id — see computeLegMargin
+  // CHANGED: for a leg whose PI was built via "Copy Lines from Another PI"
+  // (any order), the real cost isn't "previous leg of this order" — it's
+  // wherever the copy actually came from. Keyed by leg id; a key present
+  // (even with a null value, meaning the source leg isn't invoiced yet)
+  // means computeLegMargin should use this instead of the same-order chain.
+  const [crossOrderCostMap, setCrossOrderCostMap] = useState({})
   const [docsOpen, setDocsOpen] = useState({})
   const [legDocBusy, setLegDocBusy] = useState('') // `${legId}:${docType}:${format}` while generating
   // CHANGED: order-wide document completeness — sums each leg's checklist
@@ -492,7 +506,7 @@ function OrderDetail() {
         // invoices reference a leg via `order_leg_id` (see PI/Invoices save
         // payloads) — `leg_id` doesn't exist on these two tables, so both
         // queries errored and this map silently stayed empty for every leg.
-        supabase.from('proforma_invoices').select('id,pi_no,status,total_amount,total_qty,taxable_amount,order_leg_id,pi_date').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+        supabase.from('proforma_invoices').select('id,pi_no,status,total_amount,total_qty,taxable_amount,order_leg_id,pi_date,copied_from_pi_id').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
         // CHANGED: PO feeds the cascading leg Status column (PI → PO → Invoice → Movement)
         supabase.from('purchase_orders').select('id,po_no,status,order_leg_id').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
         supabase.from('invoices').select('id,invoice_no,status,total_amount,total_qty,taxable_amount,outstanding_amount,order_leg_id,invoice_date,eway_bill_no,invoice_type').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
@@ -505,6 +519,30 @@ function OrderDetail() {
       for (const po of (poRows||[])){ if(!poM[po.order_leg_id]) poM[po.order_leg_id]=po }
       for (const inv of (invRows||[])){ if(!iMap[inv.order_leg_id]) iMap[inv.order_leg_id]=inv }
       setPiMap(pMap); setPoMap(poM); setInvMap(iMap)
+
+      // CHANGED: resolve cross-order cost for legs whose PI has
+      // copied_from_pi_id set — see crossOrderCostMap above. Only one hop
+      // (the immediate source), not a full chain walk.
+      const copiedEntries = Object.entries(pMap).filter(([, pi]) => pi.copied_from_pi_id)
+      const coMap = {}
+      if (copiedEntries.length) {
+        const sourcePiIds = [...new Set(copiedEntries.map(([, pi]) => pi.copied_from_pi_id))]
+        const { data: sourcePis } = await supabase.from('proforma_invoices').select('id,order_leg_id').in('id', sourcePiIds)
+        const sourceLegBySourcePi = {}
+        for (const sp of (sourcePis||[])) sourceLegBySourcePi[sp.id] = sp.order_leg_id
+        const sourceLegIds = [...new Set(Object.values(sourceLegBySourcePi).filter(Boolean))]
+        let sourceInvByLeg = {}
+        if (sourceLegIds.length) {
+          const { data: sourceInvs } = await supabase.from('invoices').select('order_leg_id,taxable_amount').in('order_leg_id', sourceLegIds).eq('is_deleted', false).order('created_at',{ascending:false})
+          for (const inv of (sourceInvs||[])) if (!(inv.order_leg_id in sourceInvByLeg)) sourceInvByLeg[inv.order_leg_id] = inv.taxable_amount
+        }
+        for (const [legId, pi] of copiedEntries) {
+          const sourceLegId = sourceLegBySourcePi[pi.copied_from_pi_id]
+          coMap[legId] = sourceLegId ? (sourceInvByLeg[sourceLegId] ?? null) : null
+        }
+      }
+      setCrossOrderCostMap(coMap)
+
       const dMap={}
       for (const c of (checklistRows||[])){
         if (c.status==='uploaded' && c.document){
@@ -610,7 +648,10 @@ function OrderDetail() {
   const leg1 = legs.find(l=>l.leg_no===1)
   const lastLeg = legs.reduce((max,l)=>!max||l.leg_no>max.leg_no?l:max,null)
   const lastInv = lastLeg ? invMap[lastLeg.id] : null
-  const leg1Cost = leg1 ? costBasisMap[leg1.id] : null
+  // CHANGED: same cross-order override as computeLegMargin — if leg 1's own
+  // PI was copied from another order's PI, Opening Stock isn't the right
+  // cost basis either.
+  const leg1Cost = leg1 ? (leg1.id in crossOrderCostMap ? crossOrderCostMap[leg1.id] : costBasisMap[leg1.id]) : null
   const bm = (lastInv?.taxable_amount>0 && leg1Cost>0) ? ((lastInv.taxable_amount-leg1Cost)/leg1Cost*100) : null
 
   return (
@@ -643,7 +684,7 @@ function OrderDetail() {
             <span style={{fontSize:'11px',color:C.textMuted}}>Live — updates as PIs and Invoices are created</span>
           </div>
           <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px',overflow:'hidden'}}>
-            <OrderSummaryTable legs={legs} piMap={piMap} poMap={poMap} invMap={invMap} docMap={docMap} costBasisMap={costBasisMap}/>
+            <OrderSummaryTable legs={legs} piMap={piMap} poMap={poMap} invMap={invMap} docMap={docMap} costBasisMap={costBasisMap} crossOrderCostMap={crossOrderCostMap}/>
           </div>
         </div>
       )}
@@ -668,7 +709,7 @@ function OrderDetail() {
         ? <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px'}}><EmptyState icon='↗' title='No legs yet' message='Add the first leg to this order.' action={<Btn onClick={openNewLeg}>+ Add Leg</Btn>}/></div>
         : legs.map(leg=>{
           const pi=piMap[leg.id], po=poMap[leg.id], inv=invMap[leg.id]
-          const legM=computeLegMargin(leg,legs,invMap,costBasisMap)
+          const legM=computeLegMargin(leg,legs,invMap,costBasisMap,crossOrderCostMap)
           const docBtn=(docType,docRow,label)=>{
             const docId=docRow?.id
             return (

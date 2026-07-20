@@ -1,9 +1,14 @@
+import { round2 } from './money'
+
 // Margin is always markup on cost price
 // Sell Price = Cost × (1 + margin% / 100)
 
 // Calculate sell rate from cost and margin
+// CHANGED: was Math.round() — whole-rupee rounding — but every rate in this
+// app is a rupee amount with 2 decimal places (see round2 in money.js), so a
+// margin-applied rate was silently losing its paise on every copy/apply.
 export function calcSellRate(costPaise, marginPct) {
-  return Math.round(Number(costPaise) * (1 + Number(marginPct) / 100))
+  return round2(Number(costPaise) * (1 + Number(marginPct) / 100))
 }
 
 // Calculate margin % from cost and sell rate

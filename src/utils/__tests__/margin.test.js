@@ -22,14 +22,19 @@ describe('calcSellRate', () => {
     expect(calcSellRate(500, 100)).toBe(1000)
   })
 
-  it('rounds fractional result to whole rupee', () => {
+  it('handles a fractional result that lands on a clean rupee', () => {
     // 1000 * 1.15 = 1150 — clean
     expect(calcSellRate(1000, 15)).toBe(1150)
   })
 
-  it('rounds when result has fraction', () => {
-    // 3 * 1.1 = 3.3 → rounds to 3
-    expect(calcSellRate(3, 10)).toBe(3)
+  it('rounds to 2 decimal places, not the nearest whole rupee', () => {
+    // 3 * 1.1 = 3.3 — kept, not rounded down to 3
+    expect(calcSellRate(3, 10)).toBe(3.3)
+  })
+
+  it('rounds a longer fraction to 2 decimal places', () => {
+    // 1128.53 * 1.1 = 1241.383 → 1241.38
+    expect(calcSellRate(1128.53, 10)).toBe(1241.38)
   })
 
   it('handles string inputs via Number coercion', () => {
