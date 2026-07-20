@@ -28,12 +28,14 @@
  *
  * This module owns the "vananam" template family only. A theme with a
  * different `family` (see entityDocumentThemes.js) — e.g. SRPL's, a
- * genuinely different layout transcribed from real reference PDFs, or
- * Kirti's, a monochrome Tally-ERP-style layout ported from a standalone
- * HTML generator tool — is dispatched to its own module
- * (srplDocumentTemplate.js / kirtiDocumentTemplate.js) by the exported
- * buildDocumentHTML/getDocumentStyles/printDocument below, so every calling
- * page (PI/PO/Invoices/Orders) can keep importing these same three names
+ * genuinely different layout transcribed from real reference PDFs, Kirti's,
+ * a monochrome Tally-ERP-style layout ported from a standalone HTML
+ * generator tool, or Kamakhya's, a bordered Zoho-style layout ported from
+ * its own standalone HTML generator tool — is dispatched to its own module
+ * (srplDocumentTemplate.js / kirtiDocumentTemplate.js /
+ * kamakhyaDocumentTemplate.js) by the exported buildDocumentHTML/
+ * getDocumentStyles/printDocument below, so every calling page
+ * (PI/PO/Invoices/Orders) can keep importing these same three names
  * regardless of which entity's document is being built.
  */
 import { fmtDate } from './dates'
@@ -41,6 +43,7 @@ import { esc, fmtN, fmtInt, numWords, addressLines, paginateLines } from './docu
 import { resolveEntityTheme } from './entityDocumentThemes'
 import { buildSRPLDocumentHTML, getSRPLDocumentStyles } from './srplDocumentTemplate'
 import { buildKirtiDocumentHTML, getKirtiDocumentStyles } from './kirtiDocumentTemplate'
+import { buildKamakhyaDocumentHTML, getKamakhyaDocumentStyles } from './kamakhyaDocumentTemplate'
 
 // Columns needed from `entities` to render a document header/address block —
 // shared by every page that builds a doc for printDocument/downloadDocumentExcel.
@@ -426,12 +429,14 @@ export function buildDocumentHTML(doc) {
   const theme = resolveThemeOrThrow(doc.sellerEntity)
   if (theme.family === 'srpl') return buildSRPLDocumentHTML(doc)
   if (theme.family === 'tally') return buildKirtiDocumentHTML(doc)
+  if (theme.family === 'kamakhya') return buildKamakhyaDocumentHTML(doc)
   return buildVananamHTML(doc, theme)
 }
 
 export function getDocumentStyles(theme) {
   if (theme.family === 'srpl') return getSRPLDocumentStyles(theme)
   if (theme.family === 'tally') return getKirtiDocumentStyles(theme)
+  if (theme.family === 'kamakhya') return getKamakhyaDocumentStyles(theme)
   return getVananamStyles(theme)
 }
 

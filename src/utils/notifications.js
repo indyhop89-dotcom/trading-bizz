@@ -146,18 +146,21 @@ export async function generateNotifications(userId) {
     })
   }
 
-  // CHANGED: invoice_type='purchase' rows are the auto-created buyer-side
-  // bookkeeping mirror of a 'sales' invoice — same physical movement, so
-  // excluded here to avoid a duplicate/confusing second alert.
+  // CHANGED: invoice_type='purchase' rows WITH a source_invoice_id are the
+  // auto-created buyer-side bookkeeping mirror of a 'sales' invoice — same
+  // physical movement, so excluded here to avoid a duplicate/confusing
+  // second alert. A purchase invoice with no source_invoice_id was entered
+  // manually and is the only record of that transaction — it still needs
+  // this check (see stock.js buildActualStockMap for the same distinction).
   const { data: invLinesForNotif } = await supabase
     .from('invoice_lines')
-    .select('qty, product_id, invoice:invoice_id(id, invoice_no, seller_entity_id, status, invoice_type)')
+    .select('qty, product_id, invoice:invoice_id(id, invoice_no, seller_entity_id, status, invoice_type, source_invoice_id)')
     .not('invoice', 'is', null)
     .neq('invoice.status', 'cancelled')
 
   const invExceedGroups = new Map()
   for (const l of (invLinesForNotif || [])) {
-    if (!l.invoice || l.invoice.invoice_type === 'purchase' || !l.product_id) continue
+    if (!l.invoice || (l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id) || !l.product_id) continue
     if ((Number(l.qty) || 0) <= availableFor(l.invoice.seller_entity_id, l.product_id)) continue
     const g = invExceedGroups.get(l.invoice.id) || { invoice_no: l.invoice.invoice_no, entity_id: l.invoice.seller_entity_id, count: 0 }
     g.count++

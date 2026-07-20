@@ -4,7 +4,7 @@ import { supabase } from '../../supabaseClient'
 import { fetchAllPages } from '../../utils/query'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop, MultiSelectDropdown,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
@@ -164,7 +164,7 @@ function InvoiceList() {
   const [products, setProducts] = useState([])
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
-  const [statusFilter, setStatus] = useState('all')
+  const [statusFilter, setStatus] = useState([])
   const [typeFilter, setType]   = useState('all')
   const [entityFilter, setEntityF] = useState('')
   const [orderFilter, setOrderF] = useState('')
@@ -376,7 +376,7 @@ function InvoiceList() {
     const ms  = !search || (i.invoice_no || '').toLowerCase().includes(search.toLowerCase()) ||
       i.seller?.name?.toLowerCase().includes(search.toLowerCase()) ||
       i.buyer?.name?.toLowerCase().includes(search.toLowerCase())
-    const mst = statusFilter === 'all' || i.status === statusFilter
+    const mst = statusFilter.length === 0 || statusFilter.includes(i.status)
     const mt  = typeFilter === 'all' || i.invoice_type === typeFilter
     const me  = !entityFilter || i.seller_entity_id === entityFilter || i.buyer_entity_id === entityFilter
     const mo  = !orderFilter || i.order_id === orderFilter
@@ -475,11 +475,7 @@ function InvoiceList() {
           <option value='sales'>Sales</option>
           <option value='purchase'>Purchase</option>
         </select>
-        <select value={statusFilter} onChange={e => setStatus(e.target.value)}
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All statuses</option>
-          {INV_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <MultiSelectDropdown options={INV_STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
         <select value={entityFilter} onChange={e => setEntityF(e.target.value)}
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All entities</option>

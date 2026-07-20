@@ -4,7 +4,7 @@ import { supabase } from '../../supabaseClient'
 import { fetchAllPages } from '../../utils/query'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop, MultiSelectDropdown,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
@@ -115,7 +115,7 @@ function POList() {
   const [hsnMap, setHsnMap] = useState(new Map())
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
-  const [statusFilter, setStatus] = useState('all')
+  const [statusFilter, setStatus] = useState([])
   const [entityFilter, setEntityF] = useState('')
   const [orderFilter, setOrderF] = useState('')
   const [modalOpen, setModalOpen] = useState(false)
@@ -512,7 +512,7 @@ function POList() {
     const ms  = !search || (p.po_no || '').toLowerCase().includes(search.toLowerCase()) ||
       p.buyer?.name?.toLowerCase().includes(search.toLowerCase()) ||
       p.seller?.name?.toLowerCase().includes(search.toLowerCase())
-    const mst = statusFilter === 'all' || p.status === statusFilter
+    const mst = statusFilter.length === 0 || statusFilter.includes(p.status)
     const me  = !entityFilter || p.buyer_entity_id === entityFilter || p.seller_entity_id === entityFilter
     const mo  = !orderFilter || p.order_id === orderFilter
     return ms && mst && mdf && mdt && me && mo
@@ -575,11 +575,7 @@ function POList() {
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search PO no, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
-        <select value={statusFilter} onChange={e => setStatus(e.target.value)}
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All statuses</option>
-          {PO_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <MultiSelectDropdown options={PO_STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
         <select value={entityFilter} onChange={e => setEntityF(e.target.value)}
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All entities</option>

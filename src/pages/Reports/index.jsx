@@ -856,13 +856,17 @@ function StockMovementReport({ entities }) {
     setLoading(true)
     const [{ data: invLines }, { data: products }] = await Promise.all([
       fetchAllPages(() => supabase.from('invoice_lines')
-        .select('qty, product_id, invoice:invoice_id(invoice_no, eway_bill_no, eway_bill_date, status, invoice_type, seller_entity_id, buyer_entity_id, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name))')
+        .select('qty, product_id, invoice:invoice_id(invoice_no, eway_bill_no, eway_bill_date, status, invoice_type, seller_entity_id, buyer_entity_id, source_invoice_id, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name))')
         .not('invoice', 'is', null)),
       fetchAllPages(() => supabase.from('products').select('id,name')),
     ])
     const productById = Object.fromEntries((products || []).map(p => [p.id, p]))
+    // CHANGED: only the auto-generated buyer-side mirror (source_invoice_id
+    // set) is excluded to avoid showing the same movement twice — a manual
+    // purchase invoice (no source_invoice_id) is the only record of that
+    // movement and must still appear (see stock.js for the same rule).
     const result = (invLines || [])
-      .filter(l => l.invoice && l.invoice.status !== 'cancelled' && l.invoice.status !== 'draft' && l.invoice.eway_bill_no && l.invoice.invoice_type !== 'purchase')
+      .filter(l => l.invoice && l.invoice.status !== 'cancelled' && l.invoice.status !== 'draft' && l.invoice.eway_bill_no && !(l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id))
       .map(l => ({
         eway_bill_no: l.invoice.eway_bill_no, eway_bill_date: l.invoice.eway_bill_date, invoice_no: l.invoice.invoice_no,
         product: productById[l.product_id]?.name || (l.product_id ? '—' : '⚠ No product'),

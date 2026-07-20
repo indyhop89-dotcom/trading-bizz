@@ -668,6 +668,12 @@ function StockAdjustments() {
   // product) and rows are plain inserts, not upserts — each row is a distinct
   // correction event, so re-uploading the same file intentionally creates
   // duplicate adjustment rows rather than overwriting a prior one.
+  // CHANGED: optional `product_id` column — name alone isn't a safe key once
+  // duplicate-named products exist at different rates (Stock > Adjustments >
+  // Merge Duplicates), since a plain name lookup can silently match the wrong
+  // one of several same-named products. If a row supplies product_id, it's
+  // used directly (validated against the loaded product list) instead of the
+  // name search; the product column is still required for readability/audit.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -675,6 +681,7 @@ function StockAdjustments() {
     const delim = detectDelimiter(lines[0])
     const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
     const validReasons = ADJUSTMENT_REASONS.map(r => r.value)
+    const productsById = new Map(products.map(p => [p.id, p]))
     const payloads = []
     const errors = []
     for (let i = 1; i < lines.length; i++) {
@@ -683,7 +690,10 @@ function StockAdjustments() {
       header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
       const rowNum = i + 1
       const entity = entities.find(e => e.short_name?.toLowerCase() === row.entity?.toLowerCase() || e.name?.toLowerCase() === row.entity?.toLowerCase())
-      const product = products.find(p => p.name?.toLowerCase() === row.product?.toLowerCase())
+      const product = row.product_id
+        ? productsById.get(row.product_id)
+        : products.find(p => p.name?.toLowerCase() === row.product?.toLowerCase())
+      if (row.product_id && !product) { errors.push(`Row ${rowNum}: product_id "${row.product_id}" not found`); continue }
       const qty = toNum(row.qty)
       const reason = (row.reason || '').toLowerCase()
       if (!entity)  { errors.push(`Row ${rowNum}: entity "${row.entity}" not found or not accessible to you`); continue }
@@ -1092,13 +1102,22 @@ function StockPosition() {
     setDataIssues({ unresolvedLines, unresolvedQty })
 
     // Compute planned qty (PI-based, unchanged) and actual qty (invoice-based)
+    // CHANGED: carry the actual_qty breakdown (invoiced_in/out, adjustments)
+    // through too, not just the final number — "Billed Beyond Stock" alone
+    // gives no way to tell WHY a row went negative (real oversell vs. a
+    // stock-movement source this app isn't counting), so the Actual Stock
+    // column below shows the components for any row that's negative.
     const rows = Object.values(map).map(r => {
-      const key        = `${r.entity_id}__${r.product_id}`
-      const actual_qty = actualMap[key] ? actualMap[key].actual_qty : r.opening_qty
+      const key = `${r.entity_id}__${r.product_id}`
+      const am  = actualMap[key]
+      const actual_qty = am ? am.actual_qty : r.opening_qty
       return {
         ...r,
         planned_qty: r.opening_qty + r.incoming - r.outgoing,
         actual_qty,
+        actual_invoiced_in:  am ? am.invoiced_in  : 0,
+        actual_invoiced_out: am ? am.invoiced_out : 0,
+        actual_adjustment:   am ? am.adjustment_qty : 0,
         billed_beyond_stock: actual_qty < 0,
       }
     })
@@ -1188,10 +1207,23 @@ function StockPosition() {
     // CHANGED: Actual Stock is now the headline number — real, invoice-based
     // stock the entity actually holds right now (opening + all invoiced in −
     // all invoiced out, all-time). Placed right after Unit so it reads first.
+    // CHANGED: negative rows show the breakdown that produced the number
+    // (opening + invoiced-in − invoiced-out ± adjustments) right underneath
+    // — "Billed Beyond Stock" alone gave no way to tell whether this is a
+    // real oversell or a stock movement this app isn't counting (e.g. a
+    // purchase recorded through a source this page doesn't see).
     { label: 'Actual Stock', right: true, render: r => (
-      <span style={{ fontWeight: 800, fontSize: '14px', color: r.actual_qty < 0 ? C.danger : C.text }}>
-        {Number(r.actual_qty).toLocaleString('en-IN')}
-      </span>
+      <div>
+        <span style={{ fontWeight: 800, fontSize: '14px', color: r.actual_qty < 0 ? C.danger : C.text }}>
+          {Number(r.actual_qty).toLocaleString('en-IN')}
+        </span>
+        {r.actual_qty < 0 && (
+          <div style={{ fontSize: '10px', color: C.textMuted, whiteSpace: 'nowrap', marginTop: '2px' }}>
+            Open {Number(r.opening_qty).toLocaleString('en-IN')} + In {Number(r.actual_invoiced_in).toLocaleString('en-IN')} − Out {Number(r.actual_invoiced_out).toLocaleString('en-IN')}
+            {r.actual_adjustment !== 0 ? ` ${r.actual_adjustment > 0 ? '+' : '−'} Adj ${Math.abs(r.actual_adjustment).toLocaleString('en-IN')}` : ''}
+          </div>
+        )}
+      </div>
     )},
     { label: 'Opening',  right: true, render: r => <span style={{ color: C.textMuted }}>{Number(r.opening_qty).toLocaleString('en-IN')}</span> },
     { label: '+ Incoming PI', right: true, render: r => <span style={{ color: C.success }}>+{Number(r.incoming).toLocaleString('en-IN')}</span> },

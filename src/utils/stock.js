@@ -18,7 +18,7 @@ export async function fetchStockMovementData() {
   const [{ data: opening }, { data: invLines }, { data: adjustments }] = await Promise.all([
     fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_id, qty')),
     fetchAllPages(() => supabase.from('invoice_lines')
-      .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, invoice_type, is_deleted)')
+      .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, invoice_type, is_deleted, source_invoice_id)')
       .not('invoice', 'is', null)),
     // CHANGED: manual corrections (shortfall/damage/found/recount/offloaded)
     // — a signed qty_delta applied straight into actual_qty, same as
@@ -43,17 +43,22 @@ export async function fetchStockMovementData() {
     // step needed. If the same trade is redone as a fresh invoice later,
     // it's evaluated independently and follows the same rule from scratch.
     //
-    // invoice_type='purchase' rows are excluded here: those are auto-created
+    // invoice_type='purchase' rows with a source_invoice_id are auto-created
     // bookkeeping mirrors of a 'sales' invoice for the buyer's own purchase
     // register (see Invoices auto-complete-on-E-way-Bill flow) and represent
-    // the exact same physical movement, not a second one. Counting them too
-    // would double the qty on both sides.
+    // the exact same physical movement, not a second one — excluded here to
+    // avoid double-counting. A purchase invoice with NO source_invoice_id was
+    // entered manually (e.g. no matching sales invoice was ever raised on the
+    // seller's side) and is the only record of that movement anywhere in the
+    // system — it must still count, or the buyer's incoming stock silently
+    // never gets recorded and their actual stock understates what they
+    // really have on hand (surfacing later as a false "Billed beyond stock").
     invLines: (invLines || []).filter(l =>
       l.invoice &&
       !l.invoice.is_deleted &&
       !MOVEMENT_STATUSES_EXCLUDED.includes(l.invoice.status) &&
       !!l.invoice.eway_bill_no &&
-      l.invoice.invoice_type !== 'purchase'
+      !(l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id)
     ),
   }
 }

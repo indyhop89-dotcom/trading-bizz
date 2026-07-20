@@ -365,6 +365,71 @@ export function Select({ value, onChange, children, disabled, style: extra }) {
   )
 }
 
+// ─── MultiSelectDropdown ────────────────────────────────────────────────────
+// Checkbox-list dropdown for filter bars where more than one value (e.g.
+// status) needs to be selected at once — a plain <select> can only ever hold
+// one. `options` is an array of strings or {value,label} objects; `selected`
+// is an array of the chosen values.
+export function MultiSelectDropdown({ options, selected, onChange, placeholder = 'All', style: extra }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    function onDocClick(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [open])
+
+  function norm(opt) { return typeof opt === 'string' ? { value: opt, label: opt } : opt }
+  function toggle(value) {
+    const next = new Set(selected)
+    next.has(value) ? next.delete(value) : next.add(value)
+    onChange([...next])
+  }
+
+  const label = selected.length === 0 ? placeholder
+    : selected.length === 1 ? norm(options.find(o => norm(o).value === selected[0]) || selected[0]).label
+    : `${selected.length} selected`
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button type='button' onClick={() => setOpen(o => !o)} style={{
+        padding: '7px 12px', border: `1.5px solid var(--border)`, borderRadius: 'var(--radius)',
+        background: 'var(--surface)', fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit',
+        display: 'flex', alignItems: 'center', gap: '8px', color: selected.length ? 'var(--text)' : 'var(--text-muted)',
+        textTransform: 'capitalize', whiteSpace: 'nowrap', ...extra,
+      }}>
+        {label}
+        <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>▾</span>
+      </button>
+      {open && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 4px)', left: 0, zIndex: 20,
+          background: 'var(--surface)', border: `1.5px solid var(--border)`, borderRadius: 'var(--radius)',
+          boxShadow: '0 4px 16px rgba(0,0,0,0.14)', minWidth: '180px', padding: '6px', maxHeight: '280px', overflowY: 'auto',
+        }}>
+          {selected.length > 0 && (
+            <div onClick={() => onChange([])}
+              style={{ padding: '6px 8px', fontSize: '12px', color: 'var(--accent)', cursor: 'pointer', borderBottom: `1px solid var(--border)`, marginBottom: '4px' }}>
+              Clear all
+            </div>
+          )}
+          {options.map(opt => {
+            const { value, label } = norm(opt)
+            return (
+              <label key={value} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px', fontSize: '13px', cursor: 'pointer', borderRadius: '4px', textTransform: 'capitalize' }}>
+                <input type='checkbox' checked={selected.includes(value)} onChange={() => toggle(value)} />
+                {label}
+              </label>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ─── Textarea ─────────────────────────────────────────────────────────────────
 export function Textarea({ value, onChange, placeholder, rows = 3, disabled }) {
   return (

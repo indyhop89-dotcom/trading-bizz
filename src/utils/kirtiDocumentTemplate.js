@@ -25,8 +25,179 @@
  *    at the true bottom of the page, exactly like Tally's own renderer.
  */
 import { fmtDate } from './dates'
-import { esc, fmtN, numWords, paginateLines } from './documentHelpers'
+import { esc, fmtN, numWords } from './documentHelpers'
 import { GST_STATES } from '../constants/states'
+
+// Pagination: documentHelpers.js's paginateLines() defaults (12 rows first
+// page, 18 rows after) are tuned for the vananam family's roomier layout —
+// using them here left each page of this dense, small-font Tally-style
+// table barely a third full before forcing a break (a real multi-hundred-
+// line PI was landing 50+ pages, almost all blank space). This template
+// gets its own height-based packer instead, same approach as
+// srplDocumentTemplate.js's paginateSRPLLines: estimate each row's real
+// rendered height (via canvas.measureText, so word-wrap is measured, not
+// guessed from character count) and greedily fill each page to what it
+// actually holds.
+//
+// Fixed overhead, verified against the live-rendered page rather than pure
+// CSS arithmetic (real browser layout — grid row min-heights, border-box
+// rounding, font metrics — measured noticeably taller than the naive box
+// model: real title+top+table-head ran to 85mm, not the 76mm the CSS
+// values alone suggested, and every non-final page rendered 8-10mm taller
+// than intended as a result). Values below include a small safety margin
+// on top of those live measurements — this repeats identically on every
+// page (unlike some other families, this template always re-renders the
+// full company/party/meta header on continuation pages too, matching
+// Tally's own voucher printout).
+const TALLY_PAGE_MM = 297
+const TALLY_HEADER_MM = 86
+const TALLY_CONTINUED_RESERVE_MM = 16 // "Continued on next page" row plus rounding/line-height slack — measured 11-16mm in practice, well past the CSS's nominal 1.8mm
+const TALLY_DESC_COLUMN_WIDTH_MM = 190 * 0.55 - 1.3 // desc column is 55% of the 190mm table, minus .65mm cell padding each side
+const TALLY_ROW_PADDING_MM = 2.2      // 1.5mm top + .7mm bottom cell padding
+const TALLY_ROW_LINE_HEIGHT_MM = 4.0  // 8.4pt font * 1.35 line-height
+const TALLY_SUB_LINE_RESERVE_MM = 0.2 // .tally-desc-sub margin-top
+const MM_PER_PX = 25.4 / 96
+
+let _tallyMeasureCtx = null
+function measureTallyTextWidthPx(text) {
+  if (typeof document === 'undefined') return String(text).length * 5.5 // non-browser fallback, shouldn't normally be hit
+  if (!_tallyMeasureCtx) _tallyMeasureCtx = document.createElement('canvas').getContext('2d')
+  _tallyMeasureCtx.font = '11.2px Arial' // 8.4pt at 96dpi
+  return _tallyMeasureCtx.measureText(text).width
+}
+
+function countTallyWrappedLines(text, maxWidthPx) {
+  const words = String(text || '').split(/\s+/).filter(Boolean)
+  if (!words.length) return 1
+  let lines = 1
+  let lineWidthPx = 0
+  const spaceWidthPx = measureTallyTextWidthPx(' ')
+  for (const word of words) {
+    const wordWidthPx = measureTallyTextWidthPx(word)
+    const candidateWidthPx = lineWidthPx === 0 ? wordWidthPx : lineWidthPx + spaceWidthPx + wordWidthPx
+    if (candidateWidthPx > maxWidthPx && lineWidthPx > 0) { lines++; lineWidthPx = wordWidthPx }
+    else lineWidthPx = candidateWidthPx
+  }
+  return lines
+}
+
+// Same main/sub description split rowHTML() uses below (kept as one shared
+// helper so pagination measures exactly what actually gets rendered).
+function splitTallyDescription(description) {
+  const parts = String(description || '').split(/\n|\s+-\s+/)
+  const main = parts.shift() || ''
+  return { main, sub: parts.join(' - ') }
+}
+
+function estimateTallyRowHeightMm(description) {
+  const { main, sub } = splitTallyDescription(description)
+  const maxWidthPx = TALLY_DESC_COLUMN_WIDTH_MM / MM_PER_PX
+  let h = TALLY_ROW_PADDING_MM + countTallyWrappedLines(main, maxWidthPx) * TALLY_ROW_LINE_HEIGHT_MM
+  if (sub) h += TALLY_SUB_LINE_RESERVE_MM + countTallyWrappedLines(sub, maxWidthPx) * TALLY_ROW_LINE_HEIGHT_MM
+  return h
+}
+
+// Height (mm) the in-table footer rows (gap + subtotal + per-rate tax lines
+// + round-off + grand-total row) take, excluding the spacer row itself —
+// the spacer is what absorbs whatever's left, not a fixed cost. Includes a
+// small safety margin per row (live-measured slightly taller than the CSS
+// box model alone suggested, same rounding/line-height slack as
+// TALLY_CONTINUED_RESERVE_MM above).
+function withinTableFooterMm(taxLineCount) {
+  return 3 + 5 + taxLineCount * 5 + 5 + 6
+}
+
+// Fixed content below the items table on the true last page: the "Amount
+// Chargeable (in words)" box (~8mm) + PAN/declaration/bank/signature block
+// (23.5mm, fixed height) + "Computer Generated" footer line (~3mm) = ~34.5mm
+// baseline, plus a safety margin, plus the GST computation table (grows
+// with distinct HSN count) and the optional dispatch-info / entity Terms &
+// Conditions blocks — same class of estimate as
+// srplDocumentTemplate.js's estimateSRPLFooterReserveMm.
+function estimateTallyFooterReserveMm(lines, dispatchInfo, termsText) {
+  const base = 44
+  const distinctHSNCount = new Set(lines.map(l => l.hsn_code || '—')).size
+  const gstCompMm = 5.5 + (distinctHSNCount + 1) * 3.2 + 5.5
+  const dispatchCount = dispatchInfo ? Object.values(dispatchInfo).filter(Boolean).length : 0
+  const dispatchMm = dispatchCount ? 2 + Math.ceil(dispatchCount / 2) * 4 : 0
+  const termsLines = termsText ? Math.max(1, Math.ceil(String(termsText).length / 100)) : 0
+  const termsMm = termsText ? 2 + termsLines * 3.8 : 0
+  return base + gstCompMm + dispatchMm + termsMm
+}
+
+// Determines the true last page FIRST, working backward from the end, then
+// fills everything before it forward against the larger regularBudget.
+//
+// An earlier version tried "greedily fill every page to regularBudget, then
+// shrink whatever page lands last to fit the footer" — real failure mode:
+// whenever the natural remainder happened to land close to a FULL
+// regularBudget page, shrinking it peeled a big chunk into a new trailing
+// page, leaving the second-to-last page badly under-filled (large blank
+// gap). A follow-up lookahead version ("does everything remaining fit on
+// one last page? if not, fill this page to regularBudget and keep going")
+// still had the same hole: if that regularBudget fill happened to consume
+// every remaining line, the resulting page became the true last page
+// without ever being checked against the smaller lastBudget — verified
+// live in the browser to silently overflow a page by ~90mm (footer content
+// pushed well past the physical page onto what would print as a second
+// sheet). Building the last page from the end backward guarantees it is
+// always sized against lastBudget, full stop.
+function paginateTallyLines(lines, footerReserveMm) {
+  const regularBudget = TALLY_PAGE_MM - TALLY_HEADER_MM - TALLY_CONTINUED_RESERVE_MM
+  const lastBudget = TALLY_PAGE_MM - TALLY_HEADER_MM - footerReserveMm
+
+  if (!lines.length) return [[]]
+
+  const heights = lines.map(l => estimateTallyRowHeightMm(l.description))
+
+  // Largest trailing run of lines whose total height fits within
+  // lastBudget — always at least 1 line, even if that one row alone
+  // exceeds lastBudget (can't show zero lines on the last page).
+  let lastPageStart = lines.length - 1
+  let lastHeight = heights[lastPageStart]
+  while (lastPageStart > 0 && lastHeight + heights[lastPageStart - 1] <= lastBudget) {
+    lastPageStart--
+    lastHeight += heights[lastPageStart]
+  }
+
+  // Everything before the last page is spread across BALANCED boundaries,
+  // not greedily packed to regularBudget one page at a time — greedy
+  // packing (even against a slightly lower shared cap) still dumps
+  // whatever's left over onto the final regular page right before the true
+  // last page, and that leftover can land anywhere from "nearly full" down
+  // to "just a couple of rows on an otherwise blank page" purely by how the
+  // running total happened to divide against the cap. Instead: figure out
+  // the minimum number of regular pages this content needs, then place
+  // each page boundary at the cumulative-height point closest to its even
+  // share (1/N, 2/N, ... of the total) — every regular page ends up close
+  // to the same height instead of one arbitrarily short one.
+  const pages = []
+  // Nothing precedes the last page at all (a short document that fits
+  // entirely within lastBudget on its own) — skip the balancing below
+  // entirely, or it would still emit an empty leading page.
+  if (lastPageStart > 0) {
+    const totalHeightBeforeLast = heights.slice(0, lastPageStart).reduce((s, h) => s + h, 0)
+    const numRegularPages = Math.max(1, Math.ceil(totalHeightBeforeLast / regularBudget))
+    const targetPerPage = totalHeightBeforeLast / numRegularPages
+
+    const cumulative = new Array(lastPageStart + 1).fill(0)
+    for (let k = 0; k < lastPageStart; k++) cumulative[k + 1] = cumulative[k] + heights[k]
+
+    let start = 0
+    for (let pageNum = 1; pageNum < numRegularPages; pageNum++) {
+      const targetCumulative = pageNum * targetPerPage
+      let end = start
+      while (end < lastPageStart && cumulative[end + 1] <= targetCumulative) end++
+      end = Math.max(end, start + 1) // always at least 1 row per page
+      pages.push(lines.slice(start, end))
+      start = end
+    }
+    pages.push(lines.slice(start, lastPageStart))
+  }
+  pages.push(lines.slice(lastPageStart))
+
+  return pages
+}
 
 const KIRTI_META = {
   PI:      { title: 'PROFORMA INVOICE', numberLabel: 'PI No.' },
@@ -71,9 +242,6 @@ export function buildKirtiDocumentHTML(doc) {
   const ship = shipTo || (isPO ? sellerEntity : buyerEntity)
   const counterpartyLabel = isPO ? 'Supplier (Bill From)' : 'Buyer (Bill to)'
 
-  const pages = paginateLines(lines)
-  const totalPages = pages.length
-
   function metaGridHTML() {
     const numberValue = docType === 'INVOICE' && ewayBill?.eway_bill_no
       ? `${esc(docNo)} &nbsp;&nbsp; ${esc(ewayBill.eway_bill_no)}`
@@ -95,9 +263,7 @@ export function buildKirtiDocumentHTML(doc) {
   }
 
   function rowHTML(l, sl) {
-    const parts = String(l.description || '').split(/\n|\s+-\s+/)
-    const main = parts.shift() || ''
-    const sub = parts.join(' - ')
+    const { main, sub } = splitTallyDescription(l.description)
     return `<tr class="item-row">
       <td class="sl">${sl}</td>
       <td class="desc"><div class="tally-desc-main">${esc(main)}</div>${sub ? `<div class="tally-desc-sub">${esc(sub)}</div>` : ''}</td>
@@ -130,6 +296,14 @@ export function buildKirtiDocumentHTML(doc) {
     r.sgst += Number(l.sgst_amount) || 0
     r.igst += Number(l.igst_amount) || 0
   }
+  const taxLineCount = gstByRate.size * (interstate ? 1 : 2) + 1
+
+  // Computed only now (not right after destructuring `doc`, above) because
+  // the true last page's row budget depends on taxLineCount/distinct-HSN
+  // count, both derived from the grouping just above.
+  const footerReserveMm = withinTableFooterMm(taxLineCount) + estimateTallyFooterReserveMm(lines, dispatchInfo, sellerEntity.terms_and_conditions)
+  const pages = paginateTallyLines(lines, footerReserveMm)
+  const totalPages = pages.length
 
   function taxLinesHTML() {
     return [...gstByRate.values()].sort((a, b) => a.rate - b.rate).map(g => interstate
@@ -199,8 +373,12 @@ export function buildKirtiDocumentHTML(doc) {
   }
 
   function footerHTML(chunk, qtyTotal) {
-    const taxLineCount = gstByRate.size * (interstate ? 1 : 2) + 1
-    const spacerMm = Math.max(10, 120.5 - (chunk.length * 4.5) - 1.8 - (taxLineCount * 4))
+    // Same footerReserveMm the pagination above used to decide how many rows
+    // could land on this (the true last) page — so this is exactly the
+    // leftover height once real item rows + the fixed footer are accounted
+    // for, never negative by construction.
+    const itemsHeightMm = chunk.reduce((s, l) => s + estimateTallyRowHeightMm(l.description), 0)
+    const spacerMm = Math.max(10, TALLY_PAGE_MM - TALLY_HEADER_MM - itemsHeightMm - footerReserveMm)
     return `
       <tr class="tally-gap-row"><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
       <tr class="tally-subtotal-line"><td></td><td></td><td></td><td></td><td></td><td></td><td class="amount">${fmtN(totals.taxable_amount)}</td></tr>
@@ -276,8 +454,8 @@ body { background: #f0f1f8; font-family: Arial, Helvetica, sans-serif; font-size
 .tally-items th,.tally-items td{border-right:0.75pt solid #000;padding:.3mm .65mm;vertical-align:top;line-height:1.04;font-size:8.4pt}
 .tally-items th:last-child,.tally-items td:last-child{border-right:0}
 .tally-items thead th{height:6.5mm;border-bottom:0.75pt solid #000;text-align:center;font-weight:400;font-size:7.6pt;vertical-align:middle;padding:.2mm .35mm}
-.tally-items .sl{width:2.2%;text-align:center}.tally-items .desc{width:59.4%}.tally-items .hsn{width:7.9%;text-align:center}.tally-items .qty{width:7.8%;text-align:right;white-space:nowrap}.tally-items .rate{width:7.9%;text-align:right}.tally-items .per{width:3.4%;text-align:center}.tally-items .amount{width:11.4%;text-align:right;white-space:nowrap}
-.tally-items tbody tr.item-row td{height:auto!important;padding-top:.45mm;padding-bottom:.15mm}
+.tally-items .sl{width:2.2%;text-align:center}.tally-items .desc{width:55%}.tally-items .hsn{width:7%;text-align:center}.tally-items .qty{width:9%;text-align:right;white-space:nowrap}.tally-items .rate{width:9%;text-align:right}.tally-items .per{width:3.4%;text-align:center}.tally-items .amount{width:14.4%;text-align:right;white-space:nowrap}
+.tally-items tbody tr.item-row td{height:auto!important;padding-top:1.5mm;padding-bottom:.7mm;line-height:1.35}
 .tally-desc-main{font-weight:700}.tally-desc-sub{font-style:italic;margin-left:2mm;margin-top:.2mm}
 .tally-gap-row td{height:1.8mm!important;padding:0!important}
 .tally-subtotal-line td{height:4mm!important;padding-top:.45mm;padding-bottom:.25mm;vertical-align:middle;font-weight:400;font-style:normal}

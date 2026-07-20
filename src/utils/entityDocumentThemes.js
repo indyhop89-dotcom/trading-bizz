@@ -64,6 +64,20 @@ const ENTITY_THEMES = {
     navy: '#010101',
     orange: '#010101',
   },
+  // TODO(kamakhya-gstin): placeholder key — swap for the real GSTIN once
+  // provided (entities table lookup is blocked by RLS without an
+  // authenticated session, so this couldn't be confirmed automatically).
+  'PLACEHOLDER-KAMAKHYA-GSTIN': { // Kamakhya Loyalties
+    label: 'Kamakhya',
+    family: 'kamakhya',
+    // Replicated from a standalone Zoho-style PI generator HTML tool shared
+    // for this entity — a bordered A4 layout (thin black/grey rules, no
+    // color-filled header bars) with a single navy accent for headings and
+    // emphasis, genuinely different structure from vananam/srpl/tally (see
+    // kamakhyaDocumentTemplate.js's module docstring for specifics).
+    navy: '#0b2b6b',
+    orange: '#0b2b6b',
+  },
 }
 
 // Guards against ever configuring two entities with the same color pair —
