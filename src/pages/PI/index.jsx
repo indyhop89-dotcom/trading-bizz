@@ -134,6 +134,7 @@ function PIList() {
   const [search, setSearch]     = useState('')
   const [statusFilter, setStatus] = useState('all')
   const [entityFilter, setEntityF] = useState('')
+  const [orderFilter, setOrderF] = useState('')
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]         = useState(EMPTY_FORM)
   const [legs, setLegs]         = useState([])
@@ -320,7 +321,8 @@ function PIList() {
       p.to_entity?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter === 'all' || p.status === statusFilter
     const me  = !entityFilter || p.from_entity_id === entityFilter || p.to_entity_id === entityFilter
-    return ms && mst && me && mdf && mdt
+    const mo  = !orderFilter || p.order_id === orderFilter
+    return ms && mst && me && mdf && mdt && mo
   })
 
   // ── CSV bulk upload ──────────────────────────────────────────────────────────
@@ -583,6 +585,11 @@ function PIList() {
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All orders</option>
+          {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
         </select>
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>

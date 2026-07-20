@@ -117,13 +117,20 @@ async function autoCompletePurchaseMirror(inv, lines) {
     source_invoice_id: inv.id,
     pi_id: inv.pi_id || null,
     po_id: inv.po_id || null,
+    order_id: inv.order_id || null,
+    order_leg_id: inv.order_leg_id || null,
     is_interstate: inv.is_interstate,
     eway_bill_no: inv.eway_bill_no,
     eway_bill_date: inv.eway_bill_date || null,
+    // CHANGED: was missing total_qty/round_off_amount entirely — the source
+    // sales invoice already has both, so this mirror just showed a blank Qty
+    // column and a $0 round-off instead of copying them across.
+    total_qty: inv.total_qty,
     taxable_amount: inv.taxable_amount,
     cgst_amount: inv.cgst_amount,
     sgst_amount: inv.sgst_amount,
     igst_amount: inv.igst_amount,
+    round_off_amount: inv.round_off_amount,
     total_amount: inv.total_amount,
     outstanding_amount: inv.total_amount,
     paid_amount: 0,
@@ -160,6 +167,8 @@ function InvoiceList() {
   const [statusFilter, setStatus] = useState('all')
   const [typeFilter, setType]   = useState('all')
   const [entityFilter, setEntityF] = useState('')
+  const [orderFilter, setOrderF] = useState('')
+  const [orders, setOrders]     = useState([])
   const [toast, setToast]       = useState(null)
   const [csvModal, setCsvModal]   = useState(false)
   const [csvText, setCsvText]     = useState('')
@@ -175,10 +184,19 @@ function InvoiceList() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: invs }, { data: es }, { data: ps }, { data: hsnRows }] = await Promise.all([
+    const [{ data: invs }, { data: es }, { data: ps }, { data: hsnRows }, { data: ords }] = await Promise.all([
+      // CHANGED: hides the auto-generated buyer-side "purchase" mirror that
+      // autoCompletePurchaseMirror() creates the moment a sales invoice gets
+      // an E-way Bill — every real transaction was showing up twice (once as
+      // the seller's Sales invoice, once as this auto-created duplicate),
+      // which just reads as confusing noise in this list. Only the *auto*
+      // mirrors are hidden (source_invoice_id set) — a Purchase invoice
+      // created manually via the New Invoice form has no source_invoice_id
+      // and still shows normally.
       supabase.from('invoices')
-        .select('*, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name)')
+        .select('*, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).neq('invoice_type', 'intercompany')
+        .or('invoice_type.neq.purchase,source_invoice_id.is.null')
         .order('invoice_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       // CHANGED: for CSV product resolution below. Paginated — products can
@@ -186,11 +204,13 @@ function InvoiceList() {
       // silently drop products past that point from CSV matching.
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
       supabase.from('hsn_master').select('*').eq('is_active', true),
+      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
     ])
     setInvoices(invs || [])
     setEntities(es || [])
     setProducts(ps || [])
     setHsnMap(buildHSNMap(hsnRows || []))
+    setOrders(ords || [])
     setLoading(false)
   }, [])
 
@@ -359,7 +379,12 @@ function InvoiceList() {
     const mst = statusFilter === 'all' || i.status === statusFilter
     const mt  = typeFilter === 'all' || i.invoice_type === typeFilter
     const me  = !entityFilter || i.seller_entity_id === entityFilter || i.buyer_entity_id === entityFilter
-    return ms && mst && mt && me
+    const mo  = !orderFilter || i.order_id === orderFilter
+    // CHANGED: dateFrom/dateTo inputs were rendered but never actually
+    // applied — every invoice matched regardless of the date range picked.
+    const mdf = !dateFrom || i.invoice_date >= dateFrom
+    const mdt = !dateTo   || i.invoice_date <= dateTo
+    return ms && mst && mt && me && mo && mdf && mdt
   })
 
   // summary totals
@@ -404,6 +429,7 @@ function InvoiceList() {
     { label: 'Seller',  render: i => <span style={{ fontSize: '12px' }}>{i.seller?.short_name || i.seller?.name}</span> },
     { label: 'Buyer',   render: i => <span style={{ fontSize: '12px' }}>{i.buyer?.short_name || i.buyer?.name}</span> },
     { label: 'Date',    render: i => <span style={{ fontSize: '12px' }}>{fmtDate(i.invoice_date)}</span> },
+    { label: 'Order',   render: i => <span style={{ fontSize: '12px', color: C.textSoft }}>{i.orders?.name || '—'}</span> },
     { label: 'Due',     render: i => {
       if (!i.due_date) return <span style={{ color: C.textMuted }}>—</span>
       const overdue = new Date(i.due_date) < new Date() && i.status !== 'paid'
@@ -458,6 +484,11 @@ function InvoiceList() {
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All orders</option>
+          {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
         </select>
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>

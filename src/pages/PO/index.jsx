@@ -116,6 +116,8 @@ function POList() {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatus] = useState('all')
+  const [entityFilter, setEntityF] = useState('')
+  const [orderFilter, setOrderF] = useState('')
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]     = useState(EMPTY_FORM)
   const [legs, setLegs]     = useState([])
@@ -511,7 +513,9 @@ function POList() {
       p.buyer?.name?.toLowerCase().includes(search.toLowerCase()) ||
       p.seller?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter === 'all' || p.status === statusFilter
-    return ms && mst && mdf && mdt
+    const me  = !entityFilter || p.buyer_entity_id === entityFilter || p.seller_entity_id === entityFilter
+    const mo  = !orderFilter || p.order_id === orderFilter
+    return ms && mst && mdf && mdt && me && mo
   })
 
   function toggleSelect(id) {
@@ -547,6 +551,7 @@ function POList() {
     { label: 'Buyer',   render: p => <span style={{ fontSize: '12px' }}>{p.buyer?.short_name || p.buyer?.name}</span> },
     { label: 'Seller',  render: p => <span style={{ fontSize: '12px' }}>{p.seller?.short_name || p.seller?.name}</span> },
     { label: 'Date',    render: p => <span style={{ fontSize: '12px' }}>{fmtDate(p.po_date)}</span> },
+    { label: 'Order',   render: p => <span style={{ fontSize: '12px', color: C.textSoft }}>{p.orders?.name || '—'}</span> },
     { label: 'Delivery',render: p => <span style={{ fontSize: '12px', color: C.textSoft }}>{p.delivery_date ? fmtDate(p.delivery_date) : '—'}</span> },
     { label: 'Qty', right: true, render: p => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{p.total_qty || '—'}</span> },
     { label: 'Amount',  right: true, render: p => <span style={{ fontWeight: 600 }}>{formatINR(p.total_amount)}</span> },
@@ -574,6 +579,16 @@ function POList() {
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value='all'>All statuses</option>
           {PO_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select value={entityFilter} onChange={e => setEntityF(e.target.value)}
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All entities</option>
+          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All orders</option>
+          {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
         </select>
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
