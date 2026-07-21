@@ -38,6 +38,20 @@ export function formatINR(amount) {
 }
 
 /**
+ * Format a quantity for display — Indian comma grouping, capped at 2 decimal
+ * places. Quantities are summed in JS floating point, so a raw render can
+ * "overpour" digits (16680.000000000004); this clips that noise. Integers
+ * stay clean ("16,680"), fractional quantities keep up to 2dp ("12.5").
+ * null/'' → "—" so empty cells read as empty, not zero.
+ */
+export function formatQty(val) {
+  if (val === null || val === undefined || val === '') return '—'
+  const n = Number(val)
+  if (isNaN(n)) return '—'
+  return n.toLocaleString('en-IN', { maximumFractionDigits: 2 })
+}
+
+/**
  * Safe parse a user-entered string to a number.
  * Strips commas, handles empty string → 0.
  * "1,250.50" → 1250.50

@@ -7,7 +7,7 @@ import {
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop, MultiSelectDropdown,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
-import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
+import { formatINR, formatQty, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
@@ -20,6 +20,8 @@ import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock, getInvoiceLifecycleStage } from '../../utils/stock'
+import { isOrderOpenForDocs } from '../../utils/orders'
+import { PAYMENT_TERMS_OPTIONS, dueDateForTerms } from '../../utils/paymentTerms'
 import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
 import { getDriveViewUrl } from '../../utils/drive'
@@ -40,6 +42,8 @@ export async function buildInvoiceDoc(inv, lines) {
   return {
     docType: 'INVOICE',
     docNo: inv.invoice_no, docDate: inv.invoice_date, validOrDueDate: inv.due_date,
+    // CHANGED: payment terms now captured on invoices too (matches PI/PO)
+    paymentTerms: inv.payment_terms,
     sellerEntity: { ...seller, logoSrc },
     buyerEntity: buyer,
     lines,
@@ -75,7 +79,10 @@ function toInvoiceLinePayload(computedLine, invoiceId, lineNo) {
 }
 
 const EMPTY_FORM = {
-  invoice_date: today(), due_date: '', invoice_type: 'sales', status: 'draft',
+  // CHANGED: payment_terms drives due_date (see setF) — picking "Net 30 Days"
+  // on a 2026-07-01 invoice auto-fills due_date 2026-07-31; the date stays
+  // manually overridable after that.
+  invoice_date: today(), due_date: '', payment_terms: '', invoice_type: 'sales', status: 'draft',
   seller_entity_id: '', buyer_entity_id: '',
   order_id: '', order_leg_id: '', pi_id: '', po_id: '',
   is_interstate: false,
@@ -110,6 +117,7 @@ async function autoCompletePurchaseMirror(inv, lines) {
     invoice_no: invoiceNo,
     invoice_date: inv.invoice_date,
     due_date: inv.due_date || null,
+    payment_terms: inv.payment_terms || null,
     invoice_type: 'purchase',
     status: 'submitted',
     seller_entity_id: inv.seller_entity_id,
@@ -312,8 +320,12 @@ function InvoiceList() {
       // of range" once the day exceeds 12.
       const invoiceDate = parseFlexibleDate(meta.invoice_date)
       if (!invoiceDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: invoice_date "${meta.invoice_date}" is not a valid date — use YYYY-MM-DD or DD-MM-YYYY`); continue }
-      const dueDate = meta.due_date ? parseFlexibleDate(meta.due_date) : null
+      let dueDate = meta.due_date ? parseFlexibleDate(meta.due_date) : null
       if (meta.due_date && !dueDate) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: due_date "${meta.due_date}" is not a valid date`); continue }
+      // CHANGED: optional payment_terms column — when due_date is blank, the
+      // due date is derived from it (same rule as the form).
+      const paymentTerms = (meta.payment_terms || '').trim() || null
+      if (!dueDate && paymentTerms) dueDate = dueDateForTerms(invoiceDate, paymentTerms) || null
 
       // CHANGED: invoice_no taken from the CSV if supplied, else suggested
       // via suggestNextNo() keyed to the seller (the entity issuing the
@@ -358,8 +370,8 @@ function InvoiceList() {
       // computeTotals() in LineItemsEditor.jsx for why.
       const invPreciseSubtotal = round2(rawTotals.taxable_amount + rawTotals.cgst_amount + rawTotals.sgst_amount + rawTotals.igst_amount)
       const invFinalTotal = roundRupees(invPreciseSubtotal)
-      const totals = { ...rawTotals, taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount), sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount), total_amount: invFinalTotal, round_off_amount: round2(invFinalTotal - invPreciseSubtotal) }
-      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
+      const totals = { ...rawTotals, taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount), sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount), total_qty: round2(rawTotals.total_qty), total_amount: invFinalTotal, round_off_amount: round2(invFinalTotal - invPreciseSubtotal) }
+      const { data: inv, error: invErr } = await supabase.from('invoices').insert({ invoice_no: invoiceNo, invoice_date: invoiceDate, invoice_type: meta.invoice_type||'sales', seller_entity_id: sellerE.id, buyer_entity_id: buyerE.id, is_interstate: interstate, due_date: dueDate, payment_terms: paymentTerms, notes: meta.notes||null, status: 'draft', outstanding_amount: totals.total_amount, paid_amount: 0, ...totals }).select().single()
       if (invErr) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: ${invErr.message}`); continue }
       const { error: invLineErr } = await supabase.from('invoice_lines').insert(invLines.map(l => ({ ...l, invoice_id: inv.id })))
       if (invLineErr) { errors.push(`Invoice ${invoiceNo}: header created but line items failed to save: ${invLineErr.message}`); continue }
@@ -435,7 +447,7 @@ function InvoiceList() {
       const overdue = new Date(i.due_date) < new Date() && i.status !== 'paid'
       return <span style={{ fontSize: '12px', color: overdue ? C.danger : C.text, fontWeight: overdue ? 700 : 400 }}>{fmtDate(i.due_date)}{overdue ? ' ⚠️' : ''}</span>
     }},
-    { label: 'Qty', right: true, render: i => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{i.total_qty || '—'}</span> },
+    { label: 'Qty', right: true, render: i => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{i.total_qty ? formatQty(i.total_qty) : '—'}</span> },
     { label: 'Amount',  right: true, render: i => <span style={{ fontWeight: 600 }}>{formatINR(i.total_amount)}</span> },
     { label: 'Outstanding', right: true, render: i => <span style={{ fontWeight: 600, color: i.outstanding_amount > 0 ? C.warning : C.success }}>{formatINR(i.outstanding_amount)}</span> },
     { label: 'Status',  render: i => <Badge status={i.status} /> },
@@ -521,7 +533,7 @@ function InvoiceList() {
               <strong>CSV Format — one row per line item:</strong>
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('invoices')}>↓ Download Template</Btn>
             </div>
-            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no</code><br /><br />
+            <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,payment_terms,due_date,notes,invoice_no</code><br /><br />
             Multiple rows with same <strong>invoice_date + seller + buyer</strong> are grouped into one Invoice. <code>invoice_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing invoices and other rows in this file). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
           <FormRow label='Upload or Paste CSV'>
@@ -609,7 +621,8 @@ function NewInvoice() {
   useEffect(() => {
     Promise.all([
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      // `status` so the Order dropdown can offer only still-open orders
+      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
       supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,total_amount,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('purchase_orders').select('id,po_no,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
@@ -674,6 +687,14 @@ function NewInvoice() {
         const be  = entities.find(e => e.id === bid)
         if (se?.state_code && be?.state_code)
           updated.is_interstate = se.state_code !== be.state_code
+      }
+      // CHANGED: payment terms drive the due date — recompute it whenever
+      // terms are picked or the invoice date shifts under known terms. A
+      // custom terms string that doesn't imply a day count leaves due_date
+      // alone, and the user can still override the date manually afterwards.
+      if (k === 'payment_terms' || (k === 'invoice_date' && f.payment_terms)) {
+        const derived = dueDateForTerms(updated.invoice_date, updated.payment_terms)
+        if (derived) updated.due_date = derived
       }
       return updated
     })
@@ -829,7 +850,7 @@ function NewInvoice() {
     // default to NULL. eway_bill_date in particular was previously left in the
     // payload as '' on every create (E-way Bill is filled in later), which is
     // what caused this save to fail.
-    for (const k of ['order_id', 'order_leg_id', 'pi_id', 'po_id', 'due_date', 'eway_bill_date', 'einvoice_ack_date']) {
+    for (const k of ['order_id', 'order_leg_id', 'pi_id', 'po_id', 'due_date', 'payment_terms', 'eway_bill_date', 'einvoice_ack_date']) {
       if (!payload[k]) delete payload[k]
     }
     if (!payload.tds_amount)    delete payload.tds_amount
@@ -947,7 +968,11 @@ function NewInvoice() {
             <FormRow label='Invoice Number' hint='Leave blank to auto-generate'>
               <Input value={form.invoice_no} onChange={e => setF('invoice_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
-            <FormRow label='Due Date'>
+            <FormRow label='Payment Terms' hint='Due date auto-calculates from this'>
+              <Input list='inv-payment-terms' value={form.payment_terms} onChange={e => setF('payment_terms', e.target.value)} placeholder='e.g. Net 30 Days' />
+              <datalist id='inv-payment-terms'>{PAYMENT_TERMS_OPTIONS.map(o => <option key={o} value={o} />)}</datalist>
+            </FormRow>
+            <FormRow label='Due Date' hint={form.payment_terms ? 'Auto-set from payment terms — override if needed' : undefined}>
               <Input type='date' value={form.due_date} onChange={e => setF('due_date', e.target.value)} />
             </FormRow>
             <FormRow label='Type'>
@@ -993,7 +1018,8 @@ function NewInvoice() {
             <FormRow label='Order'>
               <Select value={form.order_id} onChange={e => { setF('order_id', e.target.value); loadLegs(e.target.value) }}>
                 <option value=''>No order</option>
-                {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                {/* CHANGED: only orders still open for documents — completed/cancelled hidden (current selection stays visible) */}
+                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
               </Select>
             </FormRow>
           </div>
@@ -1310,6 +1336,7 @@ function InvoiceDetail() {
   function startEdit() {
     setEditForm({
       invoice_no: inv.invoice_no || '', invoice_date: inv.invoice_date || '', due_date: inv.due_date || '',
+      payment_terms: inv.payment_terms || '',
       status: inv.status || 'draft', notes: inv.notes || '', is_interstate: inv.is_interstate,
       bill_from: inv.bill_from || '', bill_to: inv.bill_to || '', ship_from: inv.ship_from || '', ship_to: inv.ship_to || '',
     })
@@ -1384,6 +1411,7 @@ function InvoiceDetail() {
     const outstanding = round2(totals.total_amount - (Number(inv.paid_amount) || 0))
     const { error: invErr } = await supabase.from('invoices').update({
       ...editForm, invoice_no: invoiceNo, due_date: editForm.due_date || null,
+      payment_terms: editForm.payment_terms || null,
       ...totals, outstanding_amount: outstanding, updated_at: new Date(),
     }).eq('id', id)
     if (invErr) { setSaving(false); return setToast({ message: invErr.message, type: 'error' }) }
@@ -1458,6 +1486,7 @@ function InvoiceDetail() {
             {fmtDate(inv.due_date)}
           </strong>
         </div>}
+        {inv.payment_terms && <div><span style={{ color: C.textMuted }}>Terms:</span> <strong>{inv.payment_terms}</strong></div>}
         <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={inv.is_interstate ? 'export' : 'domestic'} label={inv.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
         {inv.einvoice_irn && <div><span style={{ color: C.textMuted }}>IRN:</span> <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{inv.einvoice_irn}</span></div>}
         {inv.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{inv.orders.name}</strong></div>}
@@ -1474,9 +1503,14 @@ function InvoiceDetail() {
         <Card style={{ marginBottom: '16px', padding: '16px' }}>
           <SectionDivider label='Edit Details' />
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px', marginTop: '12px' }}>
-            <FormRow label='Invoice Date' required><Input type='date' value={editForm.invoice_date} onChange={e=>setEditForm(f=>({...f,invoice_date:e.target.value}))}/></FormRow>
+            <FormRow label='Invoice Date' required><Input type='date' value={editForm.invoice_date} onChange={e=>setEditForm(f=>{const nf={...f,invoice_date:e.target.value};const d=dueDateForTerms(nf.invoice_date,nf.payment_terms);return d?{...nf,due_date:d}:nf})}/></FormRow>
             <FormRow label='Invoice Number' required><Input value={editForm.invoice_no} onChange={e=>setEditForm(f=>({...f,invoice_no:e.target.value}))}/></FormRow>
-            <FormRow label='Due Date'><Input type='date' value={editForm.due_date} onChange={e=>setEditForm(f=>({...f,due_date:e.target.value}))}/></FormRow>
+            {/* CHANGED: payment terms drive due date, same as the create form */}
+            <FormRow label='Payment Terms' hint='Due date auto-calculates from this'>
+              <Input list='inv-edit-payment-terms' value={editForm.payment_terms} onChange={e=>setEditForm(f=>{const nf={...f,payment_terms:e.target.value};const d=dueDateForTerms(nf.invoice_date,nf.payment_terms);return d?{...nf,due_date:d}:nf})} placeholder='e.g. Net 30 Days'/>
+              <datalist id='inv-edit-payment-terms'>{PAYMENT_TERMS_OPTIONS.map(o=><option key={o} value={o}/>)}</datalist>
+            </FormRow>
+            <FormRow label='Due Date' hint={editForm.payment_terms?'Auto-set from payment terms — override if needed':undefined}><Input type='date' value={editForm.due_date} onChange={e=>setEditForm(f=>({...f,due_date:e.target.value}))}/></FormRow>
             <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{INV_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
             <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
             <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>
@@ -1541,7 +1575,7 @@ function InvoiceDetail() {
             {!inv.eway_bill_no && inv.invoice_type === 'sales' && (
               <div style={{background:'#fff3cc',border:'1px solid #e6c040',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#7a5000'}}>
                 📦 Saving an E-way Bill number here moves stock now: {lines.length} line item(s) totalling{' '}
-                <strong>{lines.reduce((s,l)=>s+Number(l.qty||0),0).toLocaleString('en-IN')}</strong> unit(s) leave{' '}
+                <strong>{formatQty(lines.reduce((s,l)=>s+Number(l.qty||0),0))}</strong> unit(s) leave{' '}
                 <strong>{inv.seller?.short_name || inv.seller?.name}</strong> and land with{' '}
                 <strong>{inv.buyer?.short_name || inv.buyer?.name}</strong>
                 {inv.buyer?.type !== 'external' && <> — {inv.buyer?.short_name || inv.buyer?.name}'s purchase entry is auto-completed too</>}.

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, Fragment } from 'react'
+import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
@@ -9,7 +9,8 @@ import { fmtDate, today } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
 // LineItemsEditor's stockMap) instead of duplicating it here.
-import { fetchStockMovementData, buildActualStockMap, fetchEntityAvailableStock } from '../../utils/stock'
+import { fetchStockMovementData, buildActualStockMap, fetchEntityAvailableStock, filterStockDataAsOf } from '../../utils/stock'
+import { ProductPicker } from '../../components/LineItemsEditor'
 import { cleanProductName, productMatchKey, findNearMatchProduct, findMergeSuggestionGroups } from '../../utils/products'
 // CHANGED: needed to know the current user's role/id for entity-access scoping
 import { useAuth } from '../../hooks/useAuth'
@@ -313,13 +314,37 @@ function OpeningStock() {
 
   const filtered = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
 
+  // CHANGED: download of the (filtered) opening-stock rows. Columns lead with
+  // the exact upload format (entity,product,fy,qty,unit,rate,hsn_code,
+  // gst_rate,as_of_date,category) so an export can be corrected in Excel and
+  // re-uploaded as-is; value/notes ride along at the end and are ignored by
+  // the uploader.
+  function handleExportCSV() {
+    downloadCSV(`opening_stock_${today()}.csv`,
+      ['entity','product','fy','qty','unit','rate','hsn_code','gst_rate','as_of_date','category','value','notes'],
+      filtered.map(r => ({
+        entity: r.entity?.short_name || r.entity?.name || '',
+        product: r.product?.name || '',
+        fy: r.fy?.name || '',
+        qty: toNum(r.qty),
+        unit: r.unit || r.product?.unit || '',
+        rate: toNum(r.rate),
+        hsn_code: r.hsn_code || r.product?.hsn_code || '',
+        gst_rate: r.gst_rate ?? '',
+        as_of_date: r.as_of_date || '',
+        category: '',
+        value: toNum(r.qty) * toNum(r.rate),
+        notes: r.notes || '',
+      })))
+  }
+
   const totalValue = filtered.reduce((s, r) => s + toNum(r.qty) * toNum(r.rate), 0)
   const qtyByUnit = filtered.reduce((m, r) => {
     const u = r.unit || r.product?.unit || 'Nos'
     m[u] = (m[u] || 0) + toNum(r.qty)
     return m
   }, {})
-  const qtySummary = Object.entries(qtyByUnit).map(([u, q]) => `${q.toLocaleString('en-IN')} ${u}`).join(' • ') || '0'
+  const qtySummary = Object.entries(qtyByUnit).map(([u, q]) => `${q.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${u}`).join(' • ') || '0'
   const distinctProducts = new Set(filtered.map(r => r.product_id)).size
 
   const columns = [
@@ -327,7 +352,7 @@ function OpeningStock() {
     { label: 'Entity',   render: r => <span style={{ fontWeight: 600 }}>{r.entity?.short_name || r.entity?.name}</span> },
     { label: 'Product',  render: r => <div><div style={{ fontWeight: 600 }}>{r.product?.name}</div><div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>{r.hsn_code || r.product?.hsn_code}</div></div> },
     { label: 'FY',       render: r => <span style={{ fontSize: '12px', color: C.textSoft }}>{r.fy?.name}</span> },
-    { label: 'Qty',      right: true, render: r => <span style={{ fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN')} {r.unit || r.product?.unit}</span> },
+    { label: 'Qty',      right: true, render: r => <span style={{ fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })} {r.unit || r.product?.unit}</span> },
     { label: 'Rate',     right: true, render: r => formatINR(r.rate) },
     { label: 'Value',    right: true, render: r => <span style={{ fontWeight: 600 }}>{formatINR(toNum(r.qty) * toNum(r.rate))}</span> },
     { label: 'As of',    render: r => fmtDate(r.as_of_date) },
@@ -354,6 +379,7 @@ function OpeningStock() {
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
         <div style={{ flex: 1 }} />
+        <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
         <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
         <Btn onClick={openNew}>+ Add Opening Stock</Btn>
       </div>
@@ -384,10 +410,8 @@ function OpeningStock() {
               </Select>
             </FormRow>
             <FormRow label='Product' required>
-              <Select value={form.product_id} onChange={e => setF('product_id', e.target.value)}>
-                <option value=''>Select product</option>
-                {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </Select>
+              {/* CHANGED: searchable picker — a plain dropdown over thousands of products was unusable */}
+              <ProductPicker products={products} value={form.product_id} onSelect={id => setF('product_id', id)} />
             </FormRow>
             <FormRow label='As of Date' required>
               <Input type='date' value={form.as_of_date} onChange={e => setF('as_of_date', e.target.value)} />
@@ -722,6 +746,24 @@ function StockAdjustments() {
 
   const filtered = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
 
+  // CHANGED: download of the (filtered) adjustment history — columns lead
+  // with the upload format (entity,product,qty,reason,adjustment_date,notes)
+  // so an export doubles as a template; extra columns ride along at the end.
+  function handleExportAdjustmentsCSV() {
+    downloadCSV(`stock_adjustments_${today()}.csv`,
+      ['entity','product','qty','reason','adjustment_date','notes','product_id','recorded_by'],
+      filtered.map(r => ({
+        entity: r.entity?.short_name || r.entity?.name || '',
+        product: r.product?.name || '',
+        qty: toNum(r.qty_delta),
+        reason: r.reason || '',
+        adjustment_date: r.adjustment_date || '',
+        notes: r.notes || '',
+        product_id: r.product_id || '',
+        recorded_by: r.creator?.full_name || '',
+      })))
+  }
+
   function reasonLabel(reason) {
     return ADJUSTMENT_REASONS.find(r => r.value === reason)?.label.split(' (')[0] || reason
   }
@@ -733,7 +775,7 @@ function StockAdjustments() {
     { label: 'Product', render: r => <div><div style={{ fontWeight: 600 }}>{r.product?.name}</div><div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>{r.product?.hsn_code}</div></div> },
     { label: 'Qty Δ',   right: true, render: r => (
       <span style={{ fontWeight: 700, color: toNum(r.qty_delta) < 0 ? C.danger : C.success }}>
-        {toNum(r.qty_delta) > 0 ? '+' : ''}{Number(r.qty_delta).toLocaleString('en-IN')} {r.product?.unit}
+        {toNum(r.qty_delta) > 0 ? '+' : ''}{Number(r.qty_delta).toLocaleString('en-IN', { maximumFractionDigits: 2 })} {r.product?.unit}
       </span>
     )},
     { label: 'Reason',  render: r => <Badge status={toNum(r.qty_delta) < 0 ? 'pending' : 'active'} label={reasonLabel(r.reason)} /> },
@@ -773,6 +815,7 @@ function StockAdjustments() {
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
         <div style={{ flex: 1 }} />
+        <Btn variant='ghost' onClick={handleExportAdjustmentsCSV}>↓ Export CSV</Btn>
         <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
         <Btn variant='ghost' onClick={openNewOffload}>⤓ Offload Stock</Btn>
         <Btn onClick={openNew}>+ Add Adjustment</Btn>
@@ -797,17 +840,15 @@ function StockAdjustments() {
               </Select>
             </FormRow>
             <FormRow label='Product' required>
-              <Select value={form.product_id} onChange={e => setF('product_id', e.target.value)}>
-                <option value=''>Select product</option>
-                {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </Select>
+              {/* CHANGED: searchable picker — a plain dropdown over thousands of products was unusable */}
+              <ProductPicker products={products} value={form.product_id} onSelect={id => setF('product_id', id)} />
             </FormRow>
           </div>
 
           {currentStock !== null && (
             <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 14px', fontSize: '13px', display: 'flex', justifyContent: 'space-between' }}>
               <span style={{ color: C.textSoft }}>Current stock on hand</span>
-              <strong style={{ color: currentStock < 0 ? C.danger : C.text }}>{currentStock.toLocaleString('en-IN')}</strong>
+              <strong style={{ color: currentStock < 0 ? C.danger : C.text }}>{currentStock.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</strong>
             </div>
           )}
 
@@ -829,7 +870,7 @@ function StockAdjustments() {
           {currentStock !== null && form.qty && (
             <div style={{ fontSize: '12px', color: C.textMuted }}>
               New stock after this adjustment: <strong style={{ color: C.text }}>
-                {(currentStock + (form.direction === 'decrease' ? -toNum(form.qty) : toNum(form.qty))).toLocaleString('en-IN')}
+                {(currentStock + (form.direction === 'decrease' ? -toNum(form.qty) : toNum(form.qty))).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
               </strong>
             </div>
           )}
@@ -921,6 +962,11 @@ function StockPosition() {
   const [hideSoldOut, setHideSoldOut] = useState(true)
   // CHANGED: click-to-filter from the Shortfalls / Billed Beyond Stock StatCards
   const [statusFilter, setStatusFilter] = useState(null) // null | 'shortfall' | 'billed_beyond'
+  // CHANGED: point-in-time view — blank shows live stock (as of now); a date
+  // recomputes every Actual Stock number as of that day (opening rows dated
+  // on/before it, invoice movements whose E-way Bill/invoice date is on/
+  // before it, adjustments dated on/before it — see filterStockDataAsOf).
+  const [asOfDate, setAsOfDate] = useState('')
   // CHANGED: tracks invoice lines with no product_id (known CSV-upload data
   // gap) so we can warn about them instead of showing blank garbage rows
   const [dataIssues, setDataIssues] = useState({ unresolvedLines: 0, unresolvedQty: 0 })
@@ -936,6 +982,12 @@ function StockPosition() {
   // CHANGED: current user's role/id decide which entities they may even see
   const { profile } = useAuth()
   const isMaster = hasFullAccess(profile)
+  // CHANGED: guards against a stale in-flight load overwriting a newer one —
+  // this page's load takes tens of seconds (30k+ invoice lines paged 1000 at
+  // a time), so changing any filter mid-load used to race: whichever run
+  // finished LAST won, even if it was computed with the old filters. Each
+  // run takes a ticket; only the newest ticket may write results.
+  const loadSeqRef = useRef(0)
 
   useEffect(() => {
     if (!profile) return // wait until we know the role before deciding what to fetch
@@ -991,6 +1043,7 @@ function StockPosition() {
 
   const loadPosition = useCallback(async () => {
     if (!fyFilter) return
+    const seq = ++loadSeqRef.current
     setLoading(true)
 
     // Get opening stock
@@ -1014,7 +1067,7 @@ function StockPosition() {
     // CHANGED: same 1000-row cap risk as opening stock above — page through.
     const { data: piLinesRaw } = await fetchAllPages(() => supabase
       .from('proforma_invoice_lines')
-      .select('qty, product_id, pi:pi_id(from_entity_id, to_entity_id, status, is_deleted)')
+      .select('qty, product_id, pi:pi_id(from_entity_id, to_entity_id, status, is_deleted, pi_date)')
       .not('pi', 'is', null)
       .neq('pi.status', 'cancelled')
       .order('id'))
@@ -1023,7 +1076,9 @@ function StockPosition() {
     // second condition on it) — a soft-deleted PI kept counting toward
     // Planned stock forever since only `status` was checked. Filter it out
     // client-side same as fetchStockMovementData() already does for invoices.
-    const piLines = (piLinesRaw || []).filter(l => l.pi && !l.pi.is_deleted)
+    // CHANGED: the as-of date applies to Planned too — only PIs dated on or
+    // before it count toward the point-in-time position.
+    const piLines = (piLinesRaw || []).filter(l => l.pi && !l.pi.is_deleted && (!asOfDate || !l.pi.pi_date || l.pi.pi_date <= asOfDate))
 
     // CHANGED: Actual Stock — the real, invoice-based position per entity.
     // This is deliberately NOT scoped to fyFilter: opening stock is entered
@@ -1031,11 +1086,15 @@ function StockPosition() {
     // actual stock must be a running total across all-time opening entries +
     // all-time invoice movements. Reuses the same tested logic that already
     // feeds LineItemsEditor's available-stock check.
-    const actualMap = buildActualStockMap(await fetchStockMovementData())
+    // CHANGED: when an as-of date is set, restrict every movement source to
+    // what had happened by that day — the whole page becomes "stock status
+    // as of <date>" instead of "right now".
+    const actualMap = buildActualStockMap(filterStockDataAsOf(await fetchStockMovementData(), asOfDate))
 
     // Build position map: key = entity_id + product_id
     const map = {}
     for (const ob of (opening || [])) {
+      if (asOfDate && ob.as_of_date && ob.as_of_date > asOfDate) continue
       const key = `${ob.entity_id}__${ob.product_id}`
       map[key] = {
         entity_id:   ob.entity_id,
@@ -1099,6 +1158,7 @@ function StockPosition() {
         }
       }
     }
+    if (seq !== loadSeqRef.current) return // superseded by a newer load — discard
     setDataIssues({ unresolvedLines, unresolvedQty })
 
     // Compute planned qty (PI-based, unchanged) and actual qty (invoice-based)
@@ -1127,7 +1187,7 @@ function StockPosition() {
 
     setPosition(rows)
     setLoading(false)
-  }, [entityFilter, fyFilter, entities, products])
+  }, [entityFilter, fyFilter, entities, products, asOfDate])
 
   useEffect(() => { loadPosition() }, [loadPosition])
 
@@ -1195,7 +1255,7 @@ function StockPosition() {
     m[u] = (m[u] || 0) + toNum(r.actual_qty)
     return m
   }, {})
-  const qtySummary = Object.entries(qtyByUnit).map(([u, q]) => `${q.toLocaleString('en-IN')} ${u}`).join(' • ') || '0'
+  const qtySummary = Object.entries(qtyByUnit).map(([u, q]) => `${q.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${u}`).join(' • ') || '0'
 
   const columns = [
     // CHANGED: running row number for reference while editing/cross-checking
@@ -1215,22 +1275,22 @@ function StockPosition() {
     { label: 'Actual Stock', right: true, render: r => (
       <div>
         <span style={{ fontWeight: 800, fontSize: '14px', color: r.actual_qty < 0 ? C.danger : C.text }}>
-          {Number(r.actual_qty).toLocaleString('en-IN')}
+          {Number(r.actual_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
         </span>
         {r.actual_qty < 0 && (
           <div style={{ fontSize: '10px', color: C.textMuted, whiteSpace: 'nowrap', marginTop: '2px' }}>
-            Open {Number(r.opening_qty).toLocaleString('en-IN')} + In {Number(r.actual_invoiced_in).toLocaleString('en-IN')} − Out {Number(r.actual_invoiced_out).toLocaleString('en-IN')}
-            {r.actual_adjustment !== 0 ? ` ${r.actual_adjustment > 0 ? '+' : '−'} Adj ${Math.abs(r.actual_adjustment).toLocaleString('en-IN')}` : ''}
+            Open {Number(r.opening_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })} + In {Number(r.actual_invoiced_in).toLocaleString('en-IN', { maximumFractionDigits: 2 })} − Out {Number(r.actual_invoiced_out).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+            {r.actual_adjustment !== 0 ? ` ${r.actual_adjustment > 0 ? '+' : '−'} Adj ${Math.abs(r.actual_adjustment).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : ''}
           </div>
         )}
       </div>
     )},
-    { label: 'Opening',  right: true, render: r => <span style={{ color: C.textMuted }}>{Number(r.opening_qty).toLocaleString('en-IN')}</span> },
-    { label: '+ Incoming PI', right: true, render: r => <span style={{ color: C.success }}>+{Number(r.incoming).toLocaleString('en-IN')}</span> },
-    { label: '− Outgoing PI', right: true, render: r => <span style={{ color: C.danger }}>−{Number(r.outgoing).toLocaleString('en-IN')}</span> },
+    { label: 'Opening',  right: true, render: r => <span style={{ color: C.textMuted }}>{Number(r.opening_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span> },
+    { label: '+ Incoming PI', right: true, render: r => <span style={{ color: C.success }}>+{Number(r.incoming).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span> },
+    { label: '− Outgoing PI', right: true, render: r => <span style={{ color: C.danger }}>−{Number(r.outgoing).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span> },
     { label: 'Planned',  right: true, render: r => (
       <span style={{ fontWeight: 700, color: r.planned_qty < 0 ? C.danger : r.planned_qty === 0 ? C.warning : C.success }}>
-        {Number(r.planned_qty).toLocaleString('en-IN')}
+        {Number(r.planned_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
       </span>
     )},
     // CHANGED: two independent indicators — Planned/PI shortfall (unchanged)
@@ -1247,7 +1307,9 @@ function StockPosition() {
     // CHANGED: export the currently filtered rows (respects entity/category
     // filters already applied on screen), category column added.
     // CHANGED: actual_qty and billed_beyond_stock columns added.
-    downloadCSV(`stock_position_${new Date().toISOString().split('T')[0]}.csv`,
+    // Filename carries the as-of date when one is set, so exports from
+    // different points in time don't overwrite each other.
+    downloadCSV(`stock_position_${asOfDate ? 'as_of_' + asOfDate : new Date().toISOString().split('T')[0]}.csv`,
       ['sno','entity','category','product','hsn_code','unit','actual_qty','billed_beyond_stock','opening_qty','incoming_pi_qty','outgoing_pi_qty','planned_qty','status'],
       filteredPosition.map(r=>({sno:r.sno,entity:r.entity?.name||'',category:r.product?.category||'',product:r.product?.name||'',hsn_code:r.product?.hsn_code||'',unit:r.product?.unit||'',actual_qty:r.actual_qty||0,billed_beyond_stock:r.billed_beyond_stock?'Yes':'No',opening_qty:r.opening_qty||0,incoming_pi_qty:r.incoming||0,outgoing_pi_qty:r.outgoing||0,planned_qty:r.planned_qty||0,status:r.planned_qty<0?'Shortfall':r.planned_qty===0?'Zero':'OK'}))
     )
@@ -1261,7 +1323,7 @@ function StockPosition() {
           silently lost. */}
       {dataIssues.unresolvedLines > 0 && (
         <div style={{ background: '#fff3cc', border: '1px solid #e6c040', borderRadius: '6px', padding: '10px 14px', fontSize: '12px', color: '#7a5000', marginBottom: '16px' }}>
-          ⚠ {dataIssues.unresolvedLines} invoice line{dataIssues.unresolvedLines === 1 ? '' : 's'} (~{Number(dataIssues.unresolvedQty).toLocaleString('en-IN')} units) have no product linked and are excluded from the table below — likely from CSV-uploaded PIs/Invoices missing a product reference. This is a data issue, not a display bug; the actual stock numbers shown for real products are correct.
+          ⚠ {dataIssues.unresolvedLines} invoice line{dataIssues.unresolvedLines === 1 ? '' : 's'} (~{Number(dataIssues.unresolvedQty).toLocaleString('en-IN', { maximumFractionDigits: 2 })} units) have no product linked and are excluded from the table below — likely from CSV-uploaded PIs/Invoices missing a product reference. This is a data issue, not a display bug; the actual stock numbers shown for real products are correct.
         </div>
       )}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
@@ -1327,8 +1389,21 @@ function StockPosition() {
         <Btn size='sm' variant={hideSoldOut ? 'ghost' : 'primary'} onClick={() => setHideSoldOut(h => !h)}>
           {hideSoldOut ? 'Show sold-out products' : '✓ Showing sold-out products'}
         </Btn>
+        {/* CHANGED: point-in-time view — pick a date to see stock status as of
+            that day; blank = live (now). */}
+        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: C.textSoft }}>
+          Stock as of
+          <input type='date' value={asOfDate} onChange={e => setAsOfDate(e.target.value)}
+            style={{ padding: '6px 10px', border: `1.5px solid ${asOfDate ? C.accent : C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+        </label>
+        {asOfDate && <Btn size='sm' variant='ghost' onClick={() => setAsOfDate('')}>✕ Back to live</Btn>}
         <Btn size='sm' variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
       </div>
+      {asOfDate && (
+        <div style={{ background: '#e8f3fd', border: '1px solid #b8d8f8', borderRadius: '6px', padding: '8px 12px', fontSize: '12px', color: '#1a4a7a', marginBottom: '12px' }}>
+          📅 Showing stock status as of <strong>{fmtDate(asOfDate)}</strong> — only movements dated on or before this day are counted. Clear the date to return to the live position.
+        </div>
+      )}
 
       {/* CHANGED: report-style group-by table — click a group row to expand
           its line items, with a grand total row at the bottom. Works for
@@ -1360,7 +1435,7 @@ function StockPosition() {
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, color: C.textMuted, width: '24px' }}>{open ? '▾' : '▸'}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontWeight: 600 }}>{key}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', color: C.textMid }}>{items.length}</td>
-                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>{qty.toLocaleString('en-IN')}</td>
+                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>{qty.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(value)}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(actualValue)}</td>
                       </tr>
@@ -1387,8 +1462,8 @@ function StockPosition() {
                                     <td style={{ padding: '7px 12px' }}>{it.product?.name}</td>
                                     <td style={{ padding: '7px 12px', fontFamily: 'monospace', color: C.textMuted }}>{it.product?.hsn_code}</td>
                                     <td style={{ padding: '7px 12px' }}>{it.product?.unit}</td>
-                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.opening_qty).toLocaleString('en-IN')}</td>
-                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.actual_qty).toLocaleString('en-IN')}</td>
+                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.opening_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.actual_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                                     <td style={{ padding: '7px 12px', textAlign: 'right' }}>{formatINR(it.rate)}</td>
                                     <td style={{ padding: '7px 12px', textAlign: 'right', fontWeight: 600 }}>{formatINR(toNum(it.opening_qty) * toNum(it.rate))}</td>
                                   </tr>
@@ -1406,7 +1481,7 @@ function StockPosition() {
                 <tr>
                   <td colSpan={2} style={{ padding: '10px 12px', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>Grand Total</td>
                   <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{grandTotal.products}</td>
-                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{grandTotal.qty.toLocaleString('en-IN')}</td>
+                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{grandTotal.qty.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                   <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{formatINR(grandTotal.value)}</td>
                   <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{formatINR(grandTotal.actualValue)}</td>
                 </tr>
@@ -1582,8 +1657,8 @@ function MergeDuplicates() {
                           <td style={{ padding: '7px 10px', textAlign: 'right' }}>{formatINR(p.default_rate)}</td>
                           <td style={{ padding: '7px 10px', textAlign: 'right' }}>{p.gst_rate}%</td>
                           <td style={{ padding: '7px 10px', textAlign: 'right' }}>{p.unit}</td>
-                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{Number(p._opening).toLocaleString('en-IN')}</td>
-                          <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: p.id === keeperId ? 700 : 400 }}>{Number(p._actual).toLocaleString('en-IN')}</td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{Number(p._opening).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                          <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: p.id === keeperId ? 700 : 400 }}>{Number(p._actual).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                           <td style={{ padding: '7px 10px' }}>{p.id === keeperId && <Badge status='active' label='Suggested keeper' />}</td>
                         </tr>
                       ))}
@@ -1699,6 +1774,20 @@ function Products() {
 
   const filtered = products.filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()) || p.hsn_code.includes(search))
 
+  // CHANGED: download of the (filtered) product catalog — columns lead with
+  // the upload format (name,hsn_code,gst_rate,unit,default_rate,description,
+  // category) so an export can be corrected and re-uploaded; status rides
+  // along at the end.
+  function handleExportCSV() {
+    downloadCSV(`products_${today()}.csv`,
+      ['name','hsn_code','gst_rate','unit','default_rate','description','category','status'],
+      filtered.map(p => ({
+        name: p.name || '', hsn_code: p.hsn_code || '', gst_rate: p.gst_rate ?? '',
+        unit: p.unit || '', default_rate: p.default_rate ?? '', description: p.description || '',
+        category: p.category || '', status: p.is_active ? 'Active' : 'Inactive',
+      })))
+  }
+
   const columns = [
     { label: 'S.No.',     render: (p, i) => <span style={{ color: C.textMuted }}>{i + 1}</span> },
     { label: 'Name',      render: p => <div><div style={{ fontWeight: 600 }}>{p.name}</div>{p.description && <div style={{ fontSize: '11px', color: C.textMuted }}>{p.description}</div>}</div> },
@@ -1721,6 +1810,7 @@ function Products() {
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center' }}>
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search products…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, fontFamily: 'inherit' }} />
+        <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
         <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
         <Btn onClick={openNew}>+ New Product</Btn>
       </div>

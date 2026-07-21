@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
@@ -7,12 +7,13 @@ import {
 } from '../../components/UI/index'
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
-import { formatINR, toNum } from '../../utils/money'
+import { formatINR, formatQty, toNum, round2 } from '../../utils/money'
 import { suggestNextNo } from '../../utils/numbering'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master/admin-only delete, matches PI/PO/Invoices pattern
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
-import { getInvoiceLifecycleStage } from '../../utils/stock'
+import { getInvoiceLifecycleStage, fetchStockMovementData, buildStockValuationMap } from '../../utils/stock'
+import { ORDER_STATUSES, deriveOrderStatus, getOrderProgress } from '../../utils/orders'
 import { getDriveViewUrl } from '../../utils/drive'
 import { fetchAllPages } from '../../utils/query'
 import { printDocument } from '../../utils/documentTemplate'
@@ -49,7 +50,8 @@ async function fetchAndBuildLegDoc(docType, docId) {
 }
 
 const MOVEMENT_TYPES    = ['domestic', 'export', 'blended']
-const ORDER_STATUSES    = ['open', 'in_progress', 'completed', 'cancelled']
+// ORDER_STATUSES (now including 'planned') comes from utils/orders.js — the
+// same module that auto-derives status from leg activity.
 const CARGO_STATUSES    = ['awaiting_cargo','cargo_dispatched','cargo_received','ready_for_pi','ready_for_invoice','completed']
 const MOVEMENT_STATUSES = ['pending','in_transit','delivered']
 
@@ -126,9 +128,14 @@ function getLegStatus(pi, po, inv) {
 // mid-flow and the entity's own original purchase was never recorded as an
 // invoice here. Every leg after that is priced off what the entity actually
 // paid to acquire the goods — the previous leg's Invoice value.
-function computeLegMargin(leg, legs, invMap, costBasisMap, crossOrderCostMap) {
-  const inv = invMap[leg.id]
-  if (!inv?.taxable_amount) return null
+// CHANGED: a leg can carry MULTIPLE invoices (partial dispatches / tranches),
+// so both sides of the margin are SUMS — total sale value of all active
+// invoices on this leg vs total purchase cost, never a single-invoice pair.
+// invAggMap[legId] = { taxable, total, qty, count } summed over every
+// non-cancelled invoice on that leg (built in load()).
+function computeLegMargin(leg, legs, invAggMap, costBasisMap, crossOrderCostMap) {
+  const sale = invAggMap[leg.id]?.taxable
+  if (!(sale > 0)) return null
   let cost
   // CHANGED: a leg whose PI was copied from another order's PI isn't a
   // same-order continuation — its real cost is whatever that source leg
@@ -142,10 +149,10 @@ function computeLegMargin(leg, legs, invMap, costBasisMap, crossOrderCostMap) {
     cost = costBasisMap?.[leg.id]
   } else {
     const prevLeg = legs.find(l => l.leg_no === leg.leg_no - 1)
-    cost = prevLeg ? invMap[prevLeg.id]?.taxable_amount : null
+    cost = prevLeg ? invAggMap[prevLeg.id]?.taxable : null
   }
   if (!(cost > 0)) return null
-  return (inv.taxable_amount - cost) / cost * 100
+  return (sale - cost) / cost * 100
 }
 
 // CHANGED: PI/PO/Invoice numbers link straight through to whatever's been
@@ -174,7 +181,7 @@ function DocLink({ doc, children }) {
   )
 }
 
-function OrderSummaryTable({ legs, piMap, poMap, invMap, docMap, costBasisMap, crossOrderCostMap }) {
+function OrderSummaryTable({ legs, piMap, poMap, invMap, invAggMap, docMap, costBasisMap, crossOrderCostMap, stockMarginMap }) {
   if (!legs.length) return null
   const en = e=>e?.short_name||e?.name||'—'
   const td = {padding:'8px 10px',borderBottom:`1px solid ${C.border}`}
@@ -199,10 +206,12 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, docMap, costBasisMap, c
         <tbody>
           {legs.map((leg,ri)=>{
             const pi=piMap[leg.id], po=poMap?.[leg.id], inv=invMap[leg.id]
+            const agg=invAggMap?.[leg.id]
             const legDocs=docMap?.[leg.id]
             const payStatus=!inv?'—':inv.status==='paid'?'Paid':inv.status==='partial'?'Partial':inv.outstanding_amount>0?'Outstanding':'—'
             const payColor=payStatus==='Paid'?C.success:payStatus==='Partial'?C.warning:payStatus==='Outstanding'?C.danger:C.textMuted
-            const margin=computeLegMargin(leg,legs,invMap,costBasisMap,crossOrderCostMap)
+            const margin=computeLegMargin(leg,legs,invAggMap||{},costBasisMap,crossOrderCostMap)
+            const stockMargin=stockMarginMap?.[leg.id]
             const status=getLegStatus(pi,po,inv)
             return (
               <tr key={leg.id} style={{background:ri%2===0?C.surface:'#faf6ed'}}>
@@ -211,13 +220,21 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, docMap, costBasisMap, c
                 <td style={{...td,fontFamily:'monospace'}}>{pi?.pi_no?<DocLink doc={legDocs?.pi}>{pi.pi_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
                 <td style={{...td,color:C.textSoft}}>{pi?fmtDate(pi.pi_date):'—'}</td>
                 <td style={{...td,fontFamily:'monospace'}}>{po?.po_no?<DocLink doc={legDocs?.po}>{po.po_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
-                <td style={{...td,fontFamily:'monospace'}}>{inv?.invoice_no?<DocLink doc={legDocs?.invoice}>{inv.invoice_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
+                <td style={{...td,fontFamily:'monospace'}}>
+                  {inv?.invoice_no?<DocLink doc={legDocs?.invoice}>{inv.invoice_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}
+                  {/* CHANGED: a leg can hold several invoices (tranches) — show the count so the summed Qty/Value columns make sense */}
+                  {agg?.count>1&&<span style={{marginLeft:4,fontSize:'10px',color:C.textMuted,fontFamily:'inherit'}}>+{agg.count-1} more</span>}
+                </td>
                 <td style={{...td,color:C.textSoft}}>{inv?fmtDate(inv.invoice_date):'—'}</td>
-                <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{pi?.total_qty>0?pi.total_qty:'—'}</td>
-                <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{inv?.total_qty>0?inv.total_qty:'—'}</td>
+                <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{pi?.total_qty>0?formatQty(pi.total_qty):'—'}</td>
+                <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{agg?.qty>0?formatQty(agg.qty):'—'}</td>
                 <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{pi?.total_amount>0?formatINR(pi.total_amount):'—'}</td>
-                <td style={{...td,textAlign:'right',fontWeight:600,fontVariantNumeric:'tabular-nums'}}>{inv?.total_amount>0?formatINR(inv.total_amount):'—'}</td>
-                <td style={{...td,textAlign:'right',fontWeight:700,color:margin===null?C.textMuted:margin>=0?'#1a5c30':C.danger}}>{margin!==null?`${margin>=0?'+':''}${margin.toFixed(1)}%`:'—'}</td>
+                <td style={{...td,textAlign:'right',fontWeight:600,fontVariantNumeric:'tabular-nums'}}>{agg?.total>0?formatINR(agg.total):'—'}</td>
+                <td style={{...td,textAlign:'right',fontWeight:700,color:margin===null?C.textMuted:margin>=0?'#1a5c30':C.danger}}>
+                  <div>{margin!==null?`${margin>=0?'+':''}${margin.toFixed(1)}%`:'—'}</div>
+                  {/* CHANGED: second margin basis — sale vs the avg cost the from-entity's stock is actually carried at (opening + purchased-in), see buildStockValuationMap */}
+                  {stockMargin!=null&&<div title='Margin vs average cost of stock on hand' style={{fontSize:'10px',fontWeight:600,color:stockMargin>=0?'#1a7a40':C.danger}}>stk {stockMargin>=0?'+':''}{stockMargin.toFixed(1)}%</div>}
+                </td>
                 <td style={td}><Badge status={status.key} label={status.label}/></td>
                 <td style={{...td,textAlign:'right',fontWeight:600,color:payColor}}>{payStatus}</td>
               </tr>
@@ -251,15 +268,50 @@ function OrdersList() {
   const [form, setForm]       = useState(EMPTY_ORDER)
   const [saving, setSaving]   = useState(false)
   const [toast, setToast]     = useState(null)
-  const [expandedRow, setExpandedRow] = useState(null)
+  // CHANGED: per-order live progress ("Leg 2/3 · Invoiced") derived from leg
+  // document activity — replaces the old expand-row UI.
+  const [progressMap, setProgressMap] = useState({})
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: os }, { data: es }] = await Promise.all([
+    const [{ data: os }, { data: es }, { data: legRows }] = await Promise.all([
       supabase.from('orders').select('*, origin:origin_entity_id(name,short_name), destination:destination_entity_id(name,short_name), financial_years(name)').eq('is_deleted',false).order('created_at',{ascending:false}),
       supabase.from('entities').select('id,name,short_name,state_code').eq('is_active',true).eq('is_deleted',false).order('name'),
+      fetchAllPages(() => supabase.from('order_legs').select('id,order_id,leg_no')),
     ])
-    setOrders(os||[]); setEntities(es||[]); setLoading(false)
+    // CHANGED: derive each order's live status + current-leg progress from
+    // the PI/PO/Invoice activity on its legs (utils/orders.js), and persist
+    // any status that has auto-advanced (planned/open → in_progress →
+    // completed) so the DB never lags behind reality.
+    const [{ data: piRows }, { data: poRows }, { data: invRows }] = await Promise.all([
+      fetchAllPages(() => supabase.from('proforma_invoices').select('order_leg_id,status').not('order_leg_id','is',null).eq('is_deleted',false)),
+      fetchAllPages(() => supabase.from('purchase_orders').select('order_leg_id,status').not('order_leg_id','is',null).eq('is_deleted',false)),
+      fetchAllPages(() => supabase.from('invoices').select('order_leg_id,status,eway_bill_no').not('order_leg_id','is',null).eq('is_deleted',false)),
+    ])
+    const docsByLeg = {}
+    const ensureLeg = id => { if (!docsByLeg[id]) docsByLeg[id] = { pis: [], pos: [], invoices: [] }; return docsByLeg[id] }
+    for (const r of (piRows||[]))  ensureLeg(r.order_leg_id).pis.push(r)
+    for (const r of (poRows||[]))  ensureLeg(r.order_leg_id).pos.push(r)
+    for (const r of (invRows||[])) ensureLeg(r.order_leg_id).invoices.push(r)
+    const legsByOrder = {}
+    for (const l of (legRows||[])) { if (!legsByOrder[l.order_id]) legsByOrder[l.order_id] = []; legsByOrder[l.order_id].push(l) }
+    const pMap = {}
+    const changed = {}
+    const derivedOrders = (os||[]).map(o => {
+      const oLegs = legsByOrder[o.id] || []
+      pMap[o.id] = getOrderProgress(oLegs, docsByLeg)
+      const derived = deriveOrderStatus(o, oLegs, docsByLeg) || o.status
+      if (derived !== o.status) {
+        if (!changed[derived]) changed[derived] = []
+        changed[derived].push(o.id)
+        return { ...o, status: derived }
+      }
+      return o
+    })
+    for (const [status, ids] of Object.entries(changed)) {
+      await supabase.from('orders').update({ status, updated_at: new Date() }).in('id', ids)
+    }
+    setOrders(derivedOrders); setEntities(es||[]); setProgressMap(pMap); setLoading(false)
   }, [])
 
   useEffect(() => { load() }, [load])
@@ -350,59 +402,35 @@ function OrdersList() {
                   <input type='checkbox' checked={filtered.length>0 && selected.size===filtered.length}
                     onChange={toggleSelectAll} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
                 </th>}
-                {['Order','Type','From','To','FY','Status','Date',''].map((h,i)=>(
-                <th key={i} style={{padding:'8px 12px',textAlign:i===7?'right':'left',fontSize:'11px',fontWeight:700,color:C.textSoft,textTransform:'uppercase',letterSpacing:'0.05em',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,whiteSpace:'nowrap'}}>{h}</th>
+                {['Order','Type','From','To','FY','Status','Progress','Date'].map((h,i)=>(
+                <th key={i} style={{padding:'8px 12px',textAlign:'left',fontSize:'11px',fontWeight:700,color:C.textSoft,textTransform:'uppercase',letterSpacing:'0.05em',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,whiteSpace:'nowrap'}}>{h}</th>
               ))}</tr></thead>
               <tbody>
                 {filtered.length===0&&<tr><td colSpan={canDelete?9:8} style={{padding:'48px',textAlign:'center',color:C.textMuted}}>No orders found.</td></tr>}
-                {filtered.map((o,ri)=>(
-                  <React.Fragment key={o.id}>
-                    <tr key={o.id} style={{background:ri%2===0?C.surface:'#faf6ed'}} onMouseEnter={e=>e.currentTarget.style.background='#f0e8d8'} onMouseLeave={e=>e.currentTarget.style.background=ri%2===0?C.surface:'#faf6ed'}>
-                      {/* CHANGED: per-row checkbox */}
-                      {canDelete && <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}} onClick={e=>e.stopPropagation()}>
+                {/* CHANGED: the whole row opens the order (no more ▼/"Open →" buttons at the end) */}
+                {filtered.map((o,ri)=>{
+                  const pr = progressMap[o.id]
+                  return (
+                    <tr key={o.id} style={{background:ri%2===0?C.surface:'#faf6ed',cursor:'pointer'}} onClick={()=>navigate(`/orders/${o.id}`)} onMouseEnter={e=>e.currentTarget.style.background='#f0e8d8'} onMouseLeave={e=>e.currentTarget.style.background=ri%2===0?C.surface:'#faf6ed'}>
+                      {canDelete && <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}} onClick={e=>e.stopPropagation()}>
                         <input type='checkbox' checked={selected.has(o.id)} onChange={()=>toggleSelect(o.id)} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
                       </td>}
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}}><Badge status={o.movement_type}/></td>
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.origin)}</td>
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.destination)}</td>
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`,fontSize:'12px',color:C.textSoft}}>{o.financial_years?.name||'—'}</td>
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`}}><Badge status={o.status}/></td>
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`,fontSize:'12px',color:C.textSoft}}>{fmtDate(o.created_at)}</td>
-                      <td style={{padding:'9px 12px',borderBottom:expandedRow===o.id?'none':`1px solid ${C.border}`,textAlign:'right'}}>
-                        <div style={{display:'flex',gap:'6px',justifyContent:'flex-end'}} onClick={e=>e.stopPropagation()}>
-                          <Btn size='sm' variant='ghost' onClick={()=>setExpandedRow(r=>r===o.id?null:o.id)}>{expandedRow===o.id?'▲':'▼'}</Btn>
-                          <Btn size='sm' variant='primary' onClick={()=>navigate(`/orders/${o.id}`)}>Open →</Btn>
-                        </div>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><Badge status={o.movement_type}/></td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.origin)}</td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.destination)}</td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px',color:C.textSoft}}>{o.financial_years?.name||'—'}</td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><Badge status={o.status}/></td>
+                      {/* CHANGED: live "which leg is this order at" — derived from actual PI/PO/Invoice activity */}
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px',color:C.textSoft,whiteSpace:'nowrap'}}>
+                        {!pr ? <span style={{color:C.textMuted}}>No legs</span>
+                          : pr.legNo ? <><span style={{fontWeight:600,color:C.text}}>Leg {pr.legNo}/{pr.totalLegs}</span> · {pr.stage}</>
+                          : `${pr.totalLegs} leg${pr.totalLegs>1?'s':''} · Not started`}
                       </td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px',color:C.textSoft}}>{fmtDate(o.created_at)}</td>
                     </tr>
-                    {expandedRow===o.id&&(
-                      <tr key={o.id+'-exp'}>
-                        <td colSpan={canDelete?9:8} style={{padding:0,borderBottom:`1px solid ${C.border}`}}>
-                          <div style={{padding:'14px 16px',background:'#f5f0e8',display:'flex',gap:'24px',alignItems:'flex-start',flexWrap:'wrap'}}>
-                            <div style={{flex:1,minWidth:'200px'}}>
-                              <div style={{fontSize:'11px',fontWeight:700,color:C.textMuted,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:'6px'}}>Order Details</div>
-                              <div style={{fontSize:'13px',fontWeight:600,marginBottom:'2px'}}>{o.name}</div>
-                              {o.order_no&&<div style={{fontSize:'11px',fontFamily:'monospace',color:C.textSoft,marginBottom:'4px'}}>{o.order_no}</div>}
-                              <div style={{fontSize:'12px',color:C.textSoft}}>{en(o.origin)} → {en(o.destination)}</div>
-                              {o.notes&&<div style={{fontSize:'12px',color:C.textMuted,marginTop:'4px',fontStyle:'italic'}}>{o.notes}</div>}
-                            </div>
-                            <div style={{flex:1,minWidth:'160px'}}>
-                              <div style={{fontSize:'11px',fontWeight:700,color:C.textMuted,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:'6px'}}>Info</div>
-                              <div style={{fontSize:'12px',color:C.textSoft,marginBottom:'3px'}}>FY: {o.financial_years?.name||'—'}</div>
-                              <div style={{fontSize:'12px',color:C.textSoft,marginBottom:'3px'}}>Created: {fmtDate(o.created_at)}</div>
-                              <div style={{display:'flex',gap:'6px',marginTop:'4px'}}><Badge status={o.movement_type}/><Badge status={o.status}/></div>
-                            </div>
-                            <div style={{flexShrink:0,display:'flex',flexDirection:'column',gap:'8px',justifyContent:'center'}}>
-                              <Btn size='sm' variant='primary' onClick={()=>navigate(`/orders/${o.id}`)}>Open full order →</Btn>
-                              <Btn size='sm' variant='ghost' onClick={()=>setExpandedRow(null)}>Close</Btn>
-                            </div>
-                          </div>
-                        </td>
-                      </tr>
-                    )}
-                  </React.Fragment>
-                ))}
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -477,6 +505,17 @@ function OrderDetail() {
   const [piMap, setPiMap]       = useState({})
   const [poMap, setPoMap]       = useState({})
   const [invMap, setInvMap]     = useState({})
+  // CHANGED: a leg can carry multiple invoices (tranches) — invMap keeps the
+  // primary/latest for the pipeline display, invAggMap holds the SUMS
+  // (taxable/total/qty/count over non-cancelled invoices) that margins and
+  // the summary table's Inv columns are computed from.
+  const [invAggMap, setInvAggMap] = useState({})
+  // CHANGED: per-leg margin vs the from-entity's average stock carrying cost
+  // (opening + purchased-in) — the "what are we really making on the goods
+  // we hold" view, alongside the deal margin.
+  const [stockMarginMap, setStockMarginMap] = useState({})
+  // CHANGED: live "which leg is this order at" summary for the header.
+  const [orderProgress, setOrderProgress] = useState(null)
   const [docMap, setDocMap]     = useState({})
   const [costBasisMap, setCostBasisMap] = useState({}) // CHANGED: leg-1's real acquisition cost, keyed by leg id — see computeLegMargin
   // CHANGED: for a leg whose PI was built via "Copy Lines from Another PI"
@@ -514,11 +553,31 @@ function OrderDetail() {
         // numbers in the summary table can link straight to the uploaded file.
         supabase.from('leg_document_checklist').select('leg_id,doc_slot,status,document:document_id(drive_file_id,drive_url)').in('leg_id',legIds),
       ])
-      const pMap={}, poM={}, iMap={}
+      const pMap={}, poM={}, iMap={}, iListMap={}
       for (const pi of (piRows||[])){ if(!pMap[pi.order_leg_id]) pMap[pi.order_leg_id]=pi }
       for (const po of (poRows||[])){ if(!poM[po.order_leg_id]) poM[po.order_leg_id]=po }
-      for (const inv of (invRows||[])){ if(!iMap[inv.order_leg_id]) iMap[inv.order_leg_id]=inv }
+      for (const inv of (invRows||[])){
+        if(!iMap[inv.order_leg_id]) iMap[inv.order_leg_id]=inv
+        if(!iListMap[inv.order_leg_id]) iListMap[inv.order_leg_id]=[]
+        iListMap[inv.order_leg_id].push(inv)
+      }
       setPiMap(pMap); setPoMap(poM); setInvMap(iMap)
+
+      // CHANGED: sum every non-cancelled invoice on a leg — margins and the
+      // summary table's Inv Qty/Value read these sums, so a leg invoiced in
+      // several tranches is measured on its full purchase/sale totals, not
+      // just whichever invoice happened to be first.
+      const aggMap = {}
+      for (const [legId, list] of Object.entries(iListMap)) {
+        const act = list.filter(v => v.status !== 'cancelled')
+        aggMap[legId] = {
+          taxable: round2(act.reduce((s,v)=>s+toNum(v.taxable_amount),0)),
+          total:   round2(act.reduce((s,v)=>s+toNum(v.total_amount),0)),
+          qty:     round2(act.reduce((s,v)=>s+toNum(v.total_qty),0)),
+          count:   act.length,
+        }
+      }
+      setInvAggMap(aggMap)
 
       // CHANGED: resolve cross-order cost for legs whose PI has
       // copied_from_pi_id set — see crossOrderCostMap above. Only one hop
@@ -533,8 +592,13 @@ function OrderDetail() {
         const sourceLegIds = [...new Set(Object.values(sourceLegBySourcePi).filter(Boolean))]
         let sourceInvByLeg = {}
         if (sourceLegIds.length) {
-          const { data: sourceInvs } = await supabase.from('invoices').select('order_leg_id,taxable_amount').in('order_leg_id', sourceLegIds).eq('is_deleted', false).order('created_at',{ascending:false})
-          for (const inv of (sourceInvs||[])) if (!(inv.order_leg_id in sourceInvByLeg)) sourceInvByLeg[inv.order_leg_id] = inv.taxable_amount
+          // CHANGED: SUM the source leg's non-cancelled invoices, not just the
+          // first — the source leg may have been invoiced in tranches too.
+          const { data: sourceInvs } = await supabase.from('invoices').select('order_leg_id,taxable_amount,status').in('order_leg_id', sourceLegIds).eq('is_deleted', false)
+          for (const inv of (sourceInvs||[])) {
+            if (inv.status === 'cancelled') continue
+            sourceInvByLeg[inv.order_leg_id] = (sourceInvByLeg[inv.order_leg_id] || 0) + toNum(inv.taxable_amount)
+          }
         }
         for (const [legId, pi] of copiedEntries) {
           const sourceLegId = sourceLegBySourcePi[pi.copied_from_pi_id]
@@ -560,11 +624,13 @@ function OrderDetail() {
       // system went live. Only computed for leg 1; every later leg's margin
       // uses the previous leg's own Invoice value instead (see computeLegMargin).
       const leg1 = ls.find(l => l.leg_no === 1)
-      const leg1Inv = leg1 ? iMap[leg1.id] : null
+      // CHANGED: cost basis spans ALL of leg 1's non-cancelled invoices, not
+      // just the first — tranche-invoiced legs need every line costed.
+      const leg1Invs = leg1 ? (iListMap[leg1.id] || []).filter(v => v.status !== 'cancelled') : []
       const cbMap = {}
-      if (leg1Inv) {
+      if (leg1Invs.length) {
         const [{ data: invLines }, { data: obRows }] = await Promise.all([
-          supabase.from('invoice_lines').select('product_id,qty').eq('invoice_id', leg1Inv.id),
+          fetchAllPages(() => supabase.from('invoice_lines').select('product_id,qty').in('invoice_id', leg1Invs.map(v => v.id))),
           supabase.from('stock_opening_balance').select('product_id,rate').eq('entity_id', leg1.from_entity_id).eq('financial_year_id', o.financial_year_id),
         ])
         const rateByProduct = {}
@@ -578,6 +644,62 @@ function OrderDetail() {
         cbMap[leg1.id] = (known && cost > 0) ? cost : null
       }
       setCostBasisMap(cbMap)
+
+      // CHANGED: stock-basis margin per leg — the summed sale value of the
+      // leg's invoices vs what the from-entity's stock is actually carried
+      // at (average of opening rate + purchased-in invoice rates, E-way-Bill
+      // gated like the live stock calc). Left unknown when any product on
+      // the leg has no known carrying cost, rather than guessing.
+      const smMap = {}
+      const allActiveInvs = Object.values(iListMap).flat().filter(v => v.status !== 'cancelled')
+      if (allActiveInvs.length) {
+        const [{ data: allLines }, raw] = await Promise.all([
+          fetchAllPages(() => supabase.from('invoice_lines').select('invoice_id,product_id,qty,rate').in('invoice_id', allActiveInvs.map(v => v.id))),
+          fetchStockMovementData(),
+        ])
+        const valuation = buildStockValuationMap(raw)
+        const linesByInvoice = {}
+        for (const l of (allLines||[])) {
+          if (!linesByInvoice[l.invoice_id]) linesByInvoice[l.invoice_id] = []
+          linesByInvoice[l.invoice_id].push(l)
+        }
+        for (const leg of ls) {
+          const legInvs = (iListMap[leg.id] || []).filter(v => v.status !== 'cancelled')
+          if (!legInvs.length) continue
+          let cost = 0, sale = 0, known = true
+          for (const v of legInvs) {
+            for (const l of (linesByInvoice[v.id] || [])) {
+              const val = valuation[`${leg.from_entity_id}__${l.product_id}`]
+              if (!val || !(val.avg_rate > 0)) { known = false; break }
+              cost += toNum(l.qty) * val.avg_rate
+              sale += toNum(l.qty) * toNum(l.rate)
+            }
+            if (!known) break
+          }
+          if (known && cost > 0) smMap[leg.id] = (sale - cost) / cost * 100
+        }
+      }
+      setStockMarginMap(smMap)
+
+      // CHANGED: auto-advance the order's status from real leg activity
+      // (planned/open → in_progress → completed once every leg's stock has
+      // moved) and persist it, so the Orders list and this page always show
+      // where the order actually stands. 'cancelled' and manual forward
+      // statuses are never overridden — see deriveOrderStatus.
+      const docsByLeg = {}
+      for (const l of ls) docsByLeg[l.id] = {
+        pis:      (piRows||[]).filter(p => p.order_leg_id === l.id),
+        pos:      (poRows||[]).filter(p => p.order_leg_id === l.id),
+        invoices: iListMap[l.id] || [],
+      }
+      setOrderProgress(getOrderProgress(ls, docsByLeg))
+      const derived = deriveOrderStatus(o, ls, docsByLeg)
+      if (derived && derived !== o.status) {
+        const { error: stErr } = await supabase.from('orders').update({ status: derived, updated_at: new Date() }).eq('id', o.id)
+        if (!stErr) setOrder({ ...o, status: derived })
+      }
+    } else {
+      setInvAggMap({}); setStockMarginMap({}); setOrderProgress(null)
     }
   }, [id])
 
@@ -613,19 +735,30 @@ function OrderDetail() {
     payload.is_interstate=(fromEnt?.state_code&&toEnt?.state_code)?fromEnt.state_code!==toEnt.state_code:false
     let error
     if (editingLeg){ const r=await supabase.from('order_legs').update(payload).eq('id',editingLeg.id); error=r.error }
-    else { payload.leg_no=legs.length+1; const r=await supabase.from('order_legs').insert(payload); error=r.error }
+    // CHANGED: max(leg_no)+1, not legs.length+1 — deleting a middle leg used
+    // to make the next added leg collide with an existing leg_no.
+    else { payload.leg_no=legs.reduce((m,l)=>Math.max(m,l.leg_no||0),0)+1; const r=await supabase.from('order_legs').insert(payload); error=r.error }
     setSaving(false)
     if (error) return setToast({message:error.message,type:'error'})
     setToast({message:editingLeg?'Leg updated':'Leg added',type:'success'})
     setLegModal(false); load()
   }
 
-  async function handleDeleteLeg(){ await supabase.from('order_legs').delete().eq('id',confirmDelete.id); setConfirmDelete(null); load() }
+  // CHANGED: both results were unchecked — a leg with PI/PO/Invoice rows
+  // pointing at it fails the FK delete silently, and a failed order save
+  // just closed the modal as if it worked. Surface the error instead.
+  async function handleDeleteLeg(){
+    const { error } = await supabase.from('order_legs').delete().eq('id',confirmDelete.id)
+    setConfirmDelete(null)
+    if (error) return setToast({message:`Could not remove leg: ${error.message}`,type:'error'})
+    load()
+  }
   async function handleSaveOrder(){
     const payload={...orderForm,updated_at:new Date()}
     if (!payload.origin_entity_id) delete payload.origin_entity_id
     if (!payload.destination_entity_id) delete payload.destination_entity_id
-    await supabase.from('orders').update(payload).eq('id',id)
+    const { error } = await supabase.from('orders').update(payload).eq('id',id)
+    if (error) return setToast({message:error.message,type:'error'})
     setEditOrderModal(false); load()
   }
   // CHANGED: soft-delete the order itself (order_legs are untouched — same
@@ -647,12 +780,14 @@ function OrderDetail() {
   // PI-vs-Invoice differences (which was always ~0, see computeLegMargin).
   const leg1 = legs.find(l=>l.leg_no===1)
   const lastLeg = legs.reduce((max,l)=>!max||l.leg_no>max.leg_no?l:max,null)
-  const lastInv = lastLeg ? invMap[lastLeg.id] : null
+  // CHANGED: last leg's SUMMED sale (all non-cancelled invoices), not just
+  // its first invoice — see invAggMap.
+  const lastSale = lastLeg ? invAggMap[lastLeg.id]?.taxable : null
   // CHANGED: same cross-order override as computeLegMargin — if leg 1's own
   // PI was copied from another order's PI, Opening Stock isn't the right
   // cost basis either.
   const leg1Cost = leg1 ? (leg1.id in crossOrderCostMap ? crossOrderCostMap[leg1.id] : costBasisMap[leg1.id]) : null
-  const bm = (lastInv?.taxable_amount>0 && leg1Cost>0) ? ((lastInv.taxable_amount-leg1Cost)/leg1Cost*100) : null
+  const bm = (lastSale>0 && leg1Cost>0) ? ((lastSale-leg1Cost)/leg1Cost*100) : null
 
   return (
     <div>
@@ -674,6 +809,8 @@ function OrderDetail() {
         <StatCard label='Origin'        value={en(order.origin)}/>
         <StatCard label='Destination'   value={en(order.destination)}/>
         <StatCard label='Legs'          value={legs.length}/>
+        {/* CHANGED: live position — which leg the order is currently at */}
+        {orderProgress&&<StatCard label='Current Leg' value={orderProgress.legNo?`Leg ${orderProgress.legNo}/${orderProgress.totalLegs} · ${orderProgress.stage}`:'Not started'}/>}
         {bm!==null&&<StatCard label='Blended Margin' value={<span style={{color:bm>=0?'#1a5c30':C.danger,fontWeight:700}}>{bm>=0?'+':''}{bm.toFixed(1)}%</span>}/>}
       </div>
 
@@ -684,7 +821,7 @@ function OrderDetail() {
             <span style={{fontSize:'11px',color:C.textMuted}}>Live — updates as PIs and Invoices are created</span>
           </div>
           <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px',overflow:'hidden'}}>
-            <OrderSummaryTable legs={legs} piMap={piMap} poMap={poMap} invMap={invMap} docMap={docMap} costBasisMap={costBasisMap} crossOrderCostMap={crossOrderCostMap}/>
+            <OrderSummaryTable legs={legs} piMap={piMap} poMap={poMap} invMap={invMap} invAggMap={invAggMap} stockMarginMap={stockMarginMap} docMap={docMap} costBasisMap={costBasisMap} crossOrderCostMap={crossOrderCostMap}/>
           </div>
         </div>
       )}
@@ -709,7 +846,8 @@ function OrderDetail() {
         ? <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:'8px'}}><EmptyState icon='↗' title='No legs yet' message='Add the first leg to this order.' action={<Btn onClick={openNewLeg}>+ Add Leg</Btn>}/></div>
         : legs.map(leg=>{
           const pi=piMap[leg.id], po=poMap[leg.id], inv=invMap[leg.id]
-          const legM=computeLegMargin(leg,legs,invMap,costBasisMap,crossOrderCostMap)
+          const legM=computeLegMargin(leg,legs,invAggMap,costBasisMap,crossOrderCostMap)
+          const stockM=stockMarginMap[leg.id]
           const docBtn=(docType,docRow,label)=>{
             const docId=docRow?.id
             return (
@@ -736,6 +874,8 @@ function OrderDetail() {
                     <div style={{fontSize:'12px',color:C.textMuted,marginTop:'2px',display:'flex',gap:'12px',alignItems:'center',flexWrap:'wrap'}}>
                       <span>{leg.is_interstate===true?'Interstate — IGST':leg.is_interstate===false?'Local — CGST+SGST':'Tax type TBD'}</span>
                       {legM!==null&&<span style={{fontWeight:700,color:legM>=0?'#1a5c30':C.danger}}>Margin: {legM>=0?'+':''}{legM.toFixed(1)}%</span>}
+                      {/* CHANGED: second margin basis — sale vs avg carrying cost of the from-entity's stock */}
+                      {stockM!=null&&<span title='Margin vs average cost of stock on hand (opening + purchased-in)' style={{fontWeight:700,color:stockM>=0?'#1a7a40':C.danger}}>Stock margin: {stockM>=0?'+':''}{stockM.toFixed(1)}%</span>}
                     </div>
                   </div>
                 </div>

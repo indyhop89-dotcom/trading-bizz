@@ -808,7 +808,7 @@ function ActualStockReport({ entities, defaultEntityId }) {
 
       {rows && (
         <>
-          <StatCard label='Rows' value={rows.length} sub={`${totalQty.toLocaleString('en-IN')} total units across shown rows`} />
+          <StatCard label='Rows' value={rows.length} sub={`${totalQty.toLocaleString('en-IN', { maximumFractionDigits: 2 })} total units across shown rows`} />
           <Card>
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
@@ -827,10 +827,10 @@ function ActualStockReport({ entities, defaultEntityId }) {
                       <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontWeight: 600 }}>{r.entity?.short_name || r.entity?.name || '—'}</td>
                       <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.product?.name || '—'}</td>
                       <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', color: C.textSoft }}>{r.product?.category || '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right' }}>{r.opening_qty.toLocaleString('en-IN')}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', color: C.success }}>+{r.invoiced_in.toLocaleString('en-IN')}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', color: C.warning }}>−{r.invoiced_out.toLocaleString('en-IN')}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 700, color: r.actual_qty < 0 ? C.danger : C.text }}>{r.actual_qty.toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right' }}>{r.opening_qty.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', color: C.success }}>+{r.invoiced_in.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', color: C.warning }}>−{r.invoiced_out.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 700, color: r.actual_qty < 0 ? C.danger : C.text }}>{r.actual_qty.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                     </tr>
                   ))}
                   {rows.length === 0 && <tr><td colSpan={7} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No stock for this selection.</td></tr>}
@@ -905,7 +905,7 @@ function StockMovementReport({ entities }) {
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace' }}>{r.eway_bill_no}</td>
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace' }}>{r.invoice_no || '—'}</td>
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.product}</td>
-                    <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN')}</td>
+                    <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.from}</td>
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.to}</td>
                   </tr>
@@ -976,7 +976,7 @@ function MissingProductReport() {
                       <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace' }}>{r.doc || '—'}</td>
                       <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.date ? fmtDate(r.date) : '—'}</td>
                       <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.entity || '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN')}</td>
+                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 600 }}>{Number(r.qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                     </tr>
                   ))}
                   {rows.length === 0 && <tr><td colSpan={5} style={{ padding: '24px', textAlign: 'center', color: C.success }}>✓ No lines with missing product mapping.</td></tr>}

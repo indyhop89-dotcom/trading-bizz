@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { C, Btn } from './UI/index'
-import { formatINR, toNum, round2, roundRupees } from '../utils/money'
+import { formatINR, formatQty, toNum, round2, roundRupees } from '../utils/money'
 import { calcLineTax } from '../utils/tax'
 import { resolveGSTRate } from '../utils/hsn'
 import { calcSellRate, calcMarginPct } from '../utils/margin'
@@ -52,7 +52,10 @@ export function computeTotals(lines, roundOffOverride) {
   // spread directly into PI/PO/Invoice insert/update payloads, and none of
   // those tables have a `subtotal` column (only total_amount/round_off_amount
   // do). TotalsBar derives it back as total_amount - round_off_amount.
-  return { taxable_amount, cgst_amount, sgst_amount, igst_amount, round_off_amount, total_amount, total_qty: sum.total_qty }
+  // total_qty is round2()'d — summing fractional quantities in floating
+  // point leaves residue (16680.000000000004) that otherwise gets stored
+  // and displayed verbatim.
+  return { taxable_amount, cgst_amount, sgst_amount, igst_amount, round_off_amount, total_amount, total_qty: round2(sum.total_qty) }
 }
 
 function TotalsBar({ totals, interstate, roundOffOverride, onRoundOffOverrideChange }) {
@@ -60,7 +63,7 @@ function TotalsBar({ totals, interstate, roundOffOverride, onRoundOffOverrideCha
   const editableRoundOff = typeof onRoundOffOverrideChange === 'function'
   return (
     <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '10px 18px', minWidth: '260px' }}>
-      <TotRow label='Total Qty' val={totals.total_qty} />
+      <TotRow label='Total Qty' val={formatQty(totals.total_qty)} />
       <TotRow label='Taxable Amount' val={formatINR(totals.taxable_amount)} />
       {interstate
         ? <TotRow label='IGST' val={formatINR(totals.igst_amount)} />
@@ -93,6 +96,69 @@ function TotalsBar({ totals, interstate, roundOffOverride, onRoundOffOverrideCha
         <span>Final Amount</span>
         <span style={{ fontVariantNumeric: 'tabular-nums' }}>{formatINR(totals.total_amount)}</span>
       </div>
+    </div>
+  )
+}
+
+// CHANGED: searchable product picker — the old plain <select> forced
+// scrolling an alphabetical list of thousands of products. Type to filter by
+// name or HSN; each option shows HSN + default rate so duplicate-named
+// products (a real, supported case — same name at different rates) can be
+// told apart. Capped at 50 visible matches; narrowing the search surfaces
+// the rest.
+const PICKER_MAX_RESULTS = 50
+export function ProductPicker({ products, value, onSelect, inp = { padding: '7px 9px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '13px', width: '100%', fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box' } }) {
+  const [query, setQuery] = useState(null) // null = idle (show selected name); string = actively searching
+  const [open, setOpen] = useState(false)
+  const selected = value ? products.find(p => p.id === value) : null
+  const display = query !== null ? query : (selected?.name || '')
+  const q = (query || '').trim().toLowerCase()
+  const allMatches = q
+    ? products.filter(p => (p.name || '').toLowerCase().includes(q) || (p.hsn_code || '').toLowerCase().includes(q))
+    : products
+  const matches = allMatches.slice(0, PICKER_MAX_RESULTS)
+  function choose(id) { onSelect(id); setOpen(false); setQuery(null) }
+  return (
+    <div style={{ position: 'relative', marginBottom: '4px' }}>
+      <input
+        value={display}
+        placeholder='🔍 Search product…'
+        onFocus={() => { setOpen(true); setQuery('') }}
+        onChange={e => { setQuery(e.target.value); setOpen(true) }}
+        onBlur={() => setTimeout(() => { setOpen(false); setQuery(null) }, 150)}
+        onKeyDown={e => { if (e.key === 'Enter' && matches.length === 1) { e.preventDefault(); choose(matches[0].id) } if (e.key === 'Escape') { setOpen(false); setQuery(null); e.currentTarget.blur() } }}
+        style={{ ...inp, fontStyle: selected || query !== null ? 'normal' : 'italic' }}
+      />
+      {open && (
+        <div style={{ position: 'absolute', top: '100%', left: 0, minWidth: '100%', width: 'max-content', maxWidth: '340px', zIndex: 30, background: '#fffdf6', border: `1px solid ${C.border}`, borderRadius: '6px', maxHeight: '240px', overflowY: 'auto', boxShadow: '0 4px 14px rgba(60,45,20,0.18)' }}>
+          {value && (
+            <div onMouseDown={e => { e.preventDefault(); choose('') }}
+              style={{ padding: '6px 9px', fontSize: '11px', color: C.danger, cursor: 'pointer', borderBottom: `1px solid ${C.border}` }}>
+              ✕ Clear selected product
+            </div>
+          )}
+          {matches.length === 0 && (
+            <div style={{ padding: '8px 9px', fontSize: '12px', color: C.textMuted }}>No products match "{query}"</div>
+          )}
+          {matches.map(p => (
+            <div key={p.id}
+              onMouseDown={e => { e.preventDefault(); choose(p.id) }}
+              style={{ padding: '6px 9px', cursor: 'pointer', fontSize: '12px', background: p.id === value ? '#f0e8d8' : 'transparent', borderBottom: '1px solid #f5efe2' }}
+              onMouseEnter={e => { e.currentTarget.style.background = '#f5efe2' }}
+              onMouseLeave={e => { e.currentTarget.style.background = p.id === value ? '#f0e8d8' : 'transparent' }}>
+              <div style={{ fontWeight: 600, lineHeight: 1.3 }}>{p.name}</div>
+              <div style={{ fontSize: '10px', color: C.textMuted, fontFamily: 'monospace' }}>
+                {p.hsn_code || 'no HSN'}{p.default_rate != null ? ` · ₹${p.default_rate}` : ''}{p.unit ? ` · ${p.unit}` : ''}
+              </div>
+            </div>
+          ))}
+          {allMatches.length > PICKER_MAX_RESULTS && (
+            <div style={{ padding: '6px 9px', fontSize: '11px', color: C.textMuted, borderTop: `1px solid ${C.border}` }}>
+              Showing first {PICKER_MAX_RESULTS} of {allMatches.length} — keep typing to narrow down
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -423,10 +489,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
 
                   <td style={td}>
                     {products.length > 0 && !readOnly && (
-                      <select value={line.product_id || ''} onChange={e => onProductSelect(idx, e.target.value)} style={{ ...inp, marginBottom: '4px' }}>
-                        <option value=''>— product —</option>
-                        {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                      </select>
+                      <ProductPicker products={products} value={line.product_id || ''} onSelect={id => onProductSelect(idx, id)} inp={inp} />
                     )}
                     {readOnly
                       ? <span style={{ fontSize: '12px' }}>{line.description}</span>
@@ -448,7 +511,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
 
                   <td style={td}>
                     {readOnly
-                      ? <span style={{ fontSize: '12px' }}>{line.qty}</span>
+                      ? <span style={{ fontSize: '12px' }}>{formatQty(line.qty)}</span>
                       : <input type='number' value={line.qty} onChange={e => updateLine(idx, 'qty', e.target.value)}
                           style={{ ...inp, textAlign: 'right', borderColor: isShort ? '#c0820a' : C.border, background: isShort ? '#fff8e8' : '#fffdf6' }} />
                     }

@@ -7,7 +7,7 @@ import {
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop, MultiSelectDropdown,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
-import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
+import { formatINR, formatQty, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
@@ -20,6 +20,8 @@ import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock } from '../../utils/stock'
+import { isOrderOpenForDocs } from '../../utils/orders'
+import { PAYMENT_TERMS_OPTIONS } from '../../utils/paymentTerms'
 import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
 import { getDriveViewUrl } from '../../utils/drive'
@@ -93,7 +95,6 @@ const EMPTY_FORM = {
   payment_terms: '', delivery_timeline: '', mode_of_transport: 'Road',
 }
 
-const PAYMENT_TERMS_OPTIONS = ['100% Advance', 'Net 30 Days', 'Net 45 Days', 'Net 60 Days', '50% Advance, 50% on Delivery', 'Against Delivery', 'LC at Sight', 'Cash on Delivery']
 const TRANSPORT_MODES = ['Road', 'Air', 'Rail', 'Sea', 'Courier']
 
 // Write planned stock movements on PI create
@@ -164,7 +165,8 @@ function PIList() {
         .select('*, from_entity:from_entity_id(name,short_name), to_entity:to_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      // `status` so the New PI modal can offer only still-open orders
+      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
       supabase.from('hsn_master').select('*').eq('is_active', true),
       // CHANGED: for CSV product resolution below. Paginated — products can
       // exceed PostgREST's default 1000-row cap, which would otherwise
@@ -495,6 +497,7 @@ function PIList() {
       const totals = { ...rawTotals,
         taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount),
         sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount),
+        total_qty: round2(rawTotals.total_qty),
         total_amount: finalTotal, round_off_amount: round2(finalTotal - preciseSubtotal) }
 
       const { data: pi, error: piErr } = await supabase.from('proforma_invoices').insert({
@@ -546,7 +549,7 @@ function PIList() {
     { label: 'Date',   render: p => <span style={{ fontSize: '12px' }}>{fmtDate(p.pi_date)}</span> },
     { label: 'Order',  render: p => <span style={{ fontSize: '12px', color: C.textSoft }}>{p.orders?.name || '—'}</span> },
     { label: 'Tax',    render: p => <Badge status={p.is_interstate ? 'export' : 'domestic'} label={p.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /> },
-    { label: 'Qty', right: true, render: p => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{p.total_qty || '—'}</span> },
+    { label: 'Qty', right: true, render: p => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{p.total_qty ? formatQty(p.total_qty) : '—'}</span> },
     { label: 'Amount', right: true, render: p => <span style={{ fontWeight: 600 }}>{formatINR(p.total_amount)}</span> },
     { label: 'Status', render: p => <Badge status={p.status} /> },
   ]
@@ -716,7 +719,8 @@ function PIList() {
             <FormRow label='Order'>
               <Select value={form.order_id} onChange={e => { setF('order_id', e.target.value); loadLegs(e.target.value) }}>
                 <option value=''>No order</option>
-                {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                {/* CHANGED: only orders still open for documents — completed/cancelled hidden (current selection stays visible) */}
+                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Order Leg'>
@@ -823,7 +827,7 @@ function PIDetail() {
       // column (which is recomputed directly in Postgres, no REST cap).
       fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id',id).order('line_no')),
       supabase.from('hsn_master').select('*').eq('is_active',true),
-      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
     setPI(p); setLines(ls||[]); setHsnMap(buildHSNMap(hsnRows||[])); setOrders(os||[]); setProducts(prods||[]); setLoading(false)
@@ -1068,7 +1072,8 @@ function PIDetail() {
             <FormRow label='Order'>
               <Select value={editForm.order_id} onChange={e=>{setEditForm(f=>({...f,order_id:e.target.value,order_leg_id:''}));loadLegs(e.target.value)}}>
                 <option value=''>No order</option>
-                {orders.map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+                {/* CHANGED: only still-open orders (current selection stays visible) */}
+                {orders.filter(o=>isOrderOpenForDocs(o)||o.id===editForm.order_id).map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Order Leg'>

@@ -178,11 +178,11 @@ export const TEMPLATES = {
 
   invoices: {
     filename: 'invoices_template.csv',
-    headers:  ['invoice_date', 'invoice_type', 'seller_entity', 'buyer_entity', 'is_interstate', 'product', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'due_date', 'notes', 'invoice_no'],
+    headers:  ['invoice_date', 'invoice_type', 'seller_entity', 'buyer_entity', 'is_interstate', 'product', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate', 'payment_terms', 'due_date', 'notes', 'invoice_no'],
     rows: [
-      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', product: 'T-Shirt Basic Round Neck', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, due_date: '2025-05-30', notes: '', invoice_no: '' },
-      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', product: 'Polo T-Shirt',             description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, due_date: '2025-05-30', notes: '', invoice_no: '' },
-      { invoice_date: '2025-05-05', invoice_type: 'sales', seller_entity: 'Retail', buyer_entity: 'MVL',  is_interstate: 'true',  product: 'T-Shirt Basic Round Neck', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, due_date: '2025-06-05', notes: 'Export invoice', invoice_no: '' },
+      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', product: 'T-Shirt Basic Round Neck', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 500, unit: 'Nos', rate: 250, gst_rate: 12, payment_terms: 'Net 30 Days', due_date: '', notes: '', invoice_no: '' },
+      { invoice_date: '2025-04-30', invoice_type: 'sales', seller_entity: 'Siddi', buyer_entity: 'Retail', is_interstate: 'false', product: 'Polo T-Shirt',             description: 'Polo T-Shirt',             hsn_code: '6110', qty: 200, unit: 'Nos', rate: 450, gst_rate: 12, payment_terms: 'Net 30 Days', due_date: '', notes: '', invoice_no: '' },
+      { invoice_date: '2025-05-05', invoice_type: 'sales', seller_entity: 'Retail', buyer_entity: 'MVL',  is_interstate: 'true',  product: 'T-Shirt Basic Round Neck', description: 'T-Shirt Basic Round Neck', hsn_code: '6109', qty: 300, unit: 'Nos', rate: 320, gst_rate: 12, payment_terms: '', due_date: '2025-06-05', notes: 'Export invoice', invoice_no: '' },
     ],
     notes: [
       '# Each row = one LINE ITEM. Multiple rows with same invoice_date+seller+buyer = same Invoice.',

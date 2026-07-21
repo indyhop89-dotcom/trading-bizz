@@ -7,7 +7,7 @@ import {
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, CsvFileDrop, MultiSelectDropdown,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
-import { formatINR, toNum, round2, roundRupees } from '../../utils/money'
+import { formatINR, formatQty, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
@@ -19,6 +19,8 @@ import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '..
 import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { isOrderOpenForDocs } from '../../utils/orders'
+import { PAYMENT_TERMS_OPTIONS } from '../../utils/paymentTerms'
 import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
 import { getDriveViewUrl } from '../../utils/drive'
@@ -88,7 +90,6 @@ const EMPTY_FORM = {
   payment_terms: '', delivery_timeline: '', mode_of_transport: 'Road',
 }
 
-const PAYMENT_TERMS_OPTIONS = ['100% Advance', 'Net 30 Days', 'Net 45 Days', 'Net 60 Days', '50% Advance, 50% on Delivery', 'Against Delivery', 'LC at Sight', 'Cash on Delivery']
 const TRANSPORT_MODES = ['Road', 'Air', 'Rail', 'Sea', 'Courier']
 
 // ─── PO List ──────────────────────────────────────────────────────────────────
@@ -152,7 +153,8 @@ function POList() {
         .select('*, buyer:buyer_entity_id(name,short_name), seller:seller_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      // `status` so the New PO modal can offer only still-open orders
+      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
       supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
       // CHANGED: for CSV product resolution below. Paginated — products can
@@ -254,6 +256,10 @@ function POList() {
     const pi = pis.find(p => p.order_leg_id === legId)
     if (pi) handlePISelect(pi.id)
   }
+
+  // PI ids already consumed by a (non-deleted) PO — the Linked PI dropdown
+  // hides these so it only offers PIs still awaiting conversion.
+  const usedPiIds = new Set(pos.filter(p => p.pi_id).map(p => p.pi_id))
 
   async function loadLegs(orderId) {
     if (!orderId) { setLegs([]); return }
@@ -492,7 +498,7 @@ function POList() {
       // computeTotals() in LineItemsEditor.jsx for why.
       const poPreciseSubtotal = round2(rawTotals.taxable_amount + rawTotals.cgst_amount + rawTotals.sgst_amount + rawTotals.igst_amount)
       const poFinalTotal = roundRupees(poPreciseSubtotal)
-      const totals = { ...rawTotals, taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount), sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount), total_amount: poFinalTotal, round_off_amount: round2(poFinalTotal - poPreciseSubtotal) }
+      const totals = { ...rawTotals, taxable_amount: round2(rawTotals.taxable_amount), cgst_amount: round2(rawTotals.cgst_amount), sgst_amount: round2(rawTotals.sgst_amount), igst_amount: round2(rawTotals.igst_amount), total_qty: round2(rawTotals.total_qty), total_amount: poFinalTotal, round_off_amount: round2(poFinalTotal - poPreciseSubtotal) }
       const { data: po, error: poErr } = await supabase.from('purchase_orders').insert({ po_date: poDate, buyer_entity_id: buyerE.id, seller_entity_id: sellerE.id, is_interstate: interstate, delivery_date: deliveryDate, notes: meta.notes||null, status: 'open', po_no: poNo, ...totals }).select().single()
       if (poErr) { errors.push(`PO ${meta.po_date}: ${poErr.message}`); continue }
       const { error: lineInsertErr } = await supabase.from('purchase_order_lines').insert(poLines.map(l => ({ ...l, po_id: po.id })))
@@ -553,7 +559,7 @@ function POList() {
     { label: 'Date',    render: p => <span style={{ fontSize: '12px' }}>{fmtDate(p.po_date)}</span> },
     { label: 'Order',   render: p => <span style={{ fontSize: '12px', color: C.textSoft }}>{p.orders?.name || '—'}</span> },
     { label: 'Delivery',render: p => <span style={{ fontSize: '12px', color: C.textSoft }}>{p.delivery_date ? fmtDate(p.delivery_date) : '—'}</span> },
-    { label: 'Qty', right: true, render: p => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{p.total_qty || '—'}</span> },
+    { label: 'Qty', right: true, render: p => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{p.total_qty ? formatQty(p.total_qty) : '—'}</span> },
     { label: 'Amount',  right: true, render: p => <span style={{ fontWeight: 600 }}>{formatINR(p.total_amount)}</span> },
     { label: 'Status',  render: p => <Badge status={p.status} /> },
   ]
@@ -675,10 +681,13 @@ function POList() {
             <FormRow label='Delivery Date'>
               <Input type='date' value={form.delivery_date} onChange={e => setF('delivery_date', e.target.value)} />
             </FormRow>
-            <FormRow label='Linked PI'>
+            <FormRow label='Linked PI' hint='Only PIs not yet converted to a PO'>
               <Select value={form.pi_id} onChange={e => handlePISelect(e.target.value)}>
                 <option value=''>No PI linked</option>
-                {pis.map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0, 8)}</option>)}
+                {/* CHANGED: hide PIs that already have a (non-deleted) PO —
+                    every PI in the system was listed, so the dropdown grew
+                    endlessly. The currently-selected one stays visible. */}
+                {pis.filter(p => p.id === form.pi_id || !usedPiIds.has(p.id)).map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0, 8)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Buyer Entity' required hint={buyerEntityFrozen ? 'Locked to the only entity you have access to' : undefined}>
@@ -702,7 +711,8 @@ function POList() {
             <FormRow label='Order'>
               <Select value={form.order_id} onChange={e => { setF('order_id', e.target.value); loadLegs(e.target.value) }}>
                 <option value=''>No order</option>
-                {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                {/* CHANGED: only orders still open for documents — completed/cancelled hidden (current selection stays visible) */}
+                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Order Leg'>

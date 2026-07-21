@@ -16,9 +16,13 @@ export async function fetchStockMovementData() {
   // cap — a plain .select() silently truncates rather than erroring, which
   // undercounts opening/actual stock once either table grows past 1000 rows.
   const [{ data: opening }, { data: invLines }, { data: adjustments }] = await Promise.all([
-    fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_id, qty')),
+    // `rate` on both feeds buildStockValuationMap (avg acquisition cost) —
+    // the qty-only consumers just ignore it. Date columns (as_of_date,
+    // invoice_date/eway_bill_date, adjustment_date) feed filterStockDataAsOf
+    // for the point-in-time stock view.
+    fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_id, qty, rate, as_of_date')),
     fetchAllPages(() => supabase.from('invoice_lines')
-      .select('qty, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, invoice_type, is_deleted, source_invoice_id)')
+      .select('qty, rate, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, eway_bill_date, invoice_date, invoice_type, is_deleted, source_invoice_id)')
       .not('invoice', 'is', null)),
     // CHANGED: manual corrections (shortfall/damage/found/recount/offloaded)
     // — a signed qty_delta applied straight into actual_qty, same as
@@ -29,7 +33,7 @@ export async function fetchStockMovementData() {
     // (sold/disposed of outside it) — they affect Actual Stock exactly like
     // every other reason, but never P&L (Reports' P&L/Profitability tabs
     // are computed purely from invoices/expenses, not stock_adjustments).
-    fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_id, qty_delta')),
+    fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_id, qty_delta, adjustment_date')),
   ])
   return {
     opening: opening || [],
@@ -85,6 +89,55 @@ export function buildActualStockMap({ opening, invLines, adjustments = [] }) {
   }
   for (const row of Object.values(map)) {
     row.actual_qty = row.opening_qty + row.invoiced_in - row.invoiced_out + row.adjustment_qty
+  }
+  return map
+}
+
+// Point-in-time view: keep only the movements that had happened by asOfDate
+// (ISO YYYY-MM-DD), so buildActualStockMap over the result answers "what did
+// each entity hold on that day". Movement dates: opening rows use as_of_date,
+// invoice lines use the E-way Bill date (the actual dispatch event) falling
+// back to invoice_date, adjustments use adjustment_date. Rows with no date
+// at all are kept — they can't be placed in time, and silently dropping them
+// would understate stock. Pass a falsy asOfDate to get the data unchanged.
+export function filterStockDataAsOf(raw, asOfDate) {
+  if (!asOfDate) return raw
+  return {
+    opening: raw.opening.filter(ob => !ob.as_of_date || ob.as_of_date <= asOfDate),
+    adjustments: raw.adjustments.filter(a => !a.adjustment_date || a.adjustment_date <= asOfDate),
+    invLines: raw.invLines.filter(l => {
+      const moved = l.invoice.eway_bill_date || l.invoice.invoice_date
+      return !moved || moved <= asOfDate
+    }),
+  }
+}
+
+// Average acquisition cost per entity+product — what the stock an entity is
+// holding actually cost it: opening stock at its recorded rate plus goods
+// invoiced IN (as buyer, E-way-Bill gated like everything else) at the
+// invoice line rate. Returns { "entityId__productId": { qty_in, value_in,
+// avg_rate } }. This is the cost basis for the "stock margin" view — margin
+// of a sale against what the goods on hand are actually carried at, as
+// opposed to the deal margin (this sale vs the previous leg's sale).
+export function buildStockValuationMap({ opening, invLines }) {
+  const map = {}
+  function ensure(entityId, productId) {
+    const key = `${entityId}__${productId}`
+    if (!map[key]) map[key] = { qty_in: 0, value_in: 0, avg_rate: 0 }
+    return map[key]
+  }
+  for (const ob of opening) {
+    const s = ensure(ob.entity_id, ob.product_id)
+    s.qty_in += toNum(ob.qty)
+    s.value_in += toNum(ob.qty) * toNum(ob.rate)
+  }
+  for (const l of invLines) {
+    const s = ensure(l.invoice.buyer_entity_id, l.product_id)
+    s.qty_in += toNum(l.qty)
+    s.value_in += toNum(l.qty) * toNum(l.rate)
+  }
+  for (const s of Object.values(map)) {
+    s.avg_rate = s.qty_in > 0 ? s.value_in / s.qty_in : 0
   }
   return map
 }

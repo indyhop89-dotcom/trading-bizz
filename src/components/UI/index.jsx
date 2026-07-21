@@ -65,6 +65,7 @@ const BADGE_COLORS = {
   paid:         { bg: 'var(--success-light)', text: 'var(--success)' },
   partial:      { bg: 'var(--warning-light)', text: 'var(--warning)' },
   open:         { bg: 'var(--info-light)',    text: 'var(--info)' },
+  planned:      { bg: '#ede8f3', text: '#5a3a8a' },
   completed:    { bg: 'var(--success-light)', text: 'var(--success)' },
   cancelled:    { bg: 'var(--danger-light)',  text: 'var(--danger)' },
   active:       { bg: 'var(--success-light)', text: 'var(--success)' },
@@ -716,7 +717,7 @@ export function StatusStrip({ status }) {
     draft: RAW.warning, open: RAW.accent, active: RAW.success,
     submitted: RAW.accent, paid: RAW.success, completed: RAW.success,
     cancelled: RAW.danger, overdue: RAW.danger, pending: RAW.warning,
-    partial: RAW.warning, in_progress: RAW.accent,
+    partial: RAW.warning, in_progress: RAW.accent, planned: RAW.warning,
   }
   const color = colorMap[status?.toLowerCase()] || RAW.accent
   return (
