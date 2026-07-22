@@ -26,6 +26,7 @@ function makeQuery(data, error = null) {
     neq:    vi.fn().mockReturnThis(),
     in:     vi.fn().mockReturnThis(),
     not:    vi.fn().mockReturnThis(),
+    or:     vi.fn().mockReturnThis(),
     range:  vi.fn().mockReturnThis(),
     insert: vi.fn().mockResolvedValue({ data: null, error: null }),
     then:   resolved.then.bind(resolved),

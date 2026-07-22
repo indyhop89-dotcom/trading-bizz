@@ -15,7 +15,7 @@ import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { getInvoiceLifecycleStage, fetchActualStockPosition } from '../../utils/stock'
 import { ORDER_STATUSES, deriveOrderStatus, getOrderProgress } from '../../utils/orders'
 import { getDriveViewUrl } from '../../utils/drive'
-import { fetchAllPages } from '../../utils/query'
+import { fetchAllPages, isAutoPurchaseMirror } from '../../utils/query'
 import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
 // CHANGED: import from the shared utils module (not '../PI/index' etc.) —
@@ -287,13 +287,16 @@ function OrdersList() {
     const [{ data: piRows }, { data: poRows }, { data: invRows }] = await Promise.all([
       fetchAllPages(() => supabase.from('proforma_invoices').select('order_leg_id,status').not('order_leg_id','is',null).eq('is_deleted',false)),
       fetchAllPages(() => supabase.from('purchase_orders').select('order_leg_id,status').not('order_leg_id','is',null).eq('is_deleted',false)),
-      fetchAllPages(() => supabase.from('invoices').select('order_leg_id,status,eway_bill_no').not('order_leg_id','is',null).eq('is_deleted',false)),
+      fetchAllPages(() => supabase.from('invoices').select('order_leg_id,status,eway_bill_no,invoice_type,source_invoice_id').not('order_leg_id','is',null).eq('is_deleted',false)),
     ])
     const docsByLeg = {}
     const ensureLeg = id => { if (!docsByLeg[id]) docsByLeg[id] = { pis: [], pos: [], invoices: [] }; return docsByLeg[id] }
     for (const r of (piRows||[]))  ensureLeg(r.order_leg_id).pis.push(r)
     for (const r of (poRows||[]))  ensureLeg(r.order_leg_id).pos.push(r)
-    for (const r of (invRows||[])) ensureLeg(r.order_leg_id).invoices.push(r)
+    // CHANGED: exclude auto-generated purchase mirrors (see utils/query.js) —
+    // otherwise a leg's tranche/document activity counts each mirrored
+    // transaction twice.
+    for (const r of (invRows||[]).filter(inv => !isAutoPurchaseMirror(inv))) ensureLeg(r.order_leg_id).invoices.push(r)
     const legsByOrder = {}
     for (const l of (legRows||[])) { if (!legsByOrder[l.order_id]) legsByOrder[l.order_id] = []; legsByOrder[l.order_id].push(l) }
     const pMap = {}
@@ -549,15 +552,25 @@ function OrderDetail() {
         supabase.from('proforma_invoices').select('id,pi_no,status,total_amount,total_qty,taxable_amount,order_leg_id,pi_date,copied_from_pi_id').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
         // CHANGED: PO feeds the cascading leg Status column (PI → PO → Invoice → Movement)
         supabase.from('purchase_orders').select('id,po_no,status,order_leg_id').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
-        supabase.from('invoices').select('id,invoice_no,status,total_amount,total_qty,taxable_amount,outstanding_amount,order_leg_id,invoice_date,eway_bill_no,invoice_type').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
+        supabase.from('invoices').select('id,invoice_no,status,total_amount,total_qty,taxable_amount,outstanding_amount,order_leg_id,invoice_date,eway_bill_no,invoice_type,source_invoice_id').in('order_leg_id',legIds).eq('is_deleted',false).order('created_at',{ascending:false}),
         // CHANGED: joined document (drive_file_id/drive_url) so PI/PO/Invoice
         // numbers in the summary table can link straight to the uploaded file.
         supabase.from('leg_document_checklist').select('leg_id,doc_slot,status,document:document_id(drive_file_id,drive_url)').in('leg_id',legIds),
       ])
+      // CHANGED: drop auto-generated purchase mirrors (invoice_type='purchase'
+      // with source_invoice_id set — see utils/query.js) before building
+      // ANY of the per-leg maps below. The mirror is created immediately
+      // after (so always later than) its source, and this array is ordered
+      // created_at DESC — so without this filter, `iMap`'s "keep the first
+      // one seen" pick would take the MIRROR as the leg's "primary" invoice
+      // for every internal-buyer leg (wrong invoice_no/date/status shown in
+      // the pipeline and summary table), and `iListMap`'s sums would double
+      // every such leg's Inv Qty/Value and margin inputs.
+      const realInvRows = (invRows||[]).filter(inv => !isAutoPurchaseMirror(inv))
       const pMap={}, poM={}, iMap={}, iListMap={}
       for (const pi of (piRows||[])){ if(!pMap[pi.order_leg_id]) pMap[pi.order_leg_id]=pi }
       for (const po of (poRows||[])){ if(!poM[po.order_leg_id]) poM[po.order_leg_id]=po }
-      for (const inv of (invRows||[])){
+      for (const inv of realInvRows){
         if(!iMap[inv.order_leg_id]) iMap[inv.order_leg_id]=inv
         if(!iListMap[inv.order_leg_id]) iListMap[inv.order_leg_id]=[]
         iListMap[inv.order_leg_id].push(inv)
@@ -595,9 +608,12 @@ function OrderDetail() {
         if (sourceLegIds.length) {
           // CHANGED: SUM the source leg's non-cancelled invoices, not just the
           // first — the source leg may have been invoiced in tranches too.
-          const { data: sourceInvs } = await supabase.from('invoices').select('order_leg_id,taxable_amount,status').in('order_leg_id', sourceLegIds).eq('is_deleted', false)
+          // Also excludes auto-generated purchase mirrors (utils/query.js) —
+          // otherwise a source leg whose buyer was internal would have its
+          // real cost double-counted here.
+          const { data: sourceInvs } = await supabase.from('invoices').select('order_leg_id,taxable_amount,status,invoice_type,source_invoice_id').in('order_leg_id', sourceLegIds).eq('is_deleted', false)
           for (const inv of (sourceInvs||[])) {
-            if (inv.status === 'cancelled') continue
+            if (inv.status === 'cancelled' || isAutoPurchaseMirror(inv)) continue
             sourceInvByLeg[inv.order_leg_id] = (sourceInvByLeg[inv.order_leg_id] || 0) + toNum(inv.taxable_amount)
           }
         }

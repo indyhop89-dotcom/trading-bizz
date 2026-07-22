@@ -14,6 +14,35 @@ export function withTimeout(promise, ms = 20000, label = 'request') {
   ])
 }
 
+// The moment a 'sales' invoice gets an E-way Bill, autoCompletePurchaseMirror
+// (Invoices/index.jsx) auto-creates a SECOND invoice row for the buyer's own
+// purchase register — invoice_type: 'purchase', source_invoice_id pointing
+// back at the original, but seller_entity_id/buyer_entity_id/taxable_amount/
+// cgst/sgst/igst/total_amount/order_leg_id all copied VERBATIM from the
+// source. It represents the exact same physical transaction, not a second
+// one — any query that aggregates invoices by seller/buyer (GST output vs
+// input tax, P&L, ledgers, ageing, per-leg tranche totals, dashboard totals)
+// MUST exclude it or every mirrored transaction gets double-counted.
+// Concretely: an entity that buys from an internal (non-external) upstream
+// entity gets its purchase mirrored (input tax doubles), but only gets its
+// own sale mirrored if ITS buyer is also internal — sell to an external
+// customer and output tax stays single-counted. That asymmetry is what
+// makes a genuinely profitable trade (real output > real input) show up as
+// "more inward than outward" once the purchase side is silently doubled.
+// stock.js's fetchStockMovementData() and the Invoices list page already
+// apply the equivalent filter; this is the same rule for any other
+// aggregate query built straight from `.from('invoices')`.
+export function excludeAutoPurchaseMirrors(query) {
+  return query.or('invoice_type.neq.purchase,source_invoice_id.is.null')
+}
+
+// Same rule as excludeAutoPurchaseMirrors, for callers that already have the
+// rows in JS (e.g. a leg's invoice list built up client-side) rather than
+// shaping a fresh query.
+export function isAutoPurchaseMirror(inv) {
+  return inv?.invoice_type === 'purchase' && !!inv?.source_invoice_id
+}
+
 // PostgREST caps a single response at 1000 rows by default. Any table that
 // can realistically grow past that (products, opening stock, etc.) needs to
 // page through with .range() or it silently truncates — the query looks like

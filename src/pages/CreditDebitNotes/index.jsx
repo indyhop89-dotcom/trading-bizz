@@ -13,6 +13,7 @@ import { buildHSNMap } from '../../utils/hsn'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
 import { hasFullAccess } from '../../utils/roles'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces broken next_note_no RPC / undefined resolveFY
+import { excludeAutoPurchaseMirrors } from '../../utils/query'
 
 const NOTE_TYPES = ['credit_note', 'debit_note']
 const REASONS    = ['return', 'rate_correction', 'quantity_correction', 'other']
@@ -82,7 +83,10 @@ function NoteList() {
         .select('*, issuer:issuer_entity_id(name,short_name), receiver:receiver_entity_id(name,short_name), invoice:against_invoice_id(invoice_no)')
         .eq('is_deleted', false).order('note_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('invoices').select('id,invoice_no,seller_entity_id,buyer_entity_id,is_interstate').eq('is_deleted', false).neq('status','cancelled').order('invoice_date', { ascending: false }),
+      // CHANGED: excludeAutoPurchaseMirrors — a credit/debit note must
+      // reference the real invoice, never its auto-generated bookkeeping
+      // mirror (see utils/query.js).
+      excludeAutoPurchaseMirrors(supabase.from('invoices').select('id,invoice_no,seller_entity_id,buyer_entity_id,is_interstate').eq('is_deleted', false).neq('status','cancelled').order('invoice_date', { ascending: false })),
       supabase.from('hsn_master').select('*').eq('is_active', true),
     ])
     setNotes(ns || [])

@@ -4,9 +4,10 @@
  * Idempotent — checks if notification already exists before inserting.
  */
 import { supabase } from '../supabaseClient'
-import { fetchActualStockPosition } from './stock'
+import { fetchActualStockPosition, NEGATIVE_STOCK_FLAG_ENABLED } from './stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from './payments'
 import { formatINR, formatNumberIN } from './money'
+import { excludeAutoPurchaseMirrors } from './query'
 
 /**
  * Generate all notifications for a given user.
@@ -23,12 +24,16 @@ export async function generateNotifications(userId) {
   // 1 & 2. Invoice payment overdue / due soon — computed per INVOICE, aggregating
   // all payment tranches recorded against it (invoice_payments is now one row
   // per payment tranche, not a single snapshot of the whole invoice).
-  const { data: invForNotif } = await supabase
+  // CHANGED: excludeAutoPurchaseMirrors — a mirror's due_date/outstanding
+  // are copied from its source and never get paid down through the UI (see
+  // utils/query.js), so without this every internal transaction generated a
+  // second, confusing "overdue"/"payment due" alert for the phantom copy.
+  const { data: invForNotif } = await excludeAutoPurchaseMirrors(supabase
     .from('invoices')
     .select('id, invoice_no, total_amount, due_date, buyer_entity_id')
     .eq('is_deleted', false)
     .neq('status', 'cancelled')
-    .not('due_date', 'is', null)
+    .not('due_date', 'is', null))
 
   const invIds = (invForNotif || []).map(i => i.id)
   let tranchesByInvoice = new Map()
@@ -256,11 +261,14 @@ export async function generateNotifications(userId) {
   const { data: entityRows } = await supabase.from('entities').select('id, is_active, is_deleted')
   const inactiveEntitySet = new Set((entityRows || []).filter(e => !e.is_active || e.is_deleted).map(e => e.id))
   if (inactiveEntitySet.size > 0) {
-    const { data: invEntityCheck } = await supabase
+    // CHANGED: excludeAutoPurchaseMirrors — a mirror shares the same
+    // seller/buyer as its source, so without this the same stale-entity
+    // issue alerted twice (once per row).
+    const { data: invEntityCheck } = await excludeAutoPurchaseMirrors(supabase
       .from('invoices')
       .select('id, invoice_no, seller_entity_id, buyer_entity_id')
       .eq('is_deleted', false)
-      .neq('status', 'cancelled')
+      .neq('status', 'cancelled'))
     for (const inv of (invEntityCheck || [])) {
       if (inactiveEntitySet.has(inv.seller_entity_id) || inactiveEntitySet.has(inv.buyer_entity_id)) {
         notifs.push({
@@ -280,8 +288,11 @@ export async function generateNotifications(userId) {
   // entity, not per product) so several negative products at the same
   // entity don't flood the list — it's the same underlying problem either
   // way (more has been billed out than was ever received in).
+  // CHANGED: NEGATIVE_STOCK_FLAG_ENABLED — see utils/stock.js. Temporarily
+  // disabled; shares the suppression with Stock Position's "Billed Beyond
+  // Stock" indicator since both read the same actual_qty signal.
   const negativeByEntity = new Map()
-  for (const row of Object.values(actualMap)) {
+  if (NEGATIVE_STOCK_FLAG_ENABLED) for (const row of Object.values(actualMap)) {
     if (row.actual_qty >= 0 || !row.product_id) continue
     negativeByEntity.set(row.entity_id, (negativeByEntity.get(row.entity_id) || 0) + 1)
   }
@@ -306,11 +317,14 @@ export async function generateNotifications(userId) {
     if (!dateStr || !fyRows?.length) return true // nothing configured to check against — don't false-positive
     return fyRows.some(fy => dateStr >= fy.start_date && dateStr <= fy.end_date)
   }
-  const { data: invDateCheck } = await supabase
+  // CHANGED: excludeAutoPurchaseMirrors — a mirror's dates are copied
+  // verbatim from its source, so without this the same date issue alerted
+  // twice (once per row).
+  const { data: invDateCheck } = await excludeAutoPurchaseMirrors(supabase
     .from('invoices')
     .select('id, invoice_no, invoice_date, eway_bill_date')
     .eq('is_deleted', false)
-    .neq('status', 'cancelled')
+    .neq('status', 'cancelled'))
   for (const inv of (invDateCheck || [])) {
     if (!inAnyFY(inv.invoice_date)) {
       notifs.push({

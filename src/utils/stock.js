@@ -9,6 +9,21 @@ import { fetchAllPages } from './query'
 // E-way Bill number entered before it was cancelled.
 const MOVEMENT_STATUSES_EXCLUDED = ['draft', 'cancelled']
 
+// CHANGED: temporarily disabled at the user's explicit request — a real
+// business review found every "Billed Beyond Stock" / "Negative stock risk"
+// flag across the whole transaction history to be a false positive, most
+// likely explained by the invoice_lines/stock_opening_balance RLS gap fixed
+// in migration 043 (a non-master viewer's Actual Stock aggregation silently
+// dropped rows for entities/invoices they had no grant on, understating
+// inbound movements and making a real, fully-covered sale look oversold).
+// Shared by Stock/index.jsx (the "Billed Beyond Stock" badge/StatCard) and
+// notifications.js ("Negative stock risk") so both suppress in lockstep.
+// Once migration 043 is applied and this stays clean across a few days of
+// real use, flip back to true rather than deleting the check — it catches a
+// genuine class of data-entry error (billing more than was ever received)
+// when the underlying data is actually complete.
+export const NEGATIVE_STOCK_FLAG_ENABLED = false
+
 // Raw data fetch — shared by both consumers below so we only hit the DB once
 // per page load rather than once per entity.
 export async function fetchStockMovementData() {

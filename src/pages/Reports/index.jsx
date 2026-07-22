@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../../supabaseClient'
-import { fetchAllPages } from '../../utils/query'
+import { fetchAllPages, excludeAutoPurchaseMirrors } from '../../utils/query'
 import { C, Card, FormRow, Select, StatCard, Badge } from '../../components/UI/index'
 import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
@@ -57,15 +57,19 @@ function PLReport({ entities, fys, defaultEntityId }) {
     // Expenses: expenses where entity_id = entityId
     const fyFilter = fys.find(f => f.id === fyId)
 
-    let salesQ = supabase.from('invoices')
+    // CHANGED: excludeAutoPurchaseMirrors — without it, every internal-to-
+    // internal purchase this entity made shows up twice (its seller's real
+    // sales invoice AND the auto-mirrored 'purchase' copy of the same
+    // transaction), inflating this entity's own P&L purchases figure.
+    let salesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,total_amount,taxable_amount,cgst_amount,sgst_amount,igst_amount,invoice_date')
       .eq('seller_entity_id', entityId).eq('is_deleted', false)
-      .neq('status', 'cancelled')
+      .neq('status', 'cancelled'))
 
-    let purchasesQ = supabase.from('invoices')
+    let purchasesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,total_amount,taxable_amount,cgst_amount,sgst_amount,igst_amount,invoice_date')
       .eq('buyer_entity_id', entityId).eq('is_deleted', false)
-      .neq('status', 'cancelled')
+      .neq('status', 'cancelled'))
 
     let expensesQ = supabase.from('expenses')
       .select('id,total_amount,amount,gst_amount,expense_type,expense_date')
@@ -156,13 +160,21 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
     setLoading(true)
     const fyFilter = fys.find(f => f.id === fyId)
 
-    let salesQ = supabase.from('invoices')
+    // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. Without it, an
+    // entity that buys from an internal upstream entity has that purchase
+    // counted twice (its real value plus the auto-mirrored duplicate),
+    // inflating Input Tax Credit here relative to real Output Tax — which
+    // can flip "net payable" into a false-negative even for an entity that
+    // genuinely sells at a markup, if its own sales happen to go to an
+    // external customer (no mirror created, output stays single-counted)
+    // while its purchases come from an internal entity (mirror doubles it).
+    let salesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,total_amount,taxable_amount,cgst_amount,sgst_amount,igst_amount,is_interstate,invoice_date,buyer:buyer_entity_id(gstin,name)')
-      .eq('seller_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled')
+      .eq('seller_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled'))
 
-    let purchasesQ = supabase.from('invoices')
+    let purchasesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,total_amount,taxable_amount,cgst_amount,sgst_amount,igst_amount,is_interstate,invoice_date,seller:seller_entity_id(gstin,name)')
-      .eq('buyer_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled')
+      .eq('buyer_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled'))
 
     // CHANGED: GST-bearing expenses give input tax credit too — pulled in so the
     // month-wise net payable reflects real cash outflow, not sales−purchases only.
@@ -505,16 +517,20 @@ function Ledger({ entities, fys, defaultEntityId }) {
     const fyFilter = fys.find(f => f.id === fyId)
 
     // Sales invoices (Dr for our entity)
-    let salesQ = supabase.from('invoices')
+    // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. A sale to an
+    // internal buyer would otherwise post twice: once as our real sales
+    // invoice, once as the buyer's auto-mirrored 'purchase' copy of it
+    // (which ALSO has seller_entity_id = us).
+    let salesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,invoice_no,invoice_date,total_amount,buyer_entity_id,buyer:buyer_entity_id(name,short_name)')
-      .eq('seller_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled')
+      .eq('seller_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled'))
     if (partyId !== 'all') salesQ = salesQ.eq('buyer_entity_id', partyId)
     if (fyFilter) salesQ = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
 
     // Purchase invoices (Cr for our entity)
-    let purchasesQ = supabase.from('invoices')
+    let purchasesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,invoice_no,invoice_date,total_amount,seller_entity_id,seller:seller_entity_id(name,short_name)')
-      .eq('buyer_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled')
+      .eq('buyer_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled'))
     if (partyId !== 'all') purchasesQ = purchasesQ.eq('seller_entity_id', partyId)
     if (fyFilter) purchasesQ = purchasesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
 
@@ -678,8 +694,12 @@ function ProfitabilityReport({ entities, fys }) {
   async function runReport() {
     setLoading(true)
     const fyFilter = fys.find(f => f.id === fyId)
-    let salesQ     = supabase.from('invoices').select('seller_entity_id, taxable_amount, invoice_date').eq('is_deleted', false).neq('status', 'cancelled')
-    let purchasesQ = supabase.from('invoices').select('buyer_entity_id, taxable_amount, invoice_date').eq('is_deleted', false).neq('status', 'cancelled')
+    // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. Without it,
+    // any entity buying from another internal entity has its purchases
+    // (hence gross profit here) double-counted, skewing this cross-entity
+    // comparison.
+    let salesQ     = excludeAutoPurchaseMirrors(supabase.from('invoices').select('seller_entity_id, taxable_amount, invoice_date').eq('is_deleted', false).neq('status', 'cancelled'))
+    let purchasesQ = excludeAutoPurchaseMirrors(supabase.from('invoices').select('buyer_entity_id, taxable_amount, invoice_date').eq('is_deleted', false).neq('status', 'cancelled'))
     let expensesQ  = supabase.from('expenses').select('entity_id, amount, expense_date').eq('is_deleted', false)
     if (fyFilter) {
       salesQ     = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
@@ -1078,9 +1098,13 @@ function AgeingReport({ entities, defaultEntityId }) {
   async function runReport() {
     if (!entityId) return
     setLoading(true)
+    // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. The mirror
+    // also carries its own outstanding_amount, so an internal buyer's
+    // payables (and, symmetrically, an internal seller's receivables) would
+    // otherwise be doubled here too.
     const [{ data: receivables }, { data: payables }] = await Promise.all([
-      supabase.from('invoices').select('id,invoice_no,invoice_date,due_date,total_amount,buyer:buyer_entity_id(name,short_name)').eq('seller_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled'),
-      supabase.from('invoices').select('id,invoice_no,invoice_date,due_date,total_amount,seller:seller_entity_id(name,short_name)').eq('buyer_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled'),
+      excludeAutoPurchaseMirrors(supabase.from('invoices').select('id,invoice_no,invoice_date,due_date,total_amount,buyer:buyer_entity_id(name,short_name)').eq('seller_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled')),
+      excludeAutoPurchaseMirrors(supabase.from('invoices').select('id,invoice_no,invoice_date,due_date,total_amount,seller:seller_entity_id(name,short_name)').eq('buyer_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled')),
     ])
     const invIds = [...(receivables || []), ...(payables || [])].map(i => i.id)
     let tranchesByInvoice = new Map()

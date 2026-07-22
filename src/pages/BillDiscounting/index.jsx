@@ -12,6 +12,7 @@ import DocumentAttachments from '../../components/DocumentAttachments'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
+import { excludeAutoPurchaseMirrors } from '../../utils/query'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -684,7 +685,10 @@ function BDList() {
       supabase.from('bill_discounting_events').select('*, entity:entity_id(name,short_name), bank:bank_id(name,short_name,grace_period_days,recourse_type,account_no)').eq('is_deleted',false).order('discounting_date',{ascending:false}),
       supabase.from('banks').select('*').eq('is_active',true).order('name'),
       supabase.from('entities').select('id,name,short_name').eq('is_active',true).eq('is_deleted',false).order('name'),
-      supabase.from('invoices').select('id,invoice_no,total_amount,outstanding_amount,seller_entity_id,seller:seller_entity_id(name,short_name)').eq('is_deleted',false).in('status',['submitted','partial']).order('invoice_date',{ascending:false}),
+      // CHANGED: excludeAutoPurchaseMirrors — a mirror invoice (see
+      // utils/query.js) has no real receivable behind it and must never be
+      // offered here for discounting with a bank.
+      excludeAutoPurchaseMirrors(supabase.from('invoices').select('id,invoice_no,total_amount,outstanding_amount,seller_entity_id,seller:seller_entity_id(name,short_name)').eq('is_deleted',false).in('status',['submitted','partial']).order('invoice_date',{ascending:false})),
     ])
     setEvents(evts||[]); setBanks(bs||[]); setEntities(es||[]); setInvoices(invs||[])
     setLoading(false)

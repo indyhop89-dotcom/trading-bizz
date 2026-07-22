@@ -12,6 +12,7 @@ import { useAuth } from '../../hooks/useAuth'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { hasFullAccess } from '../../utils/roles'
 import { computeInvoiceOutstanding, syncInvoicePaymentStatus } from '../../utils/payments'
+import { excludeAutoPurchaseMirrors } from '../../utils/query'
 
 // ─── TDS / TCS constants ────────────────────────────────────────────────────────
 // CHANGED: §206C (TCS on sale of goods) was previously listed here as a "TDS
@@ -198,9 +199,14 @@ function InvoicePaymentTracker() {
   const load = useCallback(async () => {
     setLoading(true)
     const [{ data: invs }, { data: pays }, { data: es }] = await Promise.all([
-      supabase.from('invoices')
+      // CHANGED: excludeAutoPurchaseMirrors — without it, every internal
+      // buyer/seller pair's auto-mirrored 'purchase' copy (see utils/query.js)
+      // showed up here as its own phantom payable/receivable, alongside the
+      // real invoice — someone could record a real payment against the
+      // wrong (mirror) row and leave the actual invoice looking unpaid.
+      excludeAutoPurchaseMirrors(supabase.from('invoices')
         .select('id,invoice_no,invoice_date,due_date,total_amount,status,seller_entity_id,buyer_entity_id,seller:seller_entity_id(name,short_name),buyer:buyer_entity_id(name,short_name)')
-        .eq('is_deleted', false).neq('status', 'cancelled').order('invoice_date', { ascending: false }),
+        .eq('is_deleted', false).neq('status', 'cancelled').order('invoice_date', { ascending: false })),
       supabase.from('invoice_payments')
         .select('*')
         .eq('is_deleted', false).order('actual_payment_date', { ascending: false }),
@@ -709,7 +715,9 @@ function ExpensePaymentTracker() {
         .select('*, from_entity:from_entity_id(name,short_name), to_entity:to_entity_id(name,short_name), linked_invoice:linked_invoice_id(invoice_no), linked_pi:linked_pi_id(pi_no)')
         .eq('is_deleted', false).order('created_at', { ascending: false }),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
-      supabase.from('invoices').select('id,invoice_no').eq('is_deleted', false).neq('status','cancelled').order('invoice_date', { ascending: false }),
+      // CHANGED: excludeAutoPurchaseMirrors — a "link to invoice" dropdown
+      // shouldn't offer the phantom auto-mirror copies (see utils/query.js).
+      excludeAutoPurchaseMirrors(supabase.from('invoices').select('id,invoice_no').eq('is_deleted', false).neq('status','cancelled').order('invoice_date', { ascending: false })),
       supabase.from('proforma_invoices').select('id,pi_no').eq('is_deleted', false).order('pi_date', { ascending: false }),
     ])
     setRows(rs || [])

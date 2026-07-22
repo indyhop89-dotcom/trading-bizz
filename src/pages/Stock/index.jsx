@@ -9,7 +9,7 @@ import { fmtDate, today } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
 // LineItemsEditor's stockMap) instead of duplicating it here.
-import { fetchActualStockPosition, fetchEntityAvailableStock } from '../../utils/stock'
+import { fetchActualStockPosition, fetchEntityAvailableStock, NEGATIVE_STOCK_FLAG_ENABLED } from '../../utils/stock'
 import { ProductPicker } from '../../components/LineItemsEditor'
 import { cleanProductName, productMatchKey, findNearMatchProduct, findMergeSuggestionGroups } from '../../utils/products'
 // CHANGED: needed to know the current user's role/id for entity-access scoping
@@ -1180,7 +1180,7 @@ function StockPosition() {
         actual_invoiced_in:  am ? am.invoiced_in  : 0,
         actual_invoiced_out: am ? am.invoiced_out : 0,
         actual_adjustment:   am ? am.adjustment_qty : 0,
-        billed_beyond_stock: actual_qty < 0,
+        billed_beyond_stock: NEGATIVE_STOCK_FLAG_ENABLED && actual_qty < 0,
       }
     })
     // CHANGED: hide rows with nothing to show — no opening, no PI movement, no

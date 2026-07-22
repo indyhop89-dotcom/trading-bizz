@@ -12,6 +12,7 @@ import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces the unconfirmed next_exp_no RPC
 import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
+import { excludeAutoPurchaseMirrors } from '../../utils/query'
 
 const GST_RATES = [0, 5, 12, 18, 28]
 
@@ -124,10 +125,13 @@ export default function Expenses() {
     if (!form.order_id) { setOrderInvoices([]); return }
     let cancelled = false
     setLoadingInvoices(true)
-    supabase.from('invoices')
+    // CHANGED: excludeAutoPurchaseMirrors — an expense shouldn't be
+    // tag-able to the phantom auto-mirror copy of an order's invoice (see
+    // utils/query.js).
+    excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,invoice_no,invoice_date,total_amount')
       .eq('order_id', form.order_id).eq('is_deleted', false)
-      .order('invoice_date', { ascending: false })
+      .order('invoice_date', { ascending: false }))
       .then(({ data }) => { if (!cancelled) { setOrderInvoices(data || []); setLoadingInvoices(false) } })
     return () => { cancelled = true }
   }, [form.order_id])

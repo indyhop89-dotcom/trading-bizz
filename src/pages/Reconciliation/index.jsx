@@ -5,6 +5,7 @@ import {
 } from '../../components/UI/index'
 import { formatINR } from '../../utils/money'
 import { fmtDate } from '../../utils/dates'
+import { excludeAutoPurchaseMirrors } from '../../utils/query'
 
 const TABS = ['Intercompany', 'Invoice Match']
 
@@ -215,21 +216,25 @@ function InvoiceMatchTab() {
     setLoading(true)
 
     // Get all submitted invoices
-    let q = supabase.from('invoices')
+    // CHANGED: excludeAutoPurchaseMirrors — a mirror's outstanding_amount
+    // never gets paid down through the UI (see utils/query.js), so without
+    // this every internal transaction cluttered this view as a permanently
+    // "outstanding" phantom invoice.
+    let q = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,invoice_no,invoice_date,due_date,total_amount,paid_amount,outstanding_amount,status,seller:seller_entity_id(id,name,short_name),buyer:buyer_entity_id(id,name,short_name)')
       .eq('is_deleted', false)
       .neq('status', 'cancelled')
       .neq('status', 'paid')
       .gt('outstanding_amount', 0)
-      .order('due_date', { ascending: true })
+      .order('due_date', { ascending: true }))
 
     if (entityFilter) {
       // Filter where entity is seller OR buyer
-      q = supabase.from('invoices')
+      q = excludeAutoPurchaseMirrors(supabase.from('invoices')
         .select('id,invoice_no,invoice_date,due_date,total_amount,paid_amount,outstanding_amount,status,seller:seller_entity_id(id,name,short_name),buyer:buyer_entity_id(id,name,short_name)')
         .eq('is_deleted', false).neq('status','cancelled').neq('status','paid').gt('outstanding_amount',0)
         .or(`seller_entity_id.eq.${entityFilter},buyer_entity_id.eq.${entityFilter}`)
-        .order('due_date', { ascending: true })
+        .order('due_date', { ascending: true }))
     }
 
     const { data: invoices } = await q

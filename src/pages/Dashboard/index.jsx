@@ -4,6 +4,7 @@ import { supabase } from '../../supabaseClient'
 import { RAW, Card, CardHeader, StatCard, Badge, Btn, Spinner } from '../../components/UI/index'
 import { formatINR } from '../../utils/money'
 import { generateNotifications } from '../../utils/notifications'
+import { excludeAutoPurchaseMirrors } from '../../utils/query'
 import { useAuth } from '../../hooks/useAuth'
 
 // ─── Workspace module definitions ────────────────────────────────────────────
@@ -110,7 +111,14 @@ export default function Dashboard() {
         { data: recentInvoices },
         { data: recentOrders },
       ] = await Promise.all([
-        supabase.from('invoices').select('id,status,total_amount,outstanding_amount,invoice_type').eq('is_deleted', false),
+        // CHANGED: excludeAutoPurchaseMirrors — a sales invoice to an internal
+        // buyer auto-creates a duplicate 'purchase'-typed row with the same
+        // total_amount/outstanding_amount (see utils/query.js). Left
+        // unfiltered, every such transaction was counted twice in "Total
+        // Invoiced"/"Outstanding" — and since the mirror is never actually
+        // paid down through the UI, it stayed permanently outstanding,
+        // which is why those two KPIs read identical org-wide.
+        excludeAutoPurchaseMirrors(supabase.from('invoices').select('id,status,total_amount,outstanding_amount,invoice_type').eq('is_deleted', false)),
         supabase.from('payments').select('id,payment_type,net_amount,payment_date').eq('is_deleted', false),
         supabase.from('orders').select('id,status').eq('is_deleted', false),
         supabase.from('expenses').select('id,status,total_amount').eq('is_deleted', false),
@@ -118,9 +126,9 @@ export default function Dashboard() {
         // migration the app has never actually written real events to (see
         // 013_missing_payment_bank_tables.sql). This always returned 0/empty.
         supabase.from('bill_discounting_events').select('id,status,outstanding_amount').eq('is_deleted', false),
-        supabase.from('invoices')
+        excludeAutoPurchaseMirrors(supabase.from('invoices')
           .select('id,invoice_no,invoice_type,status,total_amount,outstanding_amount,invoice_date,seller:seller_entity_id(name,short_name),buyer:buyer_entity_id(name,short_name)')
-          .eq('is_deleted', false).order('invoice_date', { ascending: false }).limit(8),
+          .eq('is_deleted', false).order('invoice_date', { ascending: false }).limit(8)),
         supabase.from('orders')
           .select('id,name,status,movement_type,created_at,origin:origin_entity_id(name,short_name),destination:destination_entity_id(name,short_name)')
           .eq('is_deleted', false).order('created_at', { ascending: false }).limit(6),

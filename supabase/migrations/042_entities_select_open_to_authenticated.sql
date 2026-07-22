@@ -1,0 +1,38 @@
+-- 042: open entities_select to every authenticated user (read only)
+--
+-- entities_select (001_phase1.sql) has always been:
+--   USING (user_has_entity_access(id) OR <is master>)
+-- i.e. a non-master user can only SEE an entity row if they hold a direct
+-- user_entity_access grant on it (user_has_entity_access doesn't even check
+-- group grants — see 035_group_access.sql's has_entity_grant, which is the
+-- function every OTHER policy uses). This conflates two different concerns:
+--   - WRITE access — who can create/edit records as/against an entity —
+--     correctly scoped to grants, and untouched by this migration
+--     (entities_write is unchanged).
+--   - READ access to basic reference data (name, short_name, gstin,
+--     state_code) — needed by every user just to pick a counterparty
+--     (Buyer/To Entity/Ship To on PI/PO/Invoices, Destination on Orders),
+--     regardless of whether they administer that entity's own books.
+--
+-- Because entities_select blocks the read, a user granted only entity
+-- "Siddi" saw:
+--   - PI/PO/Invoice's "To Entity"/"Buyer" dropdown collapse to just the
+--     entities they hold a grant on (should list every entity — you can
+--     sell to a counterparty you don't personally manage).
+--   - Orders' embedded destination_entity_id(name,short_name) FK-join come
+--     back null/blank for a leg's counterparty they have no grant on, even
+--     though 036_orders_visible_via_leg_entities.sql already made the order
+--     ROW itself visible — the order shows, but the counterparty's name
+--     silently doesn't, because PostgREST embeds are independently subject
+--     to RLS on the joined table.
+--
+-- Fix: entities becomes read-open to all authenticated users, same
+-- established pattern this file already uses for entity_groups_select and
+-- financial_years' fy_select (both "all authenticated users can read").
+-- Entity financial/access-grant data (user_entity_access, user_group_access)
+-- and every entity CHILD table (invoices, orders, stock, etc.) keep their
+-- existing grant-scoped policies untouched — this migration only widens
+-- visibility of the entities reference table itself.
+
+DROP POLICY IF EXISTS "entities_select" ON entities;
+CREATE POLICY "entities_select" ON entities FOR SELECT TO authenticated USING (true);
