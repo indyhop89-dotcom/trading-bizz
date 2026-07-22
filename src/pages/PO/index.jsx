@@ -21,42 +21,11 @@ import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { isOrderOpenForDocs } from '../../utils/orders'
 import { PAYMENT_TERMS_OPTIONS } from '../../utils/paymentTerms'
-import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
+import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
-import { getDriveViewUrl } from '../../utils/drive'
-
-// A PO's letterhead/issuer is the BUYER (the entity placing the order) —
-// the vendor being ordered from goes in the "Bill To" block. This is the
-// reverse of PI/Invoice, where the seller is the issuer.
-//
-// Fetches its own full entity rows (address/bank/logo columns) by id rather
-// than relying on the page's own load() query to embed them — this keeps
-// the wider, newer entity columns (which may not exist yet until migration
-// 025_entity_logo.sql is applied) isolated to document generation, so a
-// missing column here can never break the PO detail page itself loading.
-export async function buildPODoc(po, lines) {
-  const [{ data: buyer }, { data: seller }] = await Promise.all([
-    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', po.buyer_entity_id).single(),
-    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', po.seller_entity_id).single(),
-  ])
-  let logoSrc = null
-  if (buyer?.logo_file_id) { try { logoSrc = await getDriveViewUrl(buyer.logo_file_id) } catch { /* no logo — text-only header */ } }
-  return {
-    docType: 'PO',
-    docNo: po.po_no, docDate: po.po_date, validOrDueDate: po.delivery_date,
-    paymentTerms: po.payment_terms, deliveryTimeline: po.delivery_timeline, modeOfTransport: po.mode_of_transport || 'Road',
-    sellerEntity: { ...buyer, logoSrc },
-    buyerEntity: seller,
-    lines,
-    totals: { taxable_amount: po.taxable_amount, cgst_amount: po.cgst_amount, sgst_amount: po.sgst_amount, igst_amount: po.igst_amount, round_off_amount: po.round_off_amount, total_amount: po.total_amount },
-    interstate: po.is_interstate,
-    bankDetails: buyer,
-    notes: po.notes,
-    // CHANGED: see PI/index.jsx's buildPIDoc for the full rationale — these
-    // were captured on the form but never reached the printed document.
-    dispatchInfo: { billFrom: po.bill_from, billTo: po.bill_to, shipFrom: po.ship_from, shipTo: po.ship_to },
-  }
-}
+// CHANGED: buildPODoc moved to utils/documentBuilders.js — see that file's
+// header comment (same rationale as PI/index.jsx's buildPIDoc move).
+import { buildPODoc } from '../../utils/documentBuilders'
 
 const PO_STATUSES = ['open', 'partial', 'completed', 'cancelled']
 

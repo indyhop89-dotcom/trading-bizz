@@ -147,7 +147,7 @@ export default function Layout({ children }) {
   function toggleSidebar() {
     setCollapsed(c => {
       const next = !c
-      try { localStorage.setItem('tb_sidebar_collapsed', String(next)) } catch {}
+      try { localStorage.setItem('tb_sidebar_collapsed', String(next)) } catch { /* storage unavailable — sidebar just won't remember its state */ }
       return next
     })
   }

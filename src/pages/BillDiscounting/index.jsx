@@ -263,6 +263,11 @@ function BDDashboard({ events, banks, onNewEvent }) {
           ['Outstanding',       formatINR(totalOut),    totalOut > 0 ? C.warning : C.success],
           ['Repaid',            formatINR(totalRepaid), C.success],
           ['Active Events',     active.length,          C.accent],
+          // CHANGED: 'active' above only counts status==='active' — a
+          // partially-repaid event had no count anywhere on this dashboard
+          // (invisible in both 'Active Events' and the fully-repaid count).
+          ['Partially Repaid',  partial.length,         partial.length > 0 ? C.warning : C.success],
+          ['Fully Repaid',      repaid.length,          C.success],
           ['Overdue',           overdue.length,         overdue.length > 0 ? C.danger : C.success],
           ['Banks Active',      bankRows.length,        C.textMid],
         ].map(([l,v,c]) => (

@@ -2,12 +2,11 @@ import { useState, useEffect, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom' // CHANGED: read ?order= for deep-linking from Orders
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Modal, Toast, EmptyState,
-  PageHeader, Card, FormRow, Input, Select,
+  C, Btn, Badge, Toast,
+  PageHeader, Input, Select,
 } from '../../components/UI/index'
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate } from '../../utils/dates'
-import { getDriveViewUrl, getDriveDownloadUrl, fileIcon } from '../../utils/drive'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 
 // ── helpers ──────────────────────────────────────────────────────────────────

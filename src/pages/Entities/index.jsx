@@ -10,7 +10,6 @@ import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl } from '../../u
 import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
 
 const ENTITY_TYPES = ['group', 'associate', 'external']
-const GST_UNITS    = ['Nos', 'Kg', 'Pcs', 'Box', 'Mtr', 'Ltr', 'Set']
 
 const EMPTY_FORM = {
   name: '', short_name: '', type: 'associate',

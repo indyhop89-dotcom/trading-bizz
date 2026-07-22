@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { supabase } from '../supabaseClient'
-import { C, Btn, ConfirmModal, Toast } from './UI/index'
+import { C, ConfirmModal, Toast } from './UI/index'
 import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl, getDriveDownloadUrl, formatFileSize, fileIcon } from '../utils/drive'
 import { fmtDate } from '../utils/dates'
 

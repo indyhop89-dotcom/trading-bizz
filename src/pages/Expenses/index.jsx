@@ -563,8 +563,10 @@ export default function Expenses() {
       {/* CHANGED: delete confirmation modals */}
       <ConfirmModal open={confirmBulkDelete} onClose={() => setConfirmBulkDelete(false)} onConfirm={handleBulkDelete}
         title='Delete Expenses' message={`Delete ${selected.size} selected expense(s)? This cannot be undone.`} danger />
+      {/* CHANGED: disable + relabel Confirm while the delete is in flight — 'deleting' was tracked but never wired to the button, so a slow request could be double-fired by a second click */}
       <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
-        title='Delete Expense' message={`Delete "${confirmDelete?.description || 'this expense'}"? This cannot be undone.`} danger />
+        title='Delete Expense' message={`Delete "${confirmDelete?.description || 'this expense'}"? This cannot be undone.`} danger
+        confirmDisabled={deleting} confirmLabel={deleting ? 'Deleting…' : 'Confirm'} />
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>

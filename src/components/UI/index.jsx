@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useRef } from 'react'
 
 // ─── Design tokens (mirrors CSS variables — use for inline styles) ────────────
 export const C = {
@@ -158,7 +158,12 @@ export function Modal({ open, onClose, title, width = 640, children, zIndex = 10
 }
 
 // ─── ConfirmModal ─────────────────────────────────────────────────────────────
-export function ConfirmModal({ open, onClose, onConfirm, title, message, danger = false }) {
+// CHANGED: optional confirmDisabled/confirmLabel — lets a caller disable the
+// Confirm button and swap its label while the async onConfirm is in flight
+// (e.g. "Deleting…"), so a slow request can't be double-fired by a second
+// click. Both default to the old always-enabled "Confirm" behavior, so every
+// existing call site is unaffected unless it opts in.
+export function ConfirmModal({ open, onClose, onConfirm, title, message, danger = false, confirmDisabled = false, confirmLabel = 'Confirm' }) {
   return (
     <Modal open={open} onClose={onClose} title={title || 'Confirm'} width={420}>
       <p style={{ color: 'var(--text-mid)', fontSize: '13px', marginBottom: '20px', lineHeight: 1.6 }}>
@@ -166,7 +171,7 @@ export function ConfirmModal({ open, onClose, onConfirm, title, message, danger 
       </p>
       <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
         <Btn variant='ghost' size='sm' onClick={onClose}>Cancel</Btn>
-        <Btn variant={danger ? 'danger' : 'primary'} size='sm' onClick={onConfirm}>Confirm</Btn>
+        <Btn variant={danger ? 'danger' : 'primary'} size='sm' onClick={onConfirm} disabled={confirmDisabled}>{confirmLabel}</Btn>
       </div>
     </Modal>
   )

@@ -4,7 +4,7 @@
  * Idempotent — checks if notification already exists before inserting.
  */
 import { supabase } from '../supabaseClient'
-import { buildActualStockMap, fetchStockMovementData } from './stock'
+import { fetchActualStockPosition } from './stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from './payments'
 import { formatINR, formatNumberIN } from './money'
 
@@ -115,7 +115,10 @@ export async function generateNotifications(userId) {
   // Stock page, grouped per source document (one notification per
   // over-committed PI/invoice, not per line, to match this function's
   // existing per-source_id dedup granularity).
-  const actualMap = buildActualStockMap(await fetchStockMovementData())
+  // CHANGED: fetchActualStockPosition() hits the server-side aggregation RPC
+  // (migration 041) when available, instead of downloading every raw
+  // invoice/opening-balance row just to sum them in the browser.
+  const actualMap = await fetchActualStockPosition()
   function availableFor(entityId, productId) {
     return actualMap[`${entityId}__${productId}`]?.actual_qty ?? 0
   }

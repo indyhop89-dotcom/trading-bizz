@@ -8,7 +8,7 @@ import {
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
+import { fmtDate, today, fyCodeForDate } from '../../utils/dates'
 import { buildHSNMap } from '../../utils/hsn'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
 import { hasFullAccess } from '../../utils/roles'
@@ -324,8 +324,7 @@ function NoteList() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px' }}>
             <FormRow label='Note Type' required>
               <Select value={form.note_type} onChange={e => setF('note_type', e.target.value)}>
-                <option value='credit_note'>Credit Note</option>
-                <option value='debit_note'>Debit Note</option>
+                {NOTE_TYPES.map(t => <option key={t} value={t}>{t === 'credit_note' ? 'Credit Note' : 'Debit Note'}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Note Date' required>

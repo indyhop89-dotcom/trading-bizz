@@ -3,12 +3,12 @@ import { createPortal } from 'react-dom'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, StatCard, CsvFileDrop,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, CsvFileDrop,
 } from '../../components/UI/index'
 import { toNum } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { formatSlabSummary } from '../../utils/hsn'
-import { downloadTemplate, downloadCSV, detectDelimiter } from '../../utils/csvTemplate'
+import { downloadTemplate, detectDelimiter } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'

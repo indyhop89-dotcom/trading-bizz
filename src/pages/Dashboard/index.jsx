@@ -1,9 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
-import { C, RAW, Card, CardHeader, StatCard, Badge, Btn, Spinner } from '../../components/UI/index'
+import { RAW, Card, CardHeader, StatCard, Badge, Btn, Spinner } from '../../components/UI/index'
 import { formatINR } from '../../utils/money'
-import { fmtDate } from '../../utils/dates'
 import { generateNotifications } from '../../utils/notifications'
 import { useAuth } from '../../hooks/useAuth'
 
@@ -50,7 +49,7 @@ const WORKSPACE = [
 ]
 
 // ─── Module card ──────────────────────────────────────────────────────────────
-function ModuleCard({ label, desc, icon, path, color, onClick }) {
+function ModuleCard({ label, desc, icon, color, onClick }) {
   const [hov, setHov] = useState(false)
   return (
     <div

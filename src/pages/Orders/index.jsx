@@ -3,7 +3,7 @@ import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
+  PageHeader, FormRow, Input, Select, Textarea, StatCard,
 } from '../../components/UI/index'
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
@@ -12,15 +12,16 @@ import { suggestNextNo } from '../../utils/numbering'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: needed for master/admin-only delete, matches PI/PO/Invoices pattern
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
-import { getInvoiceLifecycleStage, fetchStockMovementData, buildStockValuationMap } from '../../utils/stock'
+import { getInvoiceLifecycleStage, fetchActualStockPosition } from '../../utils/stock'
 import { ORDER_STATUSES, deriveOrderStatus, getOrderProgress } from '../../utils/orders'
 import { getDriveViewUrl } from '../../utils/drive'
 import { fetchAllPages } from '../../utils/query'
 import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
-import { buildPIDoc } from '../PI/index'
-import { buildPODoc } from '../PO/index'
-import { buildInvoiceDoc } from '../Invoices/index'
+// CHANGED: import from the shared utils module (not '../PI/index' etc.) —
+// see utils/documentBuilders.js's header comment for why: a static import
+// of the full page component would defeat route-level code-splitting.
+import { buildPIDoc, buildPODoc, buildInvoiceDoc } from '../../utils/documentBuilders'
 
 // Per-leg "Generate Docs" convenience action — the leg view here only holds
 // summary columns (piMap/poMap/invMap), so each click fetches that one
@@ -232,7 +233,7 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, invAggMap, docMap, cost
                 <td style={{...td,textAlign:'right',fontWeight:600,fontVariantNumeric:'tabular-nums'}}>{agg?.total>0?formatINR(agg.total):'—'}</td>
                 <td style={{...td,textAlign:'right',fontWeight:700,color:margin===null?C.textMuted:margin>=0?'#1a5c30':C.danger}}>
                   <div>{margin!==null?`${margin>=0?'+':''}${margin.toFixed(1)}%`:'—'}</div>
-                  {/* CHANGED: second margin basis — sale vs the avg cost the from-entity's stock is actually carried at (opening + purchased-in), see buildStockValuationMap */}
+                  {/* CHANGED: second margin basis — sale vs the avg cost the from-entity's stock is actually carried at (opening + purchased-in), see fetchActualStockPosition's avg_in_rate */}
                   {stockMargin!=null&&<div title='Margin vs average cost of stock on hand' style={{fontSize:'10px',fontWeight:600,color:stockMargin>=0?'#1a7a40':C.danger}}>stk {stockMargin>=0?'+':''}{stockMargin.toFixed(1)}%</div>}
                 </td>
                 <td style={td}><Badge status={status.key} label={status.label}/></td>
@@ -653,11 +654,14 @@ function OrderDetail() {
       const smMap = {}
       const allActiveInvs = Object.values(iListMap).flat().filter(v => v.status !== 'cancelled')
       if (allActiveInvs.length) {
-        const [{ data: allLines }, raw] = await Promise.all([
+        // CHANGED: fetchActualStockPosition() hits the server-side
+        // aggregation RPC (migration 041) for avg_in_rate per entity+product
+        // instead of downloading every raw invoice/opening-balance row just
+        // to average them in the browser.
+        const [{ data: allLines }, valuation] = await Promise.all([
           fetchAllPages(() => supabase.from('invoice_lines').select('invoice_id,product_id,qty,rate').in('invoice_id', allActiveInvs.map(v => v.id))),
-          fetchStockMovementData(),
+          fetchActualStockPosition(),
         ])
-        const valuation = buildStockValuationMap(raw)
         const linesByInvoice = {}
         for (const l of (allLines||[])) {
           if (!linesByInvoice[l.invoice_id]) linesByInvoice[l.invoice_id] = []
@@ -670,8 +674,8 @@ function OrderDetail() {
           for (const v of legInvs) {
             for (const l of (linesByInvoice[v.id] || [])) {
               const val = valuation[`${leg.from_entity_id}__${l.product_id}`]
-              if (!val || !(val.avg_rate > 0)) { known = false; break }
-              cost += toNum(l.qty) * val.avg_rate
+              if (!val || !(val.avg_in_rate > 0)) { known = false; break }
+              cost += toNum(l.qty) * val.avg_in_rate
               sale += toNum(l.qty) * toNum(l.rate)
             }
             if (!known) break

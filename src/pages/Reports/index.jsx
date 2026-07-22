@@ -1,11 +1,11 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../../supabaseClient'
 import { fetchAllPages } from '../../utils/query'
-import { C, Card, FormRow, Select, Spinner, StatCard, Badge } from '../../components/UI/index'
+import { C, Card, FormRow, Select, StatCard, Badge } from '../../components/UI/index'
 import { formatINR, toNum } from '../../utils/money'
-import { fmtDate, fyOptions, today } from '../../utils/dates'
+import { fmtDate, today } from '../../utils/dates'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
-import { fetchStockMovementData, buildActualStockMap } from '../../utils/stock'
+import { fetchActualStockPosition } from '../../utils/stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
 
 // CHANGED: "Compliance" is one tab in the main row, sitting next to Party
@@ -20,6 +20,23 @@ const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Se
 function monthLabel(ym) {
   const [y, m] = (ym || '').split('-')
   return m ? `${MONTH_NAMES[Number(m) - 1]} ${y}` : (ym || '—')
+}
+
+// CHANGED: hoisted out of PLReport's render body — it only ever depended on
+// its own props plus the module-level formatINR import, never on PLReport's
+// own state, so nothing is lost by declaring it once at module scope instead
+// of recreating the component function on every PLReport render.
+function TaxRow({ label, taxable, cgst, sgst, igst }) {
+  return (
+    <tr>
+      <td style={{ padding: '10px 14px', fontWeight: 600 }}>{label}</td>
+      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(taxable)}</td>
+      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(cgst)}</td>
+      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(sgst)}</td>
+      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(igst)}</td>
+      <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(cgst + sgst + igst)}</td>
+    </tr>
+  )
 }
 
 // ─── P&L Report ───────────────────────────────────────────────────────────────
@@ -202,17 +219,6 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
     })
     setLoading(false)
   }
-
-  const TaxRow = ({ label, taxable, cgst, sgst, igst }) => (
-    <tr>
-      <td style={{ padding: '10px 14px', fontWeight: 600 }}>{label}</td>
-      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(taxable)}</td>
-      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(cgst)}</td>
-      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(sgst)}</td>
-      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(igst)}</td>
-      <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(cgst + sgst + igst)}</td>
-    </tr>
-  )
 
   const thStyle = { padding: '10px 14px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', textAlign: 'right' }
 
@@ -497,7 +503,6 @@ function Ledger({ entities, fys, defaultEntityId }) {
     if (!ourEntityId) return
     setLoading(true)
     const fyFilter = fys.find(f => f.id === fyId)
-    const dateFilter = (q) => fyFilter ? q.gte('date', fyFilter.start_date).lte('date', fyFilter.end_date) : q
 
     // Sales invoices (Dr for our entity)
     let salesQ = supabase.from('invoices')
@@ -768,11 +773,13 @@ function ActualStockReport({ entities, defaultEntityId }) {
 
   async function runReport() {
     setLoading(true)
-    const [raw, { data: products }] = await Promise.all([
-      fetchStockMovementData(),
+    // CHANGED: fetchActualStockPosition() hits the server-side aggregation
+    // RPC (migration 041) when available, instead of downloading every raw
+    // invoice line just to sum them per entity+product in the browser.
+    const [map, { data: products }] = await Promise.all([
+      fetchActualStockPosition(),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,unit,category')),
     ])
-    const map = buildActualStockMap(raw)
     const productById = Object.fromEntries((products || []).map(p => [p.id, p]))
     const entityById  = Object.fromEntries(entities.map(e => [e.id, e]))
     // This is a "what do we actually hold right now" ledger, not a full
@@ -849,6 +856,12 @@ function ActualStockReport({ entities, defaultEntityId }) {
 // fetchStockMovementData() counts toward Actual Stock, just shown one line
 // at a time instead of aggregated.
 function StockMovementReport({ entities }) {
+  // CHANGED: entity filter — every other report tab on this page lets you
+  // scope to one entity, but this one previously took the `entities` prop
+  // and never used it, dumping every E-way-Bill movement across the whole
+  // business in one table. Matches on either side of the movement (an
+  // entity cares about both what left and what arrived).
+  const [entityId, setEntityId] = useState('')
   const [rows, setRows]       = useState(null)
   const [loading, setLoading] = useState(false)
 
@@ -867,6 +880,7 @@ function StockMovementReport({ entities }) {
     // movement and must still appear (see stock.js for the same rule).
     const result = (invLines || [])
       .filter(l => l.invoice && l.invoice.status !== 'cancelled' && l.invoice.status !== 'draft' && l.invoice.eway_bill_no && !(l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id))
+      .filter(l => !entityId || l.invoice.seller_entity_id === entityId || l.invoice.buyer_entity_id === entityId)
       .map(l => ({
         eway_bill_no: l.invoice.eway_bill_no, eway_bill_date: l.invoice.eway_bill_date, invoice_no: l.invoice.invoice_no,
         product: productById[l.product_id]?.name || (l.product_id ? '—' : '⚠ No product'),
@@ -881,10 +895,18 @@ function StockMovementReport({ entities }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-      <button onClick={runReport} disabled={loading}
-        style={{ alignSelf: 'flex-start', padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
-        {loading ? 'Running…' : 'Run Report'}
-      </button>
+      <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <FormRow label='Entity'>
+          <Select value={entityId} onChange={e => setEntityId(e.target.value)} style={{ minWidth: '200px' }}>
+            <option value=''>All entities</option>
+            {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+          </Select>
+        </FormRow>
+        <button onClick={runReport} disabled={loading}
+          style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
+          {loading ? 'Running…' : 'Run Report'}
+        </button>
+      </div>
       {rows && (
         <Card>
           <div style={{ overflowX: 'auto' }}>
@@ -999,6 +1021,54 @@ const AGE_BUCKETS = [
   { label: '90+ days',   test: d => d > 90 },
 ]
 
+const ageingTh = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
+
+// CHANGED: hoisted out of AgeingReport's render body — its only dependencies
+// (AGE_BUCKETS, ageingTh, C, formatINR, fmtDate) are all module-level, so
+// nothing was actually closing over AgeingReport's own state.
+function AgeingTable({ title, list }) {
+  const bucketed = AGE_BUCKETS.map(b => ({ ...b, rows: list.filter(r => b.test(r.daysOverdue)), total: 0 }))
+  bucketed.forEach(b => { b.total = b.rows.reduce((s, r) => s + r.pending, 0) })
+  const grandTotal = list.reduce((s, r) => s + r.pending, 0)
+  return (
+    <Card>
+      <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>{title} — {formatINR(grandTotal)} total</div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 0 }}>
+        {bucketed.map(b => (
+          <div key={b.label} style={{ padding: '10px 14px', borderRight: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700 }}>{b.label}</div>
+            <div style={{ fontWeight: 700, fontSize: '14px', marginTop: '2px', color: b.total > 0 ? C.text : C.textMuted }}>{formatINR(b.total)}</div>
+            <div style={{ fontSize: '11px', color: C.textMuted }}>{b.rows.length} invoice(s)</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ overflowX: 'auto' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+          <thead><tr>
+            <th style={{ ...ageingTh, textAlign: 'left' }}>Invoice No</th>
+            <th style={{ ...ageingTh, textAlign: 'left' }}>Party</th>
+            <th style={{ ...ageingTh, textAlign: 'left' }}>Due Date</th>
+            <th style={{ ...ageingTh, textAlign: 'right' }}>Days Overdue</th>
+            <th style={{ ...ageingTh, textAlign: 'right' }}>Outstanding</th>
+          </tr></thead>
+          <tbody>
+            {list.sort((a,b)=>b.daysOverdue-a.daysOverdue).map((r, i) => (
+              <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
+                <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace' }}>{r.invoice_no || '—'}</td>
+                <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.party || '—'}</td>
+                <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.due_date ? fmtDate(r.due_date) : '—'}</td>
+                <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', color: r.daysOverdue > 0 ? C.danger : C.textMuted, fontWeight: r.daysOverdue > 0 ? 700 : 400 }}>{r.daysOverdue > 0 ? r.daysOverdue : '—'}</td>
+                <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 600 }}>{formatINR(r.pending)}</td>
+              </tr>
+            ))}
+            {list.length === 0 && <tr><td colSpan={5} style={{ padding: '20px', textAlign: 'center', color: C.textMuted }}>Nothing outstanding.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  )
+}
+
 function AgeingReport({ entities, defaultEntityId }) {
   const [entityId, setEntityId] = useState('')
   useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -1029,51 +1099,6 @@ function AgeingReport({ entities, defaultEntityId }) {
     }
     setRows({ receivables: toRows(receivables, 'buyer'), payables: toRows(payables, 'seller') })
     setLoading(false)
-  }
-
-  const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
-
-  function AgeingTable({ title, list }) {
-    const bucketed = AGE_BUCKETS.map(b => ({ ...b, rows: list.filter(r => b.test(r.daysOverdue)), total: 0 }))
-    bucketed.forEach(b => { b.total = b.rows.reduce((s, r) => s + r.pending, 0) })
-    const grandTotal = list.reduce((s, r) => s + r.pending, 0)
-    return (
-      <Card>
-        <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>{title} — {formatINR(grandTotal)} total</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 0 }}>
-          {bucketed.map(b => (
-            <div key={b.label} style={{ padding: '10px 14px', borderRight: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}` }}>
-              <div style={{ fontSize: '10px', color: C.textMuted, textTransform: 'uppercase', fontWeight: 700 }}>{b.label}</div>
-              <div style={{ fontWeight: 700, fontSize: '14px', marginTop: '2px', color: b.total > 0 ? C.text : C.textMuted }}>{formatINR(b.total)}</div>
-              <div style={{ fontSize: '11px', color: C.textMuted }}>{b.rows.length} invoice(s)</div>
-            </div>
-          ))}
-        </div>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
-            <thead><tr>
-              <th style={{ ...th, textAlign: 'left' }}>Invoice No</th>
-              <th style={{ ...th, textAlign: 'left' }}>Party</th>
-              <th style={{ ...th, textAlign: 'left' }}>Due Date</th>
-              <th style={{ ...th, textAlign: 'right' }}>Days Overdue</th>
-              <th style={{ ...th, textAlign: 'right' }}>Outstanding</th>
-            </tr></thead>
-            <tbody>
-              {list.sort((a,b)=>b.daysOverdue-a.daysOverdue).map((r, i) => (
-                <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
-                  <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace' }}>{r.invoice_no || '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.party || '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{r.due_date ? fmtDate(r.due_date) : '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', color: r.daysOverdue > 0 ? C.danger : C.textMuted, fontWeight: r.daysOverdue > 0 ? 700 : 400 }}>{r.daysOverdue > 0 ? r.daysOverdue : '—'}</td>
-                  <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 600 }}>{formatINR(r.pending)}</td>
-                </tr>
-              ))}
-              {list.length === 0 && <tr><td colSpan={5} style={{ padding: '20px', textAlign: 'center', color: C.textMuted }}>Nothing outstanding.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-      </Card>
-    )
   }
 
   return (

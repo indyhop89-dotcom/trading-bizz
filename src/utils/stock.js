@@ -142,13 +142,55 @@ export function buildStockValuationMap({ opening, invLines }) {
   return map
 }
 
+// Server-side aggregation (see migration 041_stock_position_rpc.sql) — same
+// output as buildActualStockMap()+buildStockValuationMap() combined
+// (actual_qty breakdown AND avg carrying-cost rate per entity+product), but
+// computed entirely in Postgres. The client used to page through every raw
+// invoice line, opening-balance and adjustment row (30k+ rows, ~35 requests)
+// just to sum them in JS; the RPC returns one aggregated row per
+// entity+product in a single round trip — this is what made Stock Position
+// take ~60 seconds.
+//
+// Falls back to the full client-side computation automatically if the RPC
+// isn't available yet (migration 041 not applied — Postgres returns
+// PGRST202 "function not found") or errors for any other reason, so every
+// caller keeps working before/after the migration lands, just slower before.
+export async function fetchActualStockPosition(asOfDate = null) {
+  // supabase.rpc() itself doesn't throw on a Postgres-side error (it
+  // resolves with `error` set) — but a network-level failure or an
+  // unexpectedly missing client method can still reject/throw, and this
+  // helper is on paths (notifications, form stock checks) that must never
+  // take the whole caller down over a stock-lookup hiccup. Any failure here
+  // — thrown or returned — falls through to the same full client-side
+  // computation.
+  try {
+    const { data, error } = await supabase.rpc('stock_actual_position', { p_as_of: asOfDate || null })
+    if (!error && data) {
+      const map = {}
+      for (const row of data) {
+        map[`${row.entity_id}__${row.product_id}`] = {
+          entity_id: row.entity_id, product_id: row.product_id,
+          opening_qty: toNum(row.opening_qty), invoiced_in: toNum(row.invoiced_in),
+          invoiced_out: toNum(row.invoiced_out), adjustment_qty: toNum(row.adjustment_qty),
+          actual_qty: toNum(row.actual_qty), avg_in_rate: toNum(row.avg_in_rate),
+        }
+      }
+      return map
+    }
+  } catch { /* fall through to client-side computation below */ }
+  const raw = filterStockDataAsOf(await fetchStockMovementData(), asOfDate)
+  const actual = buildActualStockMap(raw)
+  const valuation = buildStockValuationMap(raw)
+  for (const key of Object.keys(actual)) actual[key].avg_in_rate = valuation[key]?.avg_rate ?? 0
+  return actual
+}
+
 // Convenience for a single entity — returns { product_id: actual_qty }.
 // This is what feeds LineItemsEditor's `stockMap` prop so a seller can see
 // (and not oversell past) what they actually have on hand while billing.
 export async function fetchEntityAvailableStock(entityId) {
   if (!entityId) return {}
-  const raw  = await fetchStockMovementData()
-  const full = buildActualStockMap(raw)
+  const full = await fetchActualStockPosition()
   const out  = {}
   for (const row of Object.values(full)) {
     if (row.entity_id === entityId) out[row.product_id] = row.actual_qty

@@ -22,42 +22,12 @@ import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock, getInvoiceLifecycleStage } from '../../utils/stock'
 import { isOrderOpenForDocs } from '../../utils/orders'
 import { PAYMENT_TERMS_OPTIONS, dueDateForTerms } from '../../utils/paymentTerms'
-import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
+import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
-import { getDriveViewUrl } from '../../utils/drive'
 import { isValidEwayBill, EWAY_BILL_ERROR } from '../../utils/validation'
-
-// Fetches its own full entity rows (address/bank/logo columns) by id rather
-// than relying on the page's own load() query to embed them — this keeps
-// the wider, newer entity columns (which may not exist yet until migration
-// 025_entity_logo.sql is applied) isolated to document generation, so a
-// missing column here can never break the Invoice detail page itself loading.
-export async function buildInvoiceDoc(inv, lines) {
-  const [{ data: seller }, { data: buyer }] = await Promise.all([
-    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', inv.seller_entity_id).single(),
-    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', inv.buyer_entity_id).single(),
-  ])
-  let logoSrc = null
-  if (seller?.logo_file_id) { try { logoSrc = await getDriveViewUrl(seller.logo_file_id) } catch { /* no logo — text-only header */ } }
-  return {
-    docType: 'INVOICE',
-    docNo: inv.invoice_no, docDate: inv.invoice_date, validOrDueDate: inv.due_date,
-    // CHANGED: payment terms now captured on invoices too (matches PI/PO)
-    paymentTerms: inv.payment_terms,
-    sellerEntity: { ...seller, logoSrc },
-    buyerEntity: buyer,
-    lines,
-    totals: { taxable_amount: inv.taxable_amount, cgst_amount: inv.cgst_amount, sgst_amount: inv.sgst_amount, igst_amount: inv.igst_amount, round_off_amount: inv.round_off_amount, total_amount: inv.total_amount },
-    interstate: inv.is_interstate,
-    bankDetails: seller,
-    notes: inv.notes,
-    ewayBill: { eway_bill_no: inv.eway_bill_no, vehicle_no: inv.vehicle_no, transporter_name: inv.transporter_name, challan_no: inv.challan_no },
-    // CHANGED: see PI/index.jsx's buildPIDoc for the full rationale — these
-    // were captured on the form (and even shown on this page's own detail
-    // view) but never reached the printed document.
-    dispatchInfo: { billFrom: inv.bill_from, billTo: inv.bill_to, shipFrom: inv.ship_from, shipTo: inv.ship_to },
-  }
-}
+// CHANGED: buildInvoiceDoc moved to utils/documentBuilders.js — see that
+// file's header comment (same rationale as PI/index.jsx's buildPIDoc move).
+import { buildInvoiceDoc } from '../../utils/documentBuilders'
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
 

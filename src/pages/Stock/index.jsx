@@ -2,14 +2,14 @@ import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard, CsvFileDrop,
+  PageHeader, Card, Table, FormRow, Input, Select, Textarea, StatCard, CsvFileDrop,
 } from '../../components/UI/index'
 import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
 // LineItemsEditor's stockMap) instead of duplicating it here.
-import { fetchStockMovementData, buildActualStockMap, fetchEntityAvailableStock, filterStockDataAsOf } from '../../utils/stock'
+import { fetchActualStockPosition, fetchEntityAvailableStock } from '../../utils/stock'
 import { ProductPicker } from '../../components/LineItemsEditor'
 import { cleanProductName, productMatchKey, findNearMatchProduct, findMergeSuggestionGroups } from '../../utils/products'
 // CHANGED: needed to know the current user's role/id for entity-access scoping
@@ -1088,8 +1088,10 @@ function StockPosition() {
     // feeds LineItemsEditor's available-stock check.
     // CHANGED: when an as-of date is set, restrict every movement source to
     // what had happened by that day — the whole page becomes "stock status
-    // as of <date>" instead of "right now".
-    const actualMap = buildActualStockMap(filterStockDataAsOf(await fetchStockMovementData(), asOfDate))
+    // as of <date>" instead of "right now". fetchActualStockPosition() hits
+    // the server-side aggregation RPC (migration 041) when available — one
+    // round trip instead of paging through every raw invoice line.
+    const actualMap = await fetchActualStockPosition(asOfDate)
 
     // Build position map: key = entity_id + product_id
     const map = {}
@@ -1529,14 +1531,13 @@ function MergeDuplicates() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: ps }, raw] = await Promise.all([
+    const [{ data: ps }, actualMap] = await Promise.all([
       fetchAllPages(() => supabase.from('products')
         .select('id,name,hsn_code,gst_rate,unit,default_rate,is_active,created_at')
         .eq('is_active', true).order('name')),
-      fetchStockMovementData(),
+      fetchActualStockPosition(),
     ])
     setProducts(ps || [])
-    const actualMap = buildActualStockMap(raw)
     const t = {}
     for (const row of Object.values(actualMap)) {
       if (!row.product_id) continue

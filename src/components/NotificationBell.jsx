@@ -19,6 +19,20 @@ export default function NotificationBell() {
   const [open, setOpen]       = useState(false)
   const ref                   = useRef(null)
 
+  // CHANGED: declared before the effect that calls it — function
+  // declarations are hoisted so this worked either way, but declaring
+  // ahead of use keeps the effect's dependency readable at a glance.
+  async function loadNotifs() {
+    const { data } = await supabase
+      .from('notifications')
+      .select('*')
+      .eq('is_read', false)
+      .eq('is_dismissed', false)
+      .order('created_at', { ascending: false })
+      .limit(10)
+    setNotifs(data || [])
+  }
+
   useEffect(() => {
     loadNotifs()
     // poll every 60 seconds
@@ -34,17 +48,6 @@ export default function NotificationBell() {
     return () => document.removeEventListener('mousedown', handleClick)
   }, [])
 
-  async function loadNotifs() {
-    const { data } = await supabase
-      .from('notifications')
-      .select('*')
-      .eq('is_read', false)
-      .eq('is_dismissed', false)
-      .order('created_at', { ascending: false })
-      .limit(10)
-    setNotifs(data || [])
-  }
-
   async function markRead(id, e) {
     e.stopPropagation()
     await supabase.from('notifications').update({ is_read: true }).eq('id', id)
@@ -59,9 +62,13 @@ export default function NotificationBell() {
       <button
         onClick={() => setOpen(o => !o)}
         style={{
-          position: 'relative', background: 'none', border: 'none',
+          position: 'relative', border: 'none',
           cursor: 'pointer', padding: '6px', borderRadius: '8px',
           fontSize: '18px', lineHeight: 1,
+          // CHANGED: this was a duplicate `background` key — the plain
+          // 'none' above silently lost to this one (JS keeps only the last
+          // value for a repeated object key), so the button never actually
+          // rendered fully transparent when closed.
           background: open ? 'rgba(245,240,232,0.1)' : 'transparent',
         }}
       >

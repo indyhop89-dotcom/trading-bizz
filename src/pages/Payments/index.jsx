@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, Card, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
+  C, Btn, Modal, ConfirmModal, Toast, EmptyState,
+  Card, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { formatINR, formatNumberIN, toNum, roundRupees } from '../../utils/money'
@@ -10,7 +11,7 @@ import { fmtDate, today } from '../../utils/dates'
 import { useAuth } from '../../hooks/useAuth'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { hasFullAccess } from '../../utils/roles'
-import { computeInvoiceOutstanding } from '../../utils/payments'
+import { computeInvoiceOutstanding, syncInvoicePaymentStatus } from '../../utils/payments'
 
 // ─── TDS / TCS constants ────────────────────────────────────────────────────────
 // CHANGED: §206C (TCS on sale of goods) was previously listed here as a "TDS
@@ -370,14 +371,26 @@ function InvoicePaymentTracker() {
     let error
     if (editingPayment) { const r = await supabase.from('invoice_payments').update(payload).eq('id', editingPayment.id); error = r.error }
     else                { const r = await supabase.from('invoice_payments').insert(payload); error = r.error }
+    if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
+    // CHANGED: auto-advance the invoice's own status/paid/outstanding from
+    // its recorded tranches (submitted → partial → paid) — previously the
+    // invoice row never learned about payments at all. If this tranche was
+    // moved to a different invoice while editing, re-sync the old one too.
+    const { error: syncErr } = await syncInvoicePaymentStatus(form.invoice_id)
+    if (editingPayment?.invoice_id && editingPayment.invoice_id !== form.invoice_id) {
+      await syncInvoicePaymentStatus(editingPayment.invoice_id)
+    }
     setSaving(false)
-    if (error) return setToast({ message: error.message, type: 'error' })
-    setToast({ message: editingPayment ? 'Payment updated' : 'Payment recorded', type: 'success' })
+    if (syncErr) setToast({ message: `Payment saved, but the invoice status could not be updated: ${syncErr.message}`, type: 'error' })
+    else setToast({ message: editingPayment ? 'Payment updated' : 'Payment recorded', type: 'success' })
     setModalOpen(false); load()
   }
 
   async function handleDeletePayment() {
     await supabase.from('invoice_payments').update({ is_deleted: true }).eq('id', confirmDelete.id)
+    // CHANGED: removing a tranche re-derives the invoice's payment status
+    // (a fully-paid invoice drops back to partial/submitted as appropriate).
+    await syncInvoicePaymentStatus(confirmDelete.invoice_id)
     setConfirmDelete(null); load()
     if (detailOpen) setDetailOpen(d => d) // keep panel open; load() will refresh underlying data on next render
   }
@@ -733,8 +746,6 @@ function ExpensePaymentTracker() {
     if (!form.expense_category) return setToast({ message: 'Category required', type: 'error' })
     if (!toNum(form.amount))    return setToast({ message: 'Amount required', type: 'error' })
     setSaving(true)
-    const balance = calcBalance(form.amount, form.advance_amount, form.adjustments)
-    const computedStatus = form.manual_status || autoStatus(form.advance_amount, balance, form.actual_payment_date)
     const payload = {
       expense_category: form.expense_category, expense_type: form.expense_type, expense_tag: form.expense_tag||null,
       from_entity_id: form.from_entity_id||null, from_name: form.from_name||null,
@@ -760,7 +771,6 @@ function ExpensePaymentTracker() {
   }
 
   async function markPaid(row) {
-    const balance = calcBalance(row.amount, row.advance_amount, row.adjustments)
     await supabase.from('expense_payments').update({ actual_payment_date: today(), manual_status: 'Paid', updated_at: new Date() }).eq('id', row.id)
     setConfirmPaid(null)
     setToast({ message: 'Marked as paid', type: 'success' })
@@ -983,7 +993,11 @@ function ExpensePaymentTracker() {
 
 // ─── Shell ────────────────────────────────────────────────────────────────────
 export default function Payments() {
-  const [tab, setTab] = useState('Invoice Payments')
+  // CHANGED: ?tab=expense deep-links straight to the Expense Payments tab
+  // (e.g. from a notification's source link) — read once on mount so a
+  // manual tab click afterwards isn't fighting the URL.
+  const [searchParams] = useSearchParams()
+  const [tab, setTab] = useState(searchParams.get('tab') === 'expense' ? 'Expense Payments' : 'Invoice Payments')
   return (
     <div>
       <div style={{ marginBottom: '24px' }}>

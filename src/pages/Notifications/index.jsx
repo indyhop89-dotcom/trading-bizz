@@ -23,6 +23,25 @@ function typeConfig(type) {
   return TYPE_CONFIG[type] || TYPE_CONFIG.system
 }
 
+// CHANGED: every notification carries source_type/source_id (see
+// utils/notifications.js's insert calls) but nothing ever used them to jump
+// to the actual record — clicking a notification did nothing. Maps to each
+// source table's real route; 'entities' has no per-row detail route (just a
+// list + modal), and 'expense_payments' lives on the Payments page's Expense
+// Payments tab (see ?tab= handling added to Payments/index.jsx), so those two
+// link to their list view rather than a specific row.
+function sourceLink(n) {
+  if (!n.source_type) return null
+  switch (n.source_type) {
+    case 'invoices':           return n.source_id ? `/invoices/${n.source_id}` : '/invoices'
+    case 'proforma_invoices':   return n.source_id ? `/pi/${n.source_id}` : '/pi'
+    case 'bill_discounting':    return n.source_id ? `/bill-discounting/${n.source_id}` : '/bill-discounting'
+    case 'expense_payments':    return '/payments?tab=expense'
+    case 'entities':            return '/entities'
+    default: return null
+  }
+}
+
 export default function Notifications() {
   const navigate   = useNavigate()
   const [notifs, setNotifs]     = useState([])
@@ -92,14 +111,20 @@ export default function Notifications() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {notifs.map(n => {
             const cfg = typeConfig(n.notification_type)
+            // CHANGED: clicking anywhere on the row (outside the action
+            // buttons) jumps to the source record — and marks it read on the
+            // way, since opening it is itself an acknowledgement.
+            const link = sourceLink(n)
             return (
               <Card key={n.id} style={{ opacity: n.is_dismissed ? 0.5 : 1 }}>
-                <div style={{
-                  display: 'flex', alignItems: 'flex-start', gap: '14px',
-                  padding: '14px 16px',
-                  background: !n.is_read ? '#fffdf6' : C.surface,
-                  borderLeft: !n.is_read ? `3px solid ${C.accent}` : '3px solid transparent',
-                }}>
+                <div
+                  onClick={link ? () => { if (!n.is_read) markRead(n.id); navigate(link) } : undefined}
+                  style={{
+                    display: 'flex', alignItems: 'flex-start', gap: '14px',
+                    padding: '14px 16px', cursor: link ? 'pointer' : 'default',
+                    background: !n.is_read ? '#fffdf6' : C.surface,
+                    borderLeft: !n.is_read ? `3px solid ${C.accent}` : '3px solid transparent',
+                  }}>
                   {/* icon */}
                   <div style={{ width: '36px', height: '36px', borderRadius: '8px', background: cfg.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '18px', flexShrink: 0 }}>
                     {cfg.icon}
@@ -118,8 +143,8 @@ export default function Notifications() {
                     )}
                   </div>
 
-                  {/* actions */}
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flexShrink: 0 }}>
+                  {/* actions — stopPropagation so these don't also trigger the row's navigate-on-click */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', flexShrink: 0 }} onClick={e => e.stopPropagation()}>
                     <div style={{ fontSize: '11px', color: C.textMuted, textAlign: 'right', marginBottom: '4px' }}>{fmtDate(n.created_at)}</div>
                     {!n.is_read && <Btn size='sm' variant='ghost' onClick={() => markRead(n.id)}>Mark read</Btn>}
                     {!n.is_dismissed && <Btn size='sm' variant='ghost' onClick={() => dismiss(n.id)} style={{ color: C.textMuted }}>Dismiss</Btn>}

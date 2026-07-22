@@ -22,42 +22,13 @@ import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock } from '../../utils/stock'
 import { isOrderOpenForDocs } from '../../utils/orders'
 import { PAYMENT_TERMS_OPTIONS } from '../../utils/paymentTerms'
-import { printDocument, ENTITY_DOC_COLUMNS } from '../../utils/documentTemplate'
+import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
-import { getDriveViewUrl } from '../../utils/drive'
-
-// Fetches its own full entity rows (address/bank/logo columns) by id rather
-// than relying on the page's own load() query to embed them — this keeps
-// the wider, newer entity columns (which may not exist yet until migration
-// 025_entity_logo.sql is applied) isolated to document generation, so a
-// missing column here can never break the PI detail page itself loading.
-export async function buildPIDoc(pi, lines) {
-  const [{ data: fromEntity }, { data: toEntity }] = await Promise.all([
-    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', pi.from_entity_id).single(),
-    supabase.from('entities').select(ENTITY_DOC_COLUMNS).eq('id', pi.to_entity_id).single(),
-  ])
-  let logoSrc = null
-  if (fromEntity?.logo_file_id) { try { logoSrc = await getDriveViewUrl(fromEntity.logo_file_id) } catch { /* no logo — text-only header */ } }
-  return {
-    docType: 'PI',
-    docNo: pi.pi_no, docDate: pi.pi_date, validOrDueDate: pi.valid_upto,
-    paymentTerms: pi.payment_terms, deliveryTimeline: pi.delivery_timeline, modeOfTransport: pi.mode_of_transport || 'Road',
-    sellerEntity: { ...fromEntity, logoSrc },
-    buyerEntity: toEntity,
-    lines,
-    totals: { taxable_amount: pi.taxable_amount, cgst_amount: pi.cgst_amount, sgst_amount: pi.sgst_amount, igst_amount: pi.igst_amount, round_off_amount: pi.round_off_amount, total_amount: pi.total_amount },
-    interstate: pi.is_interstate,
-    bankDetails: fromEntity,
-    notes: pi.notes,
-    // CHANGED: these free-text overrides were already captured on the PI
-    // form (and shown on the detail page) but never made it onto the
-    // printed document — wired into the shared doc shape so every template
-    // family can render them. Named distinctly from `shipTo` (the
-    // structured buyer/ship-to address object above) since these are
-    // separate free-text notes, not a replacement for it.
-    dispatchInfo: { billFrom: pi.bill_from, billTo: pi.bill_to, shipFrom: pi.ship_from, shipTo: pi.ship_to },
-  }
-}
+// CHANGED: buildPIDoc moved to utils/documentBuilders.js so Orders' per-leg
+// doc generation doesn't have to statically import this entire page module
+// (List/Detail/CSV-upload and all) just to reach one function — see that
+// file's header comment for why this matters once routes are code-split.
+import { buildPIDoc } from '../../utils/documentBuilders'
 
 const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 

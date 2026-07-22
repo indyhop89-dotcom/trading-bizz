@@ -59,11 +59,18 @@ async function fetchAuthedFileUrl(driveFileId) {
   return URL.createObjectURL(blob)
 }
 
-export async function getDriveViewUrl(driveFileId, driveUrl) {
+// CHANGED: both used to take a second `driveUrl` (legacy pre-B2-migration
+// direct URL) param that every call site still passes — now fully on the
+// authenticated-fetch-by-file-id flow (see fetchAuthedFileUrl above), so
+// it's dropped from the signature. Extra arguments a caller still passes
+// are simply ignored by JS, so every existing call site keeps working
+// unchanged (confirmed by drive.test.js, which already asserts this
+// function does NOT fall back to a supplied driveUrl).
+export async function getDriveViewUrl(driveFileId) {
   return fetchAuthedFileUrl(driveFileId)
 }
 
-export async function getDriveDownloadUrl(driveFileId, driveUrl) {
+export async function getDriveDownloadUrl(driveFileId) {
   return fetchAuthedFileUrl(driveFileId)
 }
 

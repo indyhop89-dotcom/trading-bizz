@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { fmtDate, toInputDate, today, currentFYLabel, currentFYCode, fyOptions } from '../dates.js'
 
 // ─── fmtDate ──────────────────────────────────────────────────────────────────

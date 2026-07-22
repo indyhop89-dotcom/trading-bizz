@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Card, PageHeader, EmptyState, StatCard, Toast, Modal, FormRow, Select,
+  C, Btn, Badge, Card, PageHeader, EmptyState, StatCard, Toast,
 } from '../../components/UI/index'
 import { formatINR } from '../../utils/money'
 import { fmtDate } from '../../utils/dates'
