@@ -4,7 +4,7 @@ import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, StatCard, CsvFileDrop,
 } from '../../components/UI/index'
-import { formatINR, toNum } from '../../utils/money'
+import { formatINR, toNum, round2 } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
@@ -1173,8 +1173,19 @@ function StockPosition() {
       const key = `${r.entity_id}__${r.product_id}`
       const am  = actualMap[key]
       const actual_qty = am ? am.actual_qty : r.opening_qty
+      // CHANGED: `rate` (used for Opening Value below) stays the historical
+      // value this row was recorded at — that figure is supposed to be a
+      // fixed point-in-time anchor, not something that drifts as new
+      // purchases come in. `actual_rate` is a SEPARATE field for Actual
+      // Value: the freshly-computed last-purchase rate (see
+      // buildLastPurchaseRateMap/last_purchase_rate — whichever is more
+      // recent, opening-balance or the latest real purchase invoice),
+      // falling back to the historical rate only when no purchase-in
+      // movement has ever recorded a nonzero rate for this entity+product.
+      const actual_rate = (am?.last_purchase_rate > 0) ? am.last_purchase_rate : toNum(r.rate)
       return {
         ...r,
+        actual_rate,
         planned_qty: r.opening_qty + r.incoming - r.outgoing,
         actual_qty,
         actual_invoiced_in:  am ? am.invoiced_in  : 0,
@@ -1225,7 +1236,7 @@ function StockPosition() {
       if (!map[key]) map[key] = { key, qty: 0, value: 0, actualValue: 0, items: [] }
       map[key].qty         += toNum(r.actual_qty)
       map[key].value       += toNum(r.opening_qty) * toNum(r.rate)
-      map[key].actualValue += toNum(r.actual_qty) * toNum(r.rate)
+      map[key].actualValue += toNum(r.actual_qty) * toNum(r.actual_rate)
       map[key].items.push(r)
     }
     return Object.values(map).sort((a, b) => b.value - a.value)
@@ -1244,7 +1255,7 @@ function StockPosition() {
   // CHANGED: Actual Stock is the headline number on this page now (see the
   // Actual Stock column below) — surface its value alongside Opening Value
   // rather than only showing the opening-based figure.
-  const totalActualValue = filteredPosition.reduce((s, r) => s + toNum(r.actual_qty) * toNum(r.rate), 0)
+  const totalActualValue = filteredPosition.reduce((s, r) => s + toNum(r.actual_qty) * toNum(r.actual_rate), 0)
   // CHANGED: qty subtotal broken out per unit (Mtrs/Nos/etc.) since summing
   // raw qty across mixed units is meaningless — same pattern already used on
   // the Opening Stock tab's StatCard summary. Sums actual_qty (this page's
@@ -1311,9 +1322,13 @@ function StockPosition() {
     // CHANGED: actual_qty and billed_beyond_stock columns added.
     // Filename carries the as-of date when one is set, so exports from
     // different points in time don't overwrite each other.
+    // CHANGED: actual_rate/actual_value columns — the last-purchase rate for
+    // this entity+product and what the current Actual Stock is worth at it
+    // (see actual_rate above), alongside the existing opening_qty/rate-based
+    // figures, so this export isn't left showing only the historical value.
     downloadCSV(`stock_position_${asOfDate ? 'as_of_' + asOfDate : new Date().toISOString().split('T')[0]}.csv`,
-      ['sno','entity','category','product','hsn_code','unit','actual_qty','billed_beyond_stock','opening_qty','incoming_pi_qty','outgoing_pi_qty','planned_qty','status'],
-      filteredPosition.map(r=>({sno:r.sno,entity:r.entity?.name||'',category:r.product?.category||'',product:r.product?.name||'',hsn_code:r.product?.hsn_code||'',unit:r.product?.unit||'',actual_qty:r.actual_qty||0,billed_beyond_stock:r.billed_beyond_stock?'Yes':'No',opening_qty:r.opening_qty||0,incoming_pi_qty:r.incoming||0,outgoing_pi_qty:r.outgoing||0,planned_qty:r.planned_qty||0,status:r.planned_qty<0?'Shortfall':r.planned_qty===0?'Zero':'OK'}))
+      ['sno','entity','category','product','hsn_code','unit','actual_qty','actual_rate','actual_value','billed_beyond_stock','opening_qty','incoming_pi_qty','outgoing_pi_qty','planned_qty','status'],
+      filteredPosition.map(r=>({sno:r.sno,entity:r.entity?.name||'',category:r.product?.category||'',product:r.product?.name||'',hsn_code:r.product?.hsn_code||'',unit:r.product?.unit||'',actual_qty:r.actual_qty||0,actual_rate:r.actual_rate||0,actual_value:round2(toNum(r.actual_qty)*toNum(r.actual_rate)),billed_beyond_stock:r.billed_beyond_stock?'Yes':'No',opening_qty:r.opening_qty||0,incoming_pi_qty:r.incoming||0,outgoing_pi_qty:r.outgoing||0,planned_qty:r.planned_qty||0,status:r.planned_qty<0?'Shortfall':r.planned_qty===0?'Zero':'OK'}))
     )
   }
 
@@ -1466,8 +1481,9 @@ function StockPosition() {
                                     <td style={{ padding: '7px 12px' }}>{it.product?.unit}</td>
                                     <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.opening_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
                                     <td style={{ padding: '7px 12px', textAlign: 'right' }}>{Number(it.actual_qty).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
-                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{formatINR(it.rate)}</td>
-                                    <td style={{ padding: '7px 12px', textAlign: 'right', fontWeight: 600 }}>{formatINR(toNum(it.opening_qty) * toNum(it.rate))}</td>
+                                    {/* CHANGED: Rate/Value here now pair with the Actual Qty column above (last purchase rate, not the historical opening rate) — "what this line is worth right now", not a historical snapshot. */}
+                                    <td style={{ padding: '7px 12px', textAlign: 'right' }}>{formatINR(it.actual_rate)}</td>
+                                    <td style={{ padding: '7px 12px', textAlign: 'right', fontWeight: 600 }}>{formatINR(toNum(it.actual_qty) * toNum(it.actual_rate))}</td>
                                   </tr>
                                 ))}
                               </tbody>

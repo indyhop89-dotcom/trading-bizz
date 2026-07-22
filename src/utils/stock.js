@@ -31,8 +31,8 @@ export async function fetchStockMovementData() {
   // cap — a plain .select() silently truncates rather than erroring, which
   // undercounts opening/actual stock once either table grows past 1000 rows.
   const [{ data: opening }, { data: invLines }, { data: adjustments }] = await Promise.all([
-    // `rate` on both feeds buildStockValuationMap (avg acquisition cost) —
-    // the qty-only consumers just ignore it. Date columns (as_of_date,
+    // `rate` on both feeds buildLastPurchaseRateMap — the qty-only
+    // consumers just ignore it. Date columns (as_of_date,
     // invoice_date/eway_bill_date, adjustment_date) feed filterStockDataAsOf
     // for the point-in-time stock view.
     fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_id, qty, rate, as_of_date')),
@@ -127,40 +127,49 @@ export function filterStockDataAsOf(raw, asOfDate) {
   }
 }
 
-// Average acquisition cost per entity+product — what the stock an entity is
-// holding actually cost it: opening stock at its recorded rate plus goods
-// invoiced IN (as buyer, E-way-Bill gated like everything else) at the
-// invoice line rate. Returns { "entityId__productId": { qty_in, value_in,
-// avg_rate } }. This is the cost basis for the "stock margin" view — margin
-// of a sale against what the goods on hand are actually carried at, as
-// opposed to the deal margin (this sale vs the previous leg's sale).
-export function buildStockValuationMap({ opening, invLines }) {
-  const map = {}
-  function ensure(entityId, productId) {
+// Last purchase rate per entity+product — the price the stock an entity is
+// currently holding would cost to buy again TODAY, not a blended historical
+// average. For each entity+product, picks whichever is more recent: the
+// entity's own opening-balance entry (dated by as_of_date) or its most
+// recent purchased-in invoice line (as buyer, E-way-Bill gated like
+// everything else, dated by eway_bill_date falling back to invoice_date) —
+// and uses THAT single row's rate. A zero/blank rate is never eligible (a
+// real purchase is never free); on a same-day tie, a real invoice wins over
+// an opening-balance estimate. Returns { "entityId__productId": rate }.
+// This is the cost basis for the "stock margin" view — margin of a sale
+// against what replacing the goods on hand would cost right now, as opposed
+// to the deal margin (this sale vs the previous leg's sale).
+export function buildLastPurchaseRateMap({ opening, invLines }) {
+  const best = {} // key -> { rate, date, srcPriority }
+  function consider(entityId, productId, rate, date, srcPriority) {
+    const r = toNum(rate)
+    if (!(r > 0)) return
     const key = `${entityId}__${productId}`
-    if (!map[key]) map[key] = { qty_in: 0, value_in: 0, avg_rate: 0 }
-    return map[key]
+    const cur = best[key]
+    if (!cur) { best[key] = { rate: r, date: date || null, srcPriority }; return }
+    // Undated candidates never outrank a dated one (nothing to compare
+    // against); between two dated candidates, later date wins; on a tie,
+    // higher srcPriority (real invoice = 1) wins over opening balance (0).
+    if (!date && cur.date) return
+    if (date && !cur.date) { best[key] = { rate: r, date, srcPriority }; return }
+    if (date && cur.date) {
+      if (date < cur.date) return
+      if (date === cur.date && srcPriority < cur.srcPriority) return
+    }
+    best[key] = { rate: r, date: date || cur.date, srcPriority }
   }
-  for (const ob of opening) {
-    const s = ensure(ob.entity_id, ob.product_id)
-    s.qty_in += toNum(ob.qty)
-    s.value_in += toNum(ob.qty) * toNum(ob.rate)
-  }
-  for (const l of invLines) {
-    const s = ensure(l.invoice.buyer_entity_id, l.product_id)
-    s.qty_in += toNum(l.qty)
-    s.value_in += toNum(l.qty) * toNum(l.rate)
-  }
-  for (const s of Object.values(map)) {
-    s.avg_rate = s.qty_in > 0 ? s.value_in / s.qty_in : 0
-  }
+  for (const ob of opening) consider(ob.entity_id, ob.product_id, ob.rate, ob.as_of_date, 0)
+  for (const l of invLines) consider(l.invoice.buyer_entity_id, l.product_id, l.rate, l.invoice.eway_bill_date || l.invoice.invoice_date, 1)
+  const map = {}
+  for (const [key, v] of Object.entries(best)) map[key] = v.rate
   return map
 }
 
-// Server-side aggregation (see migration 041_stock_position_rpc.sql) — same
-// output as buildActualStockMap()+buildStockValuationMap() combined
-// (actual_qty breakdown AND avg carrying-cost rate per entity+product), but
-// computed entirely in Postgres. The client used to page through every raw
+// Server-side aggregation (see migration 041_stock_position_rpc.sql, rate
+// logic updated by 044_stock_position_last_purchase_rate.sql) — same output
+// as buildActualStockMap()+buildLastPurchaseRateMap() combined (actual_qty
+// breakdown AND last-purchase rate per entity+product), but computed
+// entirely in Postgres. The client used to page through every raw
 // invoice line, opening-balance and adjustment row (30k+ rows, ~35 requests)
 // just to sum them in JS; the RPC returns one aggregated row per
 // entity+product in a single round trip — this is what made Stock Position
@@ -187,7 +196,7 @@ export async function fetchActualStockPosition(asOfDate = null) {
           entity_id: row.entity_id, product_id: row.product_id,
           opening_qty: toNum(row.opening_qty), invoiced_in: toNum(row.invoiced_in),
           invoiced_out: toNum(row.invoiced_out), adjustment_qty: toNum(row.adjustment_qty),
-          actual_qty: toNum(row.actual_qty), avg_in_rate: toNum(row.avg_in_rate),
+          actual_qty: toNum(row.actual_qty), last_purchase_rate: toNum(row.last_purchase_rate),
         }
       }
       return map
@@ -195,8 +204,8 @@ export async function fetchActualStockPosition(asOfDate = null) {
   } catch { /* fall through to client-side computation below */ }
   const raw = filterStockDataAsOf(await fetchStockMovementData(), asOfDate)
   const actual = buildActualStockMap(raw)
-  const valuation = buildStockValuationMap(raw)
-  for (const key of Object.keys(actual)) actual[key].avg_in_rate = valuation[key]?.avg_rate ?? 0
+  const rateMap = buildLastPurchaseRateMap(raw)
+  for (const key of Object.keys(actual)) actual[key].last_purchase_rate = rateMap[key] ?? 0
   return actual
 }
 
