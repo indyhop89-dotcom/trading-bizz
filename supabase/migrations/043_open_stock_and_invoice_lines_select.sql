@@ -39,7 +39,17 @@ CREATE POLICY stock_select ON stock_opening_balance FOR SELECT TO authenticated 
 DROP POLICY IF EXISTS invoice_lines_select ON invoice_lines;
 CREATE POLICY invoice_lines_select ON invoice_lines FOR SELECT TO authenticated USING (true);
 
+-- CHANGED: DROP IF EXISTS added for all four of this table's own new policy
+-- names too (not just the old "stock_adj_access") — the first run of this
+-- migration got partway through (created stock_adj_select) before a re-run
+-- hit "policy already exists", since only the old name had a guard. Full
+-- DROP+CREATE on every policy this file touches makes the whole thing safe
+-- to run again from a clean slate or a partial one.
 DROP POLICY IF EXISTS "stock_adj_access" ON stock_adjustments;
+DROP POLICY IF EXISTS stock_adj_select ON stock_adjustments;
+DROP POLICY IF EXISTS stock_adj_write ON stock_adjustments;
+DROP POLICY IF EXISTS stock_adj_update ON stock_adjustments;
+DROP POLICY IF EXISTS stock_adj_delete ON stock_adjustments;
 CREATE POLICY stock_adj_select ON stock_adjustments FOR SELECT TO authenticated USING (true);
 CREATE POLICY stock_adj_write ON stock_adjustments FOR INSERT WITH CHECK (user_has_entity_access(entity_id));
 CREATE POLICY stock_adj_update ON stock_adjustments FOR UPDATE USING (user_has_entity_access(entity_id)) WITH CHECK (user_has_entity_access(entity_id));
