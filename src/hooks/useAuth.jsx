@@ -9,13 +9,21 @@ export function AuthProvider({ children }) {
   const [loading, setLoading]     = useState(true)
   const [authError, setAuthError] = useState('')
 
+  // CHANGED: a separate supabase.auth.getSession() call used to run
+  // alongside this listener, but onAuthStateChange already fires once
+  // synchronously on subscribe with an 'INITIAL_SESSION' event carrying the
+  // exact same session getSession() would resolve with — running both
+  // fetched the caller's profile row TWICE on every load (two independent
+  // network round trips landing at different times, each calling
+  // setProfile() with its own freshly-fetched object). Since `profile` is a
+  // dependency of data-loading effects all over the app (Stock Position,
+  // PI, PO, Invoices, notifications), each of those two arrivals re-ran
+  // every one of those effects from scratch — most visibly Stock Position,
+  // whose "Planned" calculation pages through the entire proforma_invoice_
+  // lines table, so the whole slow load fired twice per page open for no
+  // reason. onAuthStateChange alone (below) covers both the initial load
+  // and every subsequent sign-in/out/refresh.
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null)
-      if (session?.user) fetchProfile(session.user.id)
-      else setLoading(false)
-    })
-
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null)
       if (session?.user) fetchProfile(session.user.id)

@@ -10,7 +10,7 @@ import LineItemsEditor, { computeLine, computeTotals } from '../../components/Li
 import { formatINR, formatQty, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
 import { suggestNextNo } from '../../utils/numbering'
-import { cleanProductName, productMatchKey, findNearMatchProduct } from '../../utils/products'
+import { cleanProductName, findProductByName, productKey } from '../../utils/products'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import { calcLineTax } from '../../utils/tax'
 import DocumentAttachments from '../../components/DocumentAttachments'
@@ -19,7 +19,7 @@ import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '..
 import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
-import { fetchEntityAvailableStock, findLinesMissingProductId, findLinesExceedingStock } from '../../utils/stock'
+import { fetchEntityAvailableStock, findLinesMissingProductName, findLinesExceedingStock } from '../../utils/stock'
 import { isOrderOpenForDocs } from '../../utils/orders'
 import { PAYMENT_TERMS_OPTIONS } from '../../utils/paymentTerms'
 import { printDocument } from '../../utils/documentTemplate'
@@ -41,7 +41,7 @@ const PI_STATUSES = ['draft', 'sent', 'accepted', 'converted', 'cancelled']
 // save fail with "Could not find the 'total_tax' column…". Allow-listing
 // real DB columns (as PO/Invoices already do) can't miss a field this way.
 const PI_LINE_COLUMNS = [
-  'product_id', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
+  'product_name', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
   'taxable_amount', 'cgst_rate', 'cgst_amount', 'sgst_rate', 'sgst_amount',
   'igst_rate', 'igst_amount', 'total_amount',
 ]
@@ -73,10 +73,10 @@ async function writeStockMovementsForPI(pi, lines) {
   if (!lines?.length) return
   const entries = []
   for (const l of lines) {
-    if (!l.product_id||!Number(l.qty)) continue
+    if (!l.product_name||!Number(l.qty)) continue
     const date = pi.pi_date || today()
-    entries.push({entity_id:pi.from_entity_id,product_id:l.product_id,posting_date:date,qty_in:0,qty_out:Number(l.qty),rate:Number(l.rate),voucher_type:'pi',voucher_id:pi.id,voucher_no:pi.pi_no||pi.id,notes:`PI outgoing — ${pi.pi_no||''}`})
-    entries.push({entity_id:pi.to_entity_id,product_id:l.product_id,posting_date:date,qty_in:Number(l.qty),qty_out:0,rate:Number(l.rate),voucher_type:'pi',voucher_id:pi.id,voucher_no:pi.pi_no||pi.id,notes:`PI incoming — ${pi.pi_no||''}`})
+    entries.push({entity_id:pi.from_entity_id,product_name:l.product_name,posting_date:date,qty_in:0,qty_out:Number(l.qty),rate:Number(l.rate),voucher_type:'pi',voucher_id:pi.id,voucher_no:pi.pi_no||pi.id,notes:`PI outgoing — ${pi.pi_no||''}`})
+    entries.push({entity_id:pi.to_entity_id,product_name:l.product_name,posting_date:date,qty_in:Number(l.qty),qty_out:0,rate:Number(l.rate),voucher_type:'pi',voucher_id:pi.id,voucher_no:pi.pi_no||pi.id,notes:`PI incoming — ${pi.pi_no||''}`})
   }
   if (entries.length) await supabase.from('stock_movements').insert(entries)
 }
@@ -200,9 +200,9 @@ function PIList() {
   async function handleSave(skipStockCheck = false) {
     if (!form.from_entity_id || !form.to_entity_id) return setToast({ message: 'From and To entity are required', type: 'error' })
 
-    // CHANGED: every stock-planning line must carry a product_id — otherwise
+    // CHANGED: every stock-planning line must carry a product_name — otherwise
     // it's invisible to every stock calculation. Hard block, not a warning.
-    const missing = findLinesMissingProductId(piLines)
+    const missing = findLinesMissingProductName(piLines)
     if (missing.length > 0) {
       return setToast({ message: `Line ${missing.map(l => l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`, type: 'error' })
     }
@@ -280,7 +280,7 @@ function PIList() {
         const res = resolveGSTRate(l.hsn_code, newRate, hsnMap, form.pi_date)
         if (res.gst_rate!==null){ gstRate=res.gst_rate; hsnRes=res.gst_rate; hsnSrc=res.source }
       }
-      return computeLine({_id:Date.now()+i,line_no:i+1,product_id:l.product_id||'',description:l.description||'',hsn_code:l.hsn_code||'',qty:l.qty,unit:l.unit||'Nos',rate:newRate,gst_rate:gstRate,_cost_rate:costRate,_margin_pct:String(pct),_hsn_resolved_rate:hsnRes,_hsn_source:hsnSrc,_hsn_override:false,_hsn_manually_set:false}, form.is_interstate)
+      return computeLine({_id:Date.now()+i,line_no:i+1,product_name:l.product_name||'',description:l.description||'',hsn_code:l.hsn_code||'',qty:l.qty,unit:l.unit||'Nos',rate:newRate,gst_rate:gstRate,_cost_rate:costRate,_margin_pct:String(pct),_hsn_resolved_rate:hsnRes,_hsn_source:hsnSrc,_hsn_override:false,_hsn_manually_set:false}, form.is_interstate)
     })
     setPILines(newLines); setCopyModal(false); setCopiedFromPiId(copyPiId)
     setToast({message:`${newLines.length} lines copied with ${pct}% margin. HSN re-evaluated.`,type:'success'})
@@ -334,53 +334,33 @@ function PIList() {
       groups[key].lines.push(row)
     }
 
-    // CHANGED: resolve/auto-create products up front, across all groups, in
-    // one batch — same approach as Stock/Opening Stock's CSV handler.
-    // CHANGED: match on name + HSN + rate + GST together, not name alone — a
-    // single file can list several genuinely different products sharing one
-    // generic name at different rates (per product-owner decision, only merge
-    // when all four fields match). New products are stored with a cleaned name.
-    // CHANGED: uses a precomputed Map (key -> product) instead of an array
-    // .find() re-run per row — with ~1000+ products x ~1000+ rows, a linear
-    // scan recomputing the match key for every candidate on every row is
-    // millions of string/regex ops, slow enough to look like a hang.
-    const productMap = new Map()
-    for (const p of products) {
-      productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
-    }
-    const rowMatchKey = row => productMatchKey({ name: row.product, hsn_code: row.hsn_code, rate: row.rate, gst_rate: row.gst_rate })
-    const findProduct = row => productMap.get(rowMatchKey(row))
+    // CHANGED: product identity is now NAME alone (migration
+    // 046_product_name_as_key.sql) — no more HSN/rate/GST tie-breaking or
+    // near-match rate tolerance, since two products can no longer share a
+    // name at all. Resolve/auto-create products up front, across all groups,
+    // in one batch — same approach as Stock/Opening Stock's CSV handler.
+    // `allProducts` is a local working copy (not the React state array) so a
+    // product created mid-batch is immediately visible to later rows in this
+    // same file without waiting for a re-render.
+    const allProducts = [...products]
+    const findProduct = row => findProductByName(allProducts, row.product)
     const allRows = Object.values(groups).flatMap(g => g.lines)
     const missingKeys = new Set()
     const missingRows = []
-    const nearMatchNotes = []
     for (const r of allRows) {
       if (!r.product?.trim()) continue
-      const k = rowMatchKey(r)
-      if (productMap.has(k) || missingKeys.has(k)) continue
-      // CHANGED: before treating this as a genuinely new product, check for
-      // an existing one with the same name+HSN+GST at a near-identical rate
-      // (see findNearMatchProduct) — reuse it instead of creating a phantom
-      // duplicate that silently starts at zero stock.
-      const near = findNearMatchProduct(products, { name: r.product, hsn_code: r.hsn_code, rate: r.rate, gst_rate: r.gst_rate })
-      if (near) {
-        productMap.set(k, near)
-        nearMatchNotes.push(`${r.product} @ ${formatINR(toNum(r.rate))} → matched to existing "${near.name}" @ ${formatINR(near.default_rate)} (rate close enough, not creating a duplicate)`)
-        continue
-      }
+      if (findProduct(r)) continue
+      const k = productKey(r.product)
+      if (missingKeys.has(k)) continue
       missingKeys.add(k); missingRows.push(r)
     }
     if (missingRows.length > 0) {
-      const payloads = missingRows.map(src => {
-        return { name: cleanProductName(src.product), hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }
-      })
+      const payloads = missingRows.map(src => ({ name: cleanProductName(src.product), hsn_code: src.hsn_code || null, gst_rate: toNum(src.gst_rate) || 18, unit: src.unit || 'Nos', default_rate: toNum(src.rate) || null, is_active: true }))
       const { data: newProducts, error: pErr } = await supabase.from('products').insert(payloads).select()
       if (pErr) {
         errors.push(`Could not auto-create ${missingRows.length} new product(s) — ${pErr.message}`)
       } else {
-        for (const p of (newProducts || [])) {
-          productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
-        }
+        allProducts.push(...(newProducts || []))
       }
     }
 
@@ -416,7 +396,7 @@ function PIList() {
 
       // CHANGED: require a resolvable product per line — a line with no
       // product reference cannot be tracked in stock, so we reject it
-      // clearly rather than silently inserting it with product_id = null.
+      // clearly rather than silently inserting it with product_name = null.
       let lineErr = false
       const piLines = gLines.map((r, i) => {
         const product = r.product?.trim() ? findProduct(r) : null
@@ -444,7 +424,7 @@ function PIList() {
         // CSV/Excel source data itself uses.
         const tax = calcLineTax(taxable, gstRate, interstate)
         return {
-          line_no: i + 1, product_id: product?.id || null, description: r.description, hsn_code: r.hsn_code,
+          line_no: i + 1, product_name: product?.name || null, description: r.description, hsn_code: r.hsn_code,
           qty, unit: r.unit || 'Nos', rate, gst_rate: gstRate,
           taxable_amount: taxable,
           ...tax,
@@ -486,7 +466,7 @@ function PIList() {
     }
 
     setCsvSaving(false)
-    setCsvResult({ created, errors, nearMatchNotes })
+    setCsvResult({ created, errors })
     load()
   }
 
@@ -596,7 +576,7 @@ function PIList() {
               <Btn size='sm' variant='ghost' onClick={() => downloadTemplate('pi')}>↓ Download Template</Btn>
             </div>
             <code style={{ fontFamily: 'monospace', fontSize: '11px' }}>pi_date,from_entity,to_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,valid_upto,notes,pi_no</code><br /><br />
-            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates). <strong>product</strong> is required — match an existing product name exactly, or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
+            Multiple rows with the same <strong>pi_date + from_entity + to_entity</strong> are grouped into one PI automatically. <code>pi_no</code> is optional — leave it blank to auto-generate, or supply your own (checked against existing PIs and other rows in this file to avoid duplicates). <strong>product</strong> is required and IS the product's identity — match an existing product name exactly (case/junk-insensitive), or a new product is auto-created from this row's hsn_code/gst_rate/rate/unit. Lines without a resolvable product are rejected (stock tracking depends on this link).
           </div>
           <FormRow label='Upload or Paste CSV'>
             <CsvFileDrop onText={setCsvText} />
@@ -606,14 +586,6 @@ function PIList() {
           {csvResult && (
             <div style={{ background: csvResult.errors.length > 0 ? '#fff3cc' : '#e8f3ec', border: `1px solid ${csvResult.errors.length > 0 ? '#e6c040' : '#b8dfc8'}`, borderRadius: '6px', padding: '10px 14px', fontSize: '12px' }}>
               <strong>{csvResult.created} PIs created.</strong>
-              {csvResult.nearMatchNotes?.length > 0 && (
-                <details style={{ marginTop: '6px' }}>
-                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.nearMatchNotes.length} row{csvResult.nearMatchNotes.length === 1 ? '' : 's'} matched to an existing product at a near-identical rate (no duplicate created)</summary>
-                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
-                    {csvResult.nearMatchNotes.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
-                  </div>
-                </details>
-              )}
               {csvResult.errors.map((e, i) => <div key={i} style={{ color: '#7a5000', marginTop: '4px' }}>• {e}</div>)}
             </div>
           )}
@@ -842,7 +814,7 @@ function PIDetail() {
     if (!piNo) return setToast({message:'PI number cannot be blank',type:'error'})
     // CHANGED: block edits that leave a line without a product_id — same
     // rule as PI creation, since these lines feed the same stock calc.
-    const missing = findLinesMissingProductId(editLines)
+    const missing = findLinesMissingProductName(editLines)
     if (missing.length > 0) return setToast({message:`Line ${missing.map(l=>l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`,type:'error'})
     setSaving(true)
     if (piNo.toLowerCase() !== (pi.pi_no||'').toLowerCase()) {
@@ -879,31 +851,31 @@ function PIDetail() {
 
   function handleExportLines() {
     if (!pi||!lines.length) return
-    // CHANGED: added a `product` column (resolved from product_id) — this
-    // export doubles as the starting template for the bulk-correction
-    // upload below, and a corrected file needs the product name to
-    // re-match lines back to their product on re-import.
-    const rows = lines.map(l => ({ ...l, product: products.find(p=>p.id===l.product_id)?.name || '' }))
+    // CHANGED: product is now stored directly on the line as product_name —
+    // no lookup needed. This export doubles as the starting template for the
+    // bulk-correction upload below, and a corrected file needs the product
+    // name to re-match lines back to their product on re-import.
+    const rows = lines.map(l => ({ ...l, product: l.product_name || '' }))
     downloadCSV(`${pi.pi_no||'pi'}_lines_${today()}.csv`,['line_no','product','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'],rows)
   }
 
   // CHANGED: bulk-upload corrections to an existing PI's lines while
   // editing — replaces editLines entirely with the CSV's rows rather than
   // appending, since a corrections file represents the full corrected set.
-  // Product resolution: match by `product` column name (case-insensitive)
-  // against the products table; if blank, inherit product_id from the
-  // existing line at the same line_no (so a file that only touches
-  // qty/rate doesn't need to restate every product). Unmatched rows are
-  // left with product_id=null — the existing findLinesMissingProductId
-  // check at save time already blocks on that, and editing mode now has a
-  // product dropdown (see LineItemsEditor below) to fix them manually.
+  // Product resolution: match by `product` column name (case-insensitive,
+  // junk-stripped — product identity is name alone) against the products
+  // table; if blank, inherit product_name from the existing line at the
+  // same line_no (so a file that only touches qty/rate doesn't need to
+  // restate every product). Unmatched rows are left with product_name=null
+  // — the existing findLinesMissingProductName check at save time already
+  // blocks on that, and editing mode now has a product dropdown (see
+  // LineItemsEditor below) to fix them manually.
   async function handleBulkLinesCsv() {
     setBulkCsvSaving(true)
     const rows = bulkCsvText.trim().split('\n').filter(l => l.trim())
     if (rows.length < 2) { setBulkCsvSaving(false); return setBulkCsvResult({ loaded: 0, errors: ['Need header + data rows'] }) }
     const delim = detectDelimiter(rows[0])
     const header = parseCSVLine(rows[0], delim).map(h => h.trim().toLowerCase())
-    const byName = new Map(products.map(p => [p.name.trim().toLowerCase(), p]))
     const byLineNo = new Map(lines.map(l => [String(l.line_no), l]))
     const errors = []
     const newLines = []
@@ -913,9 +885,9 @@ function PIDetail() {
       header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
       if (!row.description && !row.qty && !row.rate) continue // blank row
       const existing = row.line_no ? byLineNo.get(row.line_no) : null
-      const matchedProduct = row.product ? byName.get(row.product.toLowerCase()) : null
+      const matchedProduct = row.product ? findProductByName(products, row.product) : null
       if (row.product && !matchedProduct) errors.push(`Row ${i + 1}: product "${row.product}" not found — line added without a product, pick one manually before saving.`)
-      const productId = matchedProduct?.id || (!row.product ? existing?.product_id : null) || ''
+      const productName = matchedProduct?.name || (!row.product ? existing?.product_name : null) || ''
       const hsnCode = row.hsn_code || existing?.hsn_code || ''
       const rowRate = toNum(row.rate)
       // CHANGED: resolve GST rate from HSN master as of this PI's own date
@@ -928,7 +900,7 @@ function PIDetail() {
       const gstRate = resolved.gst_rate !== null ? resolved.gst_rate : (toNum(row.gst_rate) || existing?.gst_rate || 18)
       newLines.push({
         _id: existing?.id || Date.now() + i, line_no: newLines.length + 1,
-        product_id: productId, description: row.description || existing?.description || '',
+        product_name: productName, description: row.description || existing?.description || '',
         hsn_code: hsnCode, qty: toNum(row.qty), unit: row.unit || existing?.unit || 'Nos',
         rate: rowRate, gst_rate: gstRate,
         taxable_amount: 0, cgst_rate: 0, cgst_amount: 0, sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,

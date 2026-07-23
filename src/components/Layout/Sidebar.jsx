@@ -2,8 +2,6 @@ import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import { NavLink, useNavigate } from 'react-router-dom'
 import { useAuth } from '../../hooks/useAuth'
-import { supabase } from '../../supabaseClient'
-import { Modal, Input, Btn, Toast, FormRow } from '../UI/index'
 
 // ─── Nav definition ───────────────────────────────────────────────────────────
 export const NAV = [
@@ -54,44 +52,16 @@ function SettingsIcon()     { return <Icon d='M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6
 function ChevronLeftIcon()  { return <Icon d='M15 18l-6-6 6-6' /> }
 function ChevronRightIcon() { return <Icon d='M9 18l6-6-6-6' /> }
 function LogOutIcon()       { return <Icon d='M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9' /> }
-function KeyIcon()          { return <Icon d={['M21 2l-9.6 9.6', 'M15.5 7.5l3 3L22 7l-3-3', 'M7.5 15.5a3.5 3.5 0 1 1-5 5 3.5 3.5 0 0 1 5-5z']} /> }
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 export default function Sidebar({ collapsed, onToggle }) {
   const { profile, signOut } = useAuth()
   const navigate = useNavigate()
-  const [pwModalOpen, setPwModalOpen] = useState(false)
-  const [newPassword, setNewPassword] = useState('')
-  const [confirmPassword, setConfirmPassword] = useState('')
-  const [pwSaving, setPwSaving] = useState(false)
-  const [pwToast, setPwToast] = useState(null)
   const [hoverTip, setHoverTip] = useState(null)
 
   async function handleSignOut() {
     await signOut()
     navigate('/login')
-  }
-
-  function openPwModal() {
-    setNewPassword('')
-    setConfirmPassword('')
-    setPwModalOpen(true)
-  }
-
-  // Self-service — supabase.auth.updateUser() only needs the caller's own
-  // active session, no service_role/Edge Function involved. Admin/master
-  // resetting *someone else's* password is a separate flow (Settings → Users)
-  // that does need service_role, since RLS/GoTrue never let one account set
-  // another's password directly.
-  async function handleChangePassword() {
-    if (newPassword.length < 6) return setPwToast({ message: 'Password must be at least 6 characters', type: 'error' })
-    if (newPassword !== confirmPassword) return setPwToast({ message: 'Passwords do not match', type: 'error' })
-    setPwSaving(true)
-    const { error } = await supabase.auth.updateUser({ password: newPassword })
-    setPwSaving(false)
-    if (error) return setPwToast({ message: error.message, type: 'error' })
-    setPwModalOpen(false)
-    setPwToast({ message: 'Password updated', type: 'success' })
   }
 
   const W = collapsed ? 56 : 220
@@ -220,27 +190,11 @@ export default function Sidebar({ collapsed, onToggle }) {
           </div>
         )}
         <div style={{ display: 'flex', gap: '6px', flexDirection: collapsed ? 'column' : 'row' }}>
-          <button
-            onClick={openPwModal}
-            title='Change password'
-            style={{
-              background: 'rgba(245,240,232,0.06)',
-              border: '1px solid rgba(245,240,232,0.1)',
-              color: 'rgba(245,240,232,0.45)',
-              padding: collapsed ? '6px' : '5px 10px',
-              borderRadius: '5px', fontSize: '12px',
-              cursor: 'pointer', fontFamily: 'var(--font-sans)',
-              display: 'flex', alignItems: 'center', gap: '6px',
-              width: collapsed ? '100%' : 'auto',
-              justifyContent: 'center',
-              transition: 'background 0.15s, color 0.15s',
-            }}
-            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; e.currentTarget.style.color = '#f5f0e8' }}
-            onMouseLeave={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; e.currentTarget.style.color = 'rgba(245,240,232,0.45)' }}
-          >
-            <KeyIcon />
-            {!collapsed && <span>Password</span>}
-          </button>
+          {/* CHANGED: "Change Password" removed — Google SSO is now the
+              sole sign-in path shown in this app's UI (see Login.jsx), so a
+              self-service password-setting feature that could never
+              actually be used to log in was just confusing dead weight.
+              Supabase's own Email/Password provider is untouched server-side. */}
           <button
             onClick={handleSignOut}
             title='Sign out'
@@ -265,21 +219,6 @@ export default function Sidebar({ collapsed, onToggle }) {
         </div>
       </div>
 
-      <Modal open={pwModalOpen} onClose={() => setPwModalOpen(false)} title='Change Password' width={400}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          <FormRow label='New Password' required>
-            <Input type='password' value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder='At least 6 characters' />
-          </FormRow>
-          <FormRow label='Confirm Password' required>
-            <Input type='password' value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} />
-          </FormRow>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: '1px solid var(--border)' }}>
-            <Btn variant='ghost' onClick={() => setPwModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleChangePassword} disabled={pwSaving}>{pwSaving ? 'Saving…' : 'Update Password'}</Btn>
-          </div>
-        </div>
-      </Modal>
-      {pwToast && <Toast message={pwToast.message} type={pwToast.type} onClose={() => setPwToast(null)} />}
       {hoverTip && createPortal(
         <div style={{
           position: 'fixed',

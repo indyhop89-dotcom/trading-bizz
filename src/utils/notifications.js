@@ -124,20 +124,20 @@ export async function generateNotifications(userId) {
   // (migration 041) when available, instead of downloading every raw
   // invoice/opening-balance row just to sum them in the browser.
   const actualMap = await fetchActualStockPosition()
-  function availableFor(entityId, productId) {
-    return actualMap[`${entityId}__${productId}`]?.actual_qty ?? 0
+  function availableFor(entityId, productName) {
+    return actualMap[`${entityId}__${productName}`]?.actual_qty ?? 0
   }
 
   const { data: piLinesForNotif } = await supabase
     .from('proforma_invoice_lines')
-    .select('qty, product_id, pi:pi_id(id, pi_no, from_entity_id, status)')
+    .select('qty, product_name, pi:pi_id(id, pi_no, from_entity_id, status)')
     .not('pi', 'is', null)
     .neq('pi.status', 'cancelled')
 
   const piExceedGroups = new Map()
   for (const l of (piLinesForNotif || [])) {
-    if (!l.pi || !l.product_id) continue
-    if ((Number(l.qty) || 0) <= availableFor(l.pi.from_entity_id, l.product_id)) continue
+    if (!l.pi || !l.product_name) continue
+    if ((Number(l.qty) || 0) <= availableFor(l.pi.from_entity_id, l.product_name)) continue
     const g = piExceedGroups.get(l.pi.id) || { pi_no: l.pi.pi_no, entity_id: l.pi.from_entity_id, count: 0 }
     g.count++
     piExceedGroups.set(l.pi.id, g)
@@ -162,14 +162,14 @@ export async function generateNotifications(userId) {
   // this check (see stock.js buildActualStockMap for the same distinction).
   const { data: invLinesForNotif } = await supabase
     .from('invoice_lines')
-    .select('qty, product_id, invoice:invoice_id(id, invoice_no, seller_entity_id, status, invoice_type, source_invoice_id)')
+    .select('qty, product_name, invoice:invoice_id(id, invoice_no, seller_entity_id, status, invoice_type, source_invoice_id)')
     .not('invoice', 'is', null)
     .neq('invoice.status', 'cancelled')
 
   const invExceedGroups = new Map()
   for (const l of (invLinesForNotif || [])) {
-    if (!l.invoice || (l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id) || !l.product_id) continue
-    if ((Number(l.qty) || 0) <= availableFor(l.invoice.seller_entity_id, l.product_id)) continue
+    if (!l.invoice || (l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id) || !l.product_name) continue
+    if ((Number(l.qty) || 0) <= availableFor(l.invoice.seller_entity_id, l.product_name)) continue
     const g = invExceedGroups.get(l.invoice.id) || { invoice_no: l.invoice.invoice_no, entity_id: l.invoice.seller_entity_id, count: 0 }
     g.count++
     invExceedGroups.set(l.invoice.id, g)
@@ -186,11 +186,11 @@ export async function generateNotifications(userId) {
     })
   }
 
-  // 7. Missing product_id on PI/invoice lines — these are invisible to
+  // 7. Missing product_name on PI/invoice lines — these are invisible to
   // every stock calculation above, so surface them as their own alert.
   const missingPiGroups = new Map()
   for (const l of (piLinesForNotif || [])) {
-    if (!l.pi || l.product_id || !(Number(l.qty) > 0)) continue
+    if (!l.pi || l.product_name || !(Number(l.qty) > 0)) continue
     const g = missingPiGroups.get(l.pi.id) || { pi_no: l.pi.pi_no, entity_id: l.pi.from_entity_id, count: 0 }
     g.count++
     missingPiGroups.set(l.pi.id, g)
@@ -209,7 +209,7 @@ export async function generateNotifications(userId) {
 
   const missingInvGroups = new Map()
   for (const l of (invLinesForNotif || [])) {
-    if (!l.invoice || l.product_id || !(Number(l.qty) > 0)) continue
+    if (!l.invoice || l.product_name || !(Number(l.qty) > 0)) continue
     const g = missingInvGroups.get(l.invoice.id) || { invoice_no: l.invoice.invoice_no, entity_id: l.invoice.seller_entity_id, count: 0 }
     g.count++
     missingInvGroups.set(l.invoice.id, g)
@@ -293,7 +293,7 @@ export async function generateNotifications(userId) {
   // Stock" indicator since both read the same actual_qty signal.
   const negativeByEntity = new Map()
   if (NEGATIVE_STOCK_FLAG_ENABLED) for (const row of Object.values(actualMap)) {
-    if (row.actual_qty >= 0 || !row.product_id) continue
+    if (row.actual_qty >= 0 || !row.product_name) continue
     negativeByEntity.set(row.entity_id, (negativeByEntity.get(row.entity_id) || 0) + 1)
   }
   for (const [entityId, count] of negativeByEntity) {

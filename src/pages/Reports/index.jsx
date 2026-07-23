@@ -800,16 +800,16 @@ function ActualStockReport({ entities, defaultEntityId }) {
       fetchActualStockPosition(),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,unit,category')),
     ])
-    const productById = Object.fromEntries((products || []).map(p => [p.id, p]))
+    const productByName = Object.fromEntries((products || []).map(p => [p.name, p]))
     const entityById  = Object.fromEntries(entities.map(e => [e.id, e]))
     // This is a "what do we actually hold right now" ledger, not a full
     // history — a product an entity once carried but is fully out of no
     // longer belongs here (same reasoning as Stock Position's hide-sold-out
     // default, applied unconditionally since this view has no toggle).
-    let result = Object.values(map).filter(r => r.product_id && r.actual_qty !== 0)
+    let result = Object.values(map).filter(r => r.product_name && r.actual_qty !== 0)
     if (entityId) result = result.filter(r => r.entity_id === entityId)
     result = result
-      .map(r => ({ ...r, entity: entityById[r.entity_id], product: productById[r.product_id] }))
+      .map(r => ({ ...r, entity: entityById[r.entity_id], product: productByName[r.product_name] }))
       .sort((a, b) => (a.entity?.name || '').localeCompare(b.entity?.name || '') || (a.product?.name || '').localeCompare(b.product?.name || ''))
     setRows(result)
     setLoading(false)
@@ -887,13 +887,11 @@ function StockMovementReport({ entities }) {
 
   async function runReport() {
     setLoading(true)
-    const [{ data: invLines }, { data: products }] = await Promise.all([
+    const [{ data: invLines }] = await Promise.all([
       fetchAllPages(() => supabase.from('invoice_lines')
-        .select('qty, product_id, invoice:invoice_id(invoice_no, eway_bill_no, eway_bill_date, status, invoice_type, seller_entity_id, buyer_entity_id, source_invoice_id, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name))')
+        .select('qty, product_name, invoice:invoice_id(invoice_no, eway_bill_no, eway_bill_date, status, invoice_type, seller_entity_id, buyer_entity_id, source_invoice_id, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name))')
         .not('invoice', 'is', null)),
-      fetchAllPages(() => supabase.from('products').select('id,name')),
     ])
-    const productById = Object.fromEntries((products || []).map(p => [p.id, p]))
     // CHANGED: only the auto-generated buyer-side mirror (source_invoice_id
     // set) is excluded to avoid showing the same movement twice — a manual
     // purchase invoice (no source_invoice_id) is the only record of that
@@ -908,7 +906,7 @@ function StockMovementReport({ entities }) {
       .filter(l => !entityId || l.invoice.seller_entity_id === entityId || l.invoice.buyer_entity_id === entityId)
       .map(l => ({
         eway_bill_no: l.invoice.eway_bill_no, eway_bill_date: l.invoice.eway_bill_date, invoice_no: l.invoice.invoice_no,
-        product: productById[l.product_id]?.name || (l.product_id ? '—' : '⚠ No product'),
+        product: l.product_name || '⚠ No product',
         qty: l.qty, from: l.invoice.seller?.short_name || l.invoice.seller?.name, to: l.invoice.buyer?.short_name || l.invoice.buyer?.name,
       }))
       .sort((a, b) => new Date(b.eway_bill_date || 0) - new Date(a.eway_bill_date || 0))
@@ -968,8 +966,8 @@ function StockMovementReport({ entities }) {
 }
 
 // ─── Missing Product Mapping ────────────────────────────────────────────────────
-// Any qty>0 line with no product_id is invisible to every stock calculation —
-// this is the same rule findLinesMissingProductId() blocks on save, surfaced
+// Any qty>0 line with no product_name is invisible to every stock calculation —
+// this is the same rule findLinesMissingProductName() blocks on save, surfaced
 // here for lines that slipped through before that validation existed.
 function MissingProductReport() {
   const [rows, setRows]       = useState(null)
@@ -978,9 +976,9 @@ function MissingProductReport() {
   async function runReport() {
     setLoading(true)
     const [{ data: piLines }, { data: poLines }, { data: invLines }] = await Promise.all([
-      supabase.from('proforma_invoice_lines').select('qty, product_id, pi:pi_id(pi_no, pi_date, from_entity:from_entity_id(name,short_name))').is('product_id', null),
-      supabase.from('purchase_order_lines').select('qty, product_id, po:po_id(po_no, po_date, buyer:buyer_entity_id(name,short_name))').is('product_id', null),
-      supabase.from('invoice_lines').select('qty, product_id, invoice:invoice_id(invoice_no, invoice_date, seller:seller_entity_id(name,short_name))').is('product_id', null),
+      supabase.from('proforma_invoice_lines').select('qty, product_name, pi:pi_id(pi_no, pi_date, from_entity:from_entity_id(name,short_name))').is('product_name', null),
+      supabase.from('purchase_order_lines').select('qty, product_name, po:po_id(po_no, po_date, buyer:buyer_entity_id(name,short_name))').is('product_name', null),
+      supabase.from('invoice_lines').select('qty, product_name, invoice:invoice_id(invoice_no, invoice_date, seller:seller_entity_id(name,short_name))').is('product_name', null),
     ])
     const result = [
       ...(piLines || []).filter(l => l.pi && Number(l.qty) > 0).map(l => ({ source: 'PI', doc: l.pi.pi_no, date: l.pi.pi_date, entity: l.pi.from_entity?.short_name || l.pi.from_entity?.name, qty: l.qty })),

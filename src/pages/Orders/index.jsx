@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, Fragment } from 'react'
 import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
@@ -187,10 +187,21 @@ function DocLink({ doc, children }) {
 }
 
 function OrderSummaryTable({ legs, piMap, poMap, invMap, invAggMap, docMap, costBasisMap, crossOrderCostMap, stockMarginMap }) {
+  const navigate = useNavigate()
+  // CHANGED: which legs' invoice breakdown is currently expanded — a leg
+  // invoiced across several tranches previously showed only its "primary"
+  // invoice plus a plain "+N more" COUNT with no way to actually see or
+  // open the others. Clicking it now reveals every tranche, each a real
+  // link to that invoice's own detail page.
+  const [expandedLegs, setExpandedLegs] = useState(new Set())
   if (!legs.length) return null
+  function toggleLeg(legId) {
+    setExpandedLegs(prev => { const next = new Set(prev); next.has(legId) ? next.delete(legId) : next.add(legId); return next })
+  }
   const en = e=>e?.short_name||e?.name||'—'
   const td = {padding:'8px 10px',borderBottom:`1px solid ${C.border}`}
   const th = {padding:'7px 10px',fontSize:'10px',fontWeight:700,color:C.textSoft,textTransform:'uppercase',letterSpacing:'0.05em',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,whiteSpace:'nowrap'}
+  const COL_COUNT = 13
   return (
     <div style={{overflowX:'auto'}}>
       <table style={{width:'100%',borderCollapse:'collapse',fontSize:'12px',whiteSpace:'nowrap'}}>
@@ -218,8 +229,10 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, invAggMap, docMap, cost
             const margin=computeLegMargin(leg,legs,invAggMap||{},costBasisMap,crossOrderCostMap)
             const stockMargin=stockMarginMap?.[leg.id]
             const status=getLegStatus(pi,po,inv)
+            const isExpanded=expandedLegs.has(leg.id)
             return (
-              <tr key={leg.id} style={{background:ri%2===0?C.surface:'#faf6ed'}}>
+              <Fragment key={leg.id}>
+              <tr style={{background:ri%2===0?C.surface:'#faf6ed'}}>
                 <td style={td}><div style={{width:22,height:22,borderRadius:'50%',background:C.accent,color:'#f5f0e8',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'11px',fontWeight:700}}>{leg.leg_no}</div></td>
                 <td style={td}><span style={{fontWeight:600}}>{en(leg.from_entity)}</span><span style={{color:C.textMuted,margin:'0 4px'}}>→</span><span style={{fontWeight:600}}>{en(leg.to_entity)}</span></td>
                 <td style={{...td,fontFamily:'monospace'}}>{pi?.pi_no?<DocLink doc={legDocs?.pi}>{pi.pi_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
@@ -227,8 +240,16 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, invAggMap, docMap, cost
                 <td style={{...td,fontFamily:'monospace'}}>{po?.po_no?<DocLink doc={legDocs?.po}>{po.po_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}</td>
                 <td style={{...td,fontFamily:'monospace'}}>
                   {inv?.invoice_no?<DocLink doc={legDocs?.invoice}>{inv.invoice_no}</DocLink>:<span style={{color:C.textMuted}}>—</span>}
-                  {/* CHANGED: a leg can hold several invoices (tranches) — show the count so the summed Qty/Value columns make sense */}
-                  {agg?.count>1&&<span style={{marginLeft:4,fontSize:'10px',color:C.textMuted,fontFamily:'inherit'}}>+{agg.count-1} more</span>}
+                  {/* CHANGED: "+N more" is now a real toggle — a leg invoiced
+                      across several tranches previously showed only the
+                      "primary" invoice with no way to see or open the
+                      others; click to expand the full list below. */}
+                  {agg?.count>1&&(
+                    <button onClick={()=>toggleLeg(leg.id)}
+                      style={{marginLeft:4,fontSize:'10px',color:C.accent,fontFamily:'inherit',background:'none',border:'none',padding:0,cursor:'pointer',textDecoration:'underline'}}>
+                      {isExpanded?'▲ hide':`+${agg.count-1} more`}
+                    </button>
+                  )}
                 </td>
                 <td style={{...td,color:C.textSoft}}>{inv?fmtDate(inv.invoice_date):'—'}</td>
                 <td style={{...td,textAlign:'right',fontVariantNumeric:'tabular-nums'}}>{pi?.total_qty>0?formatQty(pi.total_qty):'—'}</td>
@@ -243,6 +264,34 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, invAggMap, docMap, cost
                 <td style={td}><Badge status={status.key} label={status.label}/></td>
                 <td style={{...td,textAlign:'right',fontWeight:600,color:payColor}}>{payStatus}</td>
               </tr>
+              {isExpanded&&agg?.items?.length>0&&(
+                <tr>
+                  <td colSpan={COL_COUNT} style={{padding:0,borderBottom:`1px solid ${C.border}`,background:C.bg}}>
+                    <table style={{width:'100%',borderCollapse:'collapse',fontSize:'11px'}}>
+                      <thead>
+                        <tr>
+                          {['Invoice No','Date','Qty','Value','Status'].map((h,i)=>(
+                            <th key={i} style={{padding:'5px 10px 5px 40px',textAlign:i>=2?'right':'left',fontSize:'9px',fontWeight:700,color:C.textMuted,textTransform:'uppercase',letterSpacing:'0.04em',borderBottom:`1px solid ${C.border}`,whiteSpace:'nowrap'}}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {agg.items.map(item=>(
+                          <tr key={item.id} style={{cursor:'pointer'}} onClick={()=>navigate(`/invoices/${item.id}`)}
+                            onMouseEnter={e=>e.currentTarget.style.background='#f0e8d8'} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>
+                            <td style={{padding:'5px 10px 5px 40px',fontFamily:'monospace',color:C.accent,textDecoration:'underline'}}>{item.invoice_no||item.id.slice(0,8)}</td>
+                            <td style={{padding:'5px 10px',color:C.textSoft}}>{fmtDate(item.invoice_date)}</td>
+                            <td style={{padding:'5px 10px',textAlign:'right'}}>{formatQty(item.total_qty)}</td>
+                            <td style={{padding:'5px 10px',textAlign:'right',fontWeight:600}}>{formatINR(item.total_amount)}</td>
+                            <td style={{padding:'5px 10px'}}><Badge status={item.status}/></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             )
           })}
         </tbody>
@@ -593,6 +642,10 @@ function OrderDetail() {
           total:   round2(act.reduce((s,v)=>s+toNum(v.total_amount),0)),
           qty:     round2(act.reduce((s,v)=>s+toNum(v.total_qty),0)),
           count:   act.length,
+          // CHANGED: the individual invoices themselves — "+N more" used to
+          // be just a count with no way to actually see or open the other
+          // tranches; OrderSummaryTable's expandable row reads this list.
+          items:   act,
         }
       }
       setInvAggMap(aggMap)
@@ -651,14 +704,14 @@ function OrderDetail() {
       const cbMap = {}
       if (leg1Invs.length) {
         const [{ data: invLines }, { data: obRows }] = await Promise.all([
-          fetchAllPages(() => supabase.from('invoice_lines').select('product_id,qty').in('invoice_id', leg1Invs.map(v => v.id))),
-          supabase.from('stock_opening_balance').select('product_id,rate').eq('entity_id', leg1.from_entity_id).eq('financial_year_id', o.financial_year_id),
+          fetchAllPages(() => supabase.from('invoice_lines').select('product_name,qty').in('invoice_id', leg1Invs.map(v => v.id))),
+          supabase.from('stock_opening_balance').select('product_name,rate').eq('entity_id', leg1.from_entity_id).eq('financial_year_id', o.financial_year_id),
         ])
         const rateByProduct = {}
-        for (const ob of (obRows||[])) rateByProduct[ob.product_id] = toNum(ob.rate)
+        for (const ob of (obRows||[])) rateByProduct[ob.product_name] = toNum(ob.rate)
         let cost = 0, known = true
         for (const line of (invLines||[])) {
-          const r = rateByProduct[line.product_id]
+          const r = rateByProduct[line.product_name]
           if (!(r > 0)) { known = false; break }
           cost += toNum(line.qty) * r
         }
@@ -680,7 +733,7 @@ function OrderDetail() {
         // entity+product instead of downloading every raw invoice/opening-
         // balance row just to rank them in the browser.
         const [{ data: allLines }, valuation] = await Promise.all([
-          fetchAllPages(() => supabase.from('invoice_lines').select('invoice_id,product_id,qty,rate').in('invoice_id', allActiveInvs.map(v => v.id))),
+          fetchAllPages(() => supabase.from('invoice_lines').select('invoice_id,product_name,qty,rate').in('invoice_id', allActiveInvs.map(v => v.id))),
           fetchActualStockPosition(),
         ])
         const linesByInvoice = {}
@@ -694,7 +747,7 @@ function OrderDetail() {
           let cost = 0, sale = 0, known = true
           for (const v of legInvs) {
             for (const l of (linesByInvoice[v.id] || [])) {
-              const val = valuation[`${leg.from_entity_id}__${l.product_id}`]
+              const val = valuation[`${leg.from_entity_id}__${l.product_name}`]
               if (!val || !(val.last_purchase_rate > 0)) { known = false; break }
               cost += toNum(l.qty) * val.last_purchase_rate
               sale += toNum(l.qty) * toNum(l.rate)

@@ -28,7 +28,7 @@ const STATUSES   = ['draft', 'submitted', 'cancelled']
 // Allow-listing real DB columns (same pattern PI/PO/Invoices already use
 // via PI_LINE_COLUMNS/toPILinePayload) can't miss a field this way.
 const NOTE_LINE_COLUMNS = [
-  'product_id', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
+  'product_name', 'description', 'hsn_code', 'qty', 'unit', 'rate', 'gst_rate',
   'taxable_amount', 'cgst_amount', 'sgst_amount', 'igst_amount', 'total_amount',
 ]
 function toNoteLinePayload(computedLine, noteId, lineNo) {
@@ -158,7 +158,7 @@ function NoteList() {
     // exact same computeLine/computeTotals math every full-line-item note
     // already uses — no separate tax-math path needed.
     const sourceLines = simpleMode
-      ? simpleLines.map(r => ({ description: 'Rate/amount adjustment', hsn_code: '-', product_id: null, qty: 1, unit: 'Nos', rate: toNum(r.amount), gst_rate: toNum(r.gst_rate) }))
+      ? simpleLines.map(r => ({ description: 'Rate/amount adjustment', hsn_code: '-', product_name: null, qty: 1, unit: 'Nos', rate: toNum(r.amount), gst_rate: toNum(r.gst_rate) }))
       : noteLines
     const computed = sourceLines.map(l => computeLine(l, form.is_interstate))
     const totals   = computeTotals(computed)

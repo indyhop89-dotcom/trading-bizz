@@ -34,6 +34,11 @@ const MOVEMENT_STATUSES_EXCLUDED = ['cancelled']
 // when the underlying data is actually complete.
 export const NEGATIVE_STOCK_FLAG_ENABLED = false
 
+// CHANGED: product identity is now NAME, not product_id (see migration
+// 046_product_name_as_key.sql) — every table below carries product_name
+// instead. All the aggregation keys in this file are `entityId__productName`
+// accordingly.
+
 // Raw data fetch — shared by both consumers below so we only hit the DB once
 // per page load rather than once per entity.
 export async function fetchStockMovementData() {
@@ -45,9 +50,9 @@ export async function fetchStockMovementData() {
     // consumers just ignore it. Date columns (as_of_date,
     // invoice_date/eway_bill_date, adjustment_date) feed filterStockDataAsOf
     // for the point-in-time stock view.
-    fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_id, qty, rate, as_of_date')),
+    fetchAllPages(() => supabase.from('stock_opening_balance').select('entity_id, product_name, qty, rate, as_of_date')),
     fetchAllPages(() => supabase.from('invoice_lines')
-      .select('qty, rate, product_id, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, eway_bill_date, invoice_date, invoice_type, is_deleted, source_invoice_id)')
+      .select('qty, rate, product_name, invoice:invoice_id(seller_entity_id, buyer_entity_id, status, eway_bill_no, eway_bill_date, invoice_date, invoice_type, is_deleted, source_invoice_id)')
       .not('invoice', 'is', null)),
     // CHANGED: manual corrections (shortfall/damage/found/recount/offloaded)
     // — a signed qty_delta applied straight into actual_qty, same as
@@ -58,7 +63,7 @@ export async function fetchStockMovementData() {
     // (sold/disposed of outside it) — they affect Actual Stock exactly like
     // every other reason, but never P&L (Reports' P&L/Profitability tabs
     // are computed purely from invoices/expenses, not stock_adjustments).
-    fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_id, qty_delta, adjustment_date')),
+    fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_name, qty_delta, adjustment_date')),
   ])
   return {
     opening: opening || [],
@@ -92,25 +97,25 @@ export async function fetchStockMovementData() {
   }
 }
 
-// Builds { "entityId__productId": { entity_id, product_id, opening_qty, invoiced_in, invoiced_out, adjustment_qty, actual_qty } }
+// Builds { "entityId__productName": { entity_id, product_name, opening_qty, invoiced_in, invoiced_out, adjustment_qty, actual_qty } }
 // actual_qty = opening + goods invoiced in (as buyer) - goods invoiced out (as seller) + manual adjustments
 export function buildActualStockMap({ opening, invLines, adjustments = [] }) {
   const map = {}
-  function ensure(entityId, productId) {
-    const key = `${entityId}__${productId}`
-    if (!map[key]) map[key] = { entity_id: entityId, product_id: productId, opening_qty: 0, invoiced_in: 0, invoiced_out: 0, adjustment_qty: 0 }
+  function ensure(entityId, productName) {
+    const key = `${entityId}__${productName}`
+    if (!map[key]) map[key] = { entity_id: entityId, product_name: productName, opening_qty: 0, invoiced_in: 0, invoiced_out: 0, adjustment_qty: 0 }
     return map[key]
   }
   for (const ob of opening) {
-    ensure(ob.entity_id, ob.product_id).opening_qty += toNum(ob.qty)
+    ensure(ob.entity_id, ob.product_name).opening_qty += toNum(ob.qty)
   }
   for (const line of invLines) {
     const qty = toNum(line.qty)
-    ensure(line.invoice.seller_entity_id, line.product_id).invoiced_out += qty
-    ensure(line.invoice.buyer_entity_id, line.product_id).invoiced_in   += qty
+    ensure(line.invoice.seller_entity_id, line.product_name).invoiced_out += qty
+    ensure(line.invoice.buyer_entity_id, line.product_name).invoiced_in   += qty
   }
   for (const adj of adjustments) {
-    ensure(adj.entity_id, adj.product_id).adjustment_qty += toNum(adj.qty_delta)
+    ensure(adj.entity_id, adj.product_name).adjustment_qty += toNum(adj.qty_delta)
   }
   for (const row of Object.values(map)) {
     row.actual_qty = row.opening_qty + row.invoiced_in - row.invoiced_out + row.adjustment_qty
@@ -145,16 +150,16 @@ export function filterStockDataAsOf(raw, asOfDate) {
 // everything else, dated by eway_bill_date falling back to invoice_date) —
 // and uses THAT single row's rate. A zero/blank rate is never eligible (a
 // real purchase is never free); on a same-day tie, a real invoice wins over
-// an opening-balance estimate. Returns { "entityId__productId": rate }.
+// an opening-balance estimate. Returns { "entityId__productName": rate }.
 // This is the cost basis for the "stock margin" view — margin of a sale
 // against what replacing the goods on hand would cost right now, as opposed
 // to the deal margin (this sale vs the previous leg's sale).
 export function buildLastPurchaseRateMap({ opening, invLines }) {
   const best = {} // key -> { rate, date, srcPriority }
-  function consider(entityId, productId, rate, date, srcPriority) {
+  function consider(entityId, productName, rate, date, srcPriority) {
     const r = toNum(rate)
     if (!(r > 0)) return
-    const key = `${entityId}__${productId}`
+    const key = `${entityId}__${productName}`
     const cur = best[key]
     if (!cur) { best[key] = { rate: r, date: date || null, srcPriority }; return }
     // Undated candidates never outrank a dated one (nothing to compare
@@ -168,16 +173,17 @@ export function buildLastPurchaseRateMap({ opening, invLines }) {
     }
     best[key] = { rate: r, date: date || cur.date, srcPriority }
   }
-  for (const ob of opening) consider(ob.entity_id, ob.product_id, ob.rate, ob.as_of_date, 0)
-  for (const l of invLines) consider(l.invoice.buyer_entity_id, l.product_id, l.rate, l.invoice.eway_bill_date || l.invoice.invoice_date, 1)
+  for (const ob of opening) consider(ob.entity_id, ob.product_name, ob.rate, ob.as_of_date, 0)
+  for (const l of invLines) consider(l.invoice.buyer_entity_id, l.product_name, l.rate, l.invoice.eway_bill_date || l.invoice.invoice_date, 1)
   const map = {}
   for (const [key, v] of Object.entries(best)) map[key] = v.rate
   return map
 }
 
 // Server-side aggregation (see migration 041_stock_position_rpc.sql, rate
-// logic updated by 044_stock_position_last_purchase_rate.sql) — same output
-// as buildActualStockMap()+buildLastPurchaseRateMap() combined (actual_qty
+// logic updated by 044_stock_position_last_purchase_rate.sql/045, keyed on
+// product_name by 046_product_name_as_key.sql) — same output as
+// buildActualStockMap()+buildLastPurchaseRateMap() combined (actual_qty
 // breakdown AND last-purchase rate per entity+product), but computed
 // entirely in Postgres. The client used to page through every raw
 // invoice line, opening-balance and adjustment row (30k+ rows, ~35 requests)
@@ -186,7 +192,7 @@ export function buildLastPurchaseRateMap({ opening, invLines }) {
 // take ~60 seconds.
 //
 // Falls back to the full client-side computation automatically if the RPC
-// isn't available yet (migration 041 not applied — Postgres returns
+// isn't available yet (migration 046 not applied — Postgres returns
 // PGRST202 "function not found") or errors for any other reason, so every
 // caller keeps working before/after the migration lands, just slower before.
 export async function fetchActualStockPosition(asOfDate = null) {
@@ -202,8 +208,8 @@ export async function fetchActualStockPosition(asOfDate = null) {
     if (!error && data) {
       const map = {}
       for (const row of data) {
-        map[`${row.entity_id}__${row.product_id}`] = {
-          entity_id: row.entity_id, product_id: row.product_id,
+        map[`${row.entity_id}__${row.product_name}`] = {
+          entity_id: row.entity_id, product_name: row.product_name,
           opening_qty: toNum(row.opening_qty), invoiced_in: toNum(row.invoiced_in),
           invoiced_out: toNum(row.invoiced_out), adjustment_qty: toNum(row.adjustment_qty),
           actual_qty: toNum(row.actual_qty), last_purchase_rate: toNum(row.last_purchase_rate),
@@ -219,7 +225,49 @@ export async function fetchActualStockPosition(asOfDate = null) {
   return actual
 }
 
-// Convenience for a single entity — returns { product_id: actual_qty }.
+// Server-side aggregation for "Planned" (PI-based) stock — mirrors
+// fetchActualStockPosition() exactly, but for proforma_invoice_lines instead
+// of invoice_lines (see migration 048_stock_planned_position_rpc.sql). Before
+// this, Stock Position paged through the ENTIRE proforma_invoice_lines table
+// client-side on every load with no entity filter — the dominant cause of
+// the page being slow on a real dataset. Falls back to the old full-table
+// page-through if the RPC isn't available yet (migration 048 not applied) or
+// errors for any reason, same fallback contract as fetchActualStockPosition.
+// Returns { "entityId__productName": { incoming, outgoing } }.
+export async function fetchPlannedStockPosition(asOfDate = null) {
+  try {
+    const { data, error } = await supabase.rpc('stock_planned_position', { p_as_of: asOfDate || null })
+    if (!error && data) {
+      const map = {}
+      for (const row of data) {
+        map[`${row.entity_id}__${row.product_name}`] = { incoming: toNum(row.incoming), outgoing: toNum(row.outgoing) }
+      }
+      return map
+    }
+  } catch { /* fall through to client-side computation below */ }
+
+  const { data: piLinesRaw } = await fetchAllPages(() => supabase
+    .from('proforma_invoice_lines')
+    .select('qty, product_name, pi:pi_id(from_entity_id, to_entity_id, status, is_deleted, pi_date)')
+    .not('pi', 'is', null)
+    .neq('pi.status', 'cancelled')
+    .order('id'))
+  const piLines = (piLinesRaw || []).filter(l => l.pi && !l.pi.is_deleted && (!asOfDate || !l.pi.pi_date || l.pi.pi_date <= asOfDate))
+  const map = {}
+  function ensure(entityId, productName) {
+    const key = `${entityId}__${productName}`
+    if (!map[key]) map[key] = { incoming: 0, outgoing: 0 }
+    return map[key]
+  }
+  for (const line of piLines) {
+    const qty = toNum(line.qty)
+    ensure(line.pi.from_entity_id, line.product_name).outgoing += qty
+    ensure(line.pi.to_entity_id, line.product_name).incoming   += qty
+  }
+  return map
+}
+
+// Convenience for a single entity — returns { product_name: actual_qty }.
 // This is what feeds LineItemsEditor's `stockMap` prop so a seller can see
 // (and not oversell past) what they actually have on hand while billing.
 export async function fetchEntityAvailableStock(entityId) {
@@ -227,19 +275,19 @@ export async function fetchEntityAvailableStock(entityId) {
   const full = await fetchActualStockPosition()
   const out  = {}
   for (const row of Object.values(full)) {
-    if (row.entity_id === entityId) out[row.product_id] = row.actual_qty
+    if (row.entity_id === entityId) out[row.product_name] = row.actual_qty
   }
   return out
 }
 
 // Every stock-affecting or stock-planning line (PI, PO, Invoice) must carry a
-// product_id — otherwise it silently falls out of every stock calculation
-// above (see the `!row.product_id` branch in Stock Position). Call this
+// product_name — otherwise it silently falls out of every stock calculation
+// above (see the `!row.product_name` branch in Stock Position). Call this
 // before insert/update and block the save if it returns any rows.
-export function findLinesMissingProductId(lines) {
+export function findLinesMissingProductName(lines) {
   return (lines || [])
     .map((l, i) => ({ ...l, _lineNo: i + 1 }))
-    .filter(l => toNum(l.qty) > 0 && !l.product_id)
+    .filter(l => toNum(l.qty) > 0 && !l.product_name)
 }
 
 // Returns the subset of `lines` whose qty exceeds the entity's currently
@@ -249,8 +297,8 @@ export function findLinesMissingProductId(lines) {
 export function findLinesExceedingStock(lines, stockMap) {
   if (!stockMap) return []
   return (lines || []).filter(l => {
-    if (!l.product_id) return false
-    const avail = stockMap[l.product_id]
+    if (!l.product_name) return false
+    const avail = stockMap[l.product_name]
     return avail != null && toNum(l.qty) > avail
   })
 }

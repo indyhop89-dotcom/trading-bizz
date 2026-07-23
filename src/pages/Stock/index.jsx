@@ -9,9 +9,9 @@ import { fmtDate, today } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
 // LineItemsEditor's stockMap) instead of duplicating it here.
-import { fetchActualStockPosition, fetchEntityAvailableStock, NEGATIVE_STOCK_FLAG_ENABLED } from '../../utils/stock'
+import { fetchActualStockPosition, fetchPlannedStockPosition, fetchEntityAvailableStock, NEGATIVE_STOCK_FLAG_ENABLED } from '../../utils/stock'
 import { ProductPicker } from '../../components/LineItemsEditor'
-import { cleanProductName, productMatchKey, findNearMatchProduct, findMergeSuggestionGroups } from '../../utils/products'
+import { cleanProductName, findProductByName, productKey } from '../../utils/products'
 // CHANGED: needed to know the current user's role/id for entity-access scoping
 import { useAuth } from '../../hooks/useAuth'
 import { fetchAllPages } from '../../utils/query'
@@ -55,7 +55,7 @@ function billedBeyondStockBadge() {
 
 // ─── Opening Stock Tab ────────────────────────────────────────────────────────
 const EMPTY_OPENING = {
-  entity_id: '', product_id: '', financial_year_id: '',
+  entity_id: '', product_name: '', financial_year_id: '',
   qty: '', unit: '', rate: '', hsn_code: '', gst_rate: '',
   as_of_date: today(), notes: '',
 }
@@ -89,13 +89,18 @@ function OpeningStock() {
     setLoading(true)
     const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }] = await Promise.all([
       fetchAllPages(() => supabase.from('stock_opening_balance')
-        .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit), fy:financial_year_id(name)')
+        .select('*, entity:entity_id(name,short_name), fy:financial_year_id(name)')
         .order('created_at', { ascending: false })),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name')),
       supabase.from('financial_years').select('*').order('start_date', { ascending: false }),
     ])
-    setRows(rs || [])
+    // CHANGED: product identity is now NAME (migration 046) — look the
+    // product master up client-side by product_name rather than embedding
+    // via product_id, so this keeps working whichever of the two FK columns
+    // is currently live on stock_opening_balance during the transition.
+    const productByName = new Map((ps || []).map(p => [p.name, p]))
+    setRows((rs || []).map(r => ({ ...r, product: productByName.get(r.product_name) || null })))
     setEntities(es || [])
     setProducts(ps || [])
     setFys(fyData || [])
@@ -107,8 +112,8 @@ function OpeningStock() {
   function setF(k, v) {
     setForm(f => {
       const u = { ...f, [k]: v }
-      if (k === 'product_id' && v) {
-        const p = products.find(p => p.id === v)
+      if (k === 'product_name' && v) {
+        const p = products.find(p => p.name === v)
         if (p) { u.hsn_code = p.hsn_code || ''; u.gst_rate = p.gst_rate != null ? String(p.gst_rate) : ''; u.rate = p.default_rate != null ? String(p.default_rate) : ''; u.unit = p.unit || '' }
       }
       return u
@@ -118,15 +123,15 @@ function OpeningStock() {
   function openNew()   { setEditing(null); setForm(EMPTY_OPENING); setModalOpen(true) }
   function openEdit(r) {
     setEditing(r)
-    setForm({ entity_id: r.entity_id||'', product_id: r.product_id||'', financial_year_id: r.financial_year_id||'', qty: r.qty!=null?String(r.qty):'', unit: r.unit||r.product?.unit||'', rate: r.rate!=null?String(r.rate):'', hsn_code: r.hsn_code||'', gst_rate: r.gst_rate!=null?String(r.gst_rate):'', as_of_date: r.as_of_date||today(), notes: r.notes||'' })
+    setForm({ entity_id: r.entity_id||'', product_name: r.product_name||'', financial_year_id: r.financial_year_id||'', qty: r.qty!=null?String(r.qty):'', unit: r.unit||r.product?.unit||'', rate: r.rate!=null?String(r.rate):'', hsn_code: r.hsn_code||'', gst_rate: r.gst_rate!=null?String(r.gst_rate):'', as_of_date: r.as_of_date||today(), notes: r.notes||'' })
     setModalOpen(true)
   }
 
   async function handleSave() {
-    if (!form.entity_id || !form.product_id || !form.financial_year_id)
+    if (!form.entity_id || !form.product_name || !form.financial_year_id)
       return setToast({ message: 'Entity, Product and FY are required', type: 'error' })
     setSaving(true)
-    const payload = { entity_id: form.entity_id, product_id: form.product_id, financial_year_id: form.financial_year_id, qty: toNum(form.qty), unit: form.unit||null, rate: toNum(form.rate), hsn_code: form.hsn_code||null, gst_rate: toNum(form.gst_rate)||null, as_of_date: form.as_of_date, notes: form.notes||null }
+    const payload = { entity_id: form.entity_id, product_name: form.product_name, financial_year_id: form.financial_year_id, qty: toNum(form.qty), unit: form.unit||null, rate: toNum(form.rate), hsn_code: form.hsn_code||null, gst_rate: toNum(form.gst_rate)||null, as_of_date: form.as_of_date, notes: form.notes||null }
     let error
     if (editing) {
       const res = await supabase.from('stock_opening_balance').update(payload).eq('id', editing.id)
@@ -150,7 +155,7 @@ function OpeningStock() {
   // CHANGED: category is optional — only used when auto-creating a new product;
   // it does not update the category of a product that already exists.
   // Products not found by exact name are auto-created from the row's hsn_code/gst_rate/unit/rate.
-  // CHANGED: rows are now UPSERTED on (entity_id, product_id, financial_year_id) —
+  // CHANGED: rows are now UPSERTED on (entity_id, product_name, financial_year_id) —
   // re-uploading updates the qty/rate/etc. of an existing opening-stock row
   // instead of failing with a duplicate-key error. (The old code tried to skip
   // existing rows by comparing against the currently-loaded list, but that list
@@ -190,42 +195,19 @@ function OpeningStock() {
     }
 
     // Phase 2 — bulk-create any missing products in one request
+    // CHANGED: product identity is now NAME alone (migration
+    // 046_product_name_as_key.sql) — no more HSN/rate/GST tie-breaking.
+    // `allProducts` is a local working copy so a product created mid-batch
+    // is immediately visible to later rows in this same file.
     setCsvProgress('Checking products…')
-    // CHANGED: match on name + HSN + rate + GST together, not name alone.
-    // A single source file can have several genuinely different products
-    // sharing one generic name (e.g. "Embroidered Cotton Cushion Cover" at 7
-    // different rates = 7 different designs) — matching by name only would
-    // silently merge them and lose real stock quantity. Only collapse to the
-    // same product when ALL FOUR fields match (per product-owner decision);
-    // the normalized name key alone still catches the trailing-')' junk cases.
-    //
-    // CHANGED: uses a precomputed Map (key -> product) instead of an
-    // array .find() re-run per row. With ~1000 products x ~1100 rows, a
-    // linear scan recomputing productMatchKey for every candidate on every
-    // row means millions of string/regex operations — slow enough on a large
-    // file that the upload looked hung. A Map lookup is O(1) per row.
-    const productMap = new Map()
-    for (const p of products) {
-      productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
-    }
-    const rowMatchKey = row => productMatchKey({ name: row.product, hsn_code: row.hsn_code, rate: row.rate, gst_rate: row.gst_rate })
-    const findProduct = row => productMap.get(rowMatchKey(row))
+    const allProducts = [...products]
+    const findProduct = row => findProductByName(allProducts, row.product)
     const missingRowKeys = new Set()
     const missingRows = []
-    const nearMatchNotes = []
     for (const p of parsed) {
-      const k = rowMatchKey(p.row)
-      if (productMap.has(k) || missingRowKeys.has(k)) continue
-      // CHANGED: before treating this as a genuinely new product, check for
-      // an existing one with the same name+HSN+GST at a near-identical rate
-      // (see findNearMatchProduct) — reuse it instead of creating a phantom
-      // duplicate that silently starts at zero stock.
-      const near = findNearMatchProduct(products, { name: p.productName, hsn_code: p.row.hsn_code, rate: p.row.rate, gst_rate: p.row.gst_rate })
-      if (near) {
-        productMap.set(k, near)
-        nearMatchNotes.push(`${p.productName} @ ₹${p.row.rate} → matched to existing "${near.name}" @ ₹${near.default_rate} (rate close enough, not creating a duplicate)`)
-        continue
-      }
+      if (findProduct(p.row)) continue
+      const k = productKey(p.productName)
+      if (missingRowKeys.has(k)) continue
       missingRowKeys.add(k)
       missingRows.push(p)
     }
@@ -237,9 +219,7 @@ function OpeningStock() {
       if (pErr) {
         errors.push(`Could not auto-create ${missingRows.length} new product(s) — ${pErr.message}`)
       } else {
-        for (const p of (newProducts || [])) {
-          productMap.set(productMatchKey({ name: p.name, hsn_code: p.hsn_code, rate: p.default_rate, gst_rate: p.gst_rate }), p)
-        }
+        allProducts.push(...(newProducts || []))
         productsCreated = (newProducts || []).length
         createdProductNames.push(...(newProducts || []).map(p => p.name))
       }
@@ -249,13 +229,7 @@ function OpeningStock() {
     // entity+product+fy keys within the file since one upsert can't touch the
     // same key twice. Source files legitimately list the same product more
     // than once (separate stock lots/batches received at the same rate) and
-    // those quantities are meant to add up, not overwrite one another — a
-    // product's rate/HSN/GST are already part of what makes it "the same
-    // product" (see productMatchKey), so colliding rows always share those
-    // values and only qty needs combining.
-    // Note: two rows with the same product NAME but different HSN/rate/GST
-    // resolve to different products here, so they land in different
-    // entity+product+fy keys and do NOT collapse into each other.
+    // those quantities are meant to add up, not overwrite one another.
     setCsvProgress('Preparing rows…')
     const byKey = new Map()
     const skippedItems = []
@@ -263,14 +237,14 @@ function OpeningStock() {
       const product = findProduct(p.row)
       if (!product) { errors.push(`Row ${p.rowNum}: product "${p.productName}" could not be created`); continue }
       const label = `${p.row.entity} — ${p.productName} — ${p.row.fy}`
-      const key = `${p.entity.id}__${product.id}__${p.fy.id}`
+      const key = `${p.entity.id}__${product.name}__${p.fy.id}`
       const qty = toNum(p.row.qty)
       if (byKey.has(key)) {
         byKey.get(key).qty += qty
         skippedItems.push(`${label} — listed more than once in this file; quantities combined`)
       } else {
         byKey.set(key, {
-          entity_id: p.entity.id, product_id: product.id, financial_year_id: p.fy.id,
+          entity_id: p.entity.id, product_name: product.name, financial_year_id: p.fy.id,
           qty, unit: p.row.unit || product.unit || null, rate: toNum(p.row.rate),
           hsn_code: p.row.hsn_code || product.hsn_code || null,
           gst_rate: p.row.gst_rate ? toNum(p.row.gst_rate) : (product.gst_rate != null ? product.gst_rate : null),
@@ -286,7 +260,7 @@ function OpeningStock() {
     // batch fails, retry row-by-row to attribute the error to the specific row.
     let added = 0
     const addedItems = []
-    const CONFLICT = 'entity_id,product_id,financial_year_id'
+    const CONFLICT = 'entity_id,product_name,financial_year_id'
     const CHUNK = 200
     for (let c = 0; c < toUpsert.length; c += CHUNK) {
       const chunk = toUpsert.slice(c, c + CHUNK)
@@ -306,7 +280,7 @@ function OpeningStock() {
       }
     }
 
-    setCsvResult({ totalDataRows, added, skipped: skippedItems.length, productsCreated, errors, addedItems, skippedItems, createdProductNames, nearMatchNotes })
+    setCsvResult({ totalDataRows, added, skipped: skippedItems.length, productsCreated, errors, addedItems, skippedItems, createdProductNames })
     setCsvProgress('')
     await load()
     setCsvSaving(false)
@@ -345,7 +319,7 @@ function OpeningStock() {
     return m
   }, {})
   const qtySummary = Object.entries(qtyByUnit).map(([u, q]) => `${q.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${u}`).join(' • ') || '0'
-  const distinctProducts = new Set(filtered.map(r => r.product_id)).size
+  const distinctProducts = new Set(filtered.map(r => r.product_name)).size
 
   const columns = [
     { label: 'S.No.',    render: (r, i) => <span style={{ color: C.textMuted }}>{i + 1}</span> },
@@ -411,7 +385,7 @@ function OpeningStock() {
             </FormRow>
             <FormRow label='Product' required>
               {/* CHANGED: searchable picker — a plain dropdown over thousands of products was unusable */}
-              <ProductPicker products={products} value={form.product_id} onSelect={id => setF('product_id', id)} />
+              <ProductPicker products={products} value={form.product_name} onSelect={name => setF('product_name', name)} />
             </FormRow>
             <FormRow label='As of Date' required>
               <Input type='date' value={form.as_of_date} onChange={e => setF('as_of_date', e.target.value)} />
@@ -507,14 +481,6 @@ function OpeningStock() {
                   </div>
                 </details>
               )}
-              {csvResult.nearMatchNotes?.length > 0 && (
-                <details style={{ marginTop: '6px' }}>
-                  <summary style={{ cursor: 'pointer', color: C.textSoft }}>Show {csvResult.nearMatchNotes.length} row{csvResult.nearMatchNotes.length === 1 ? '' : 's'} matched to an existing product at a near-identical rate (no duplicate created)</summary>
-                  <div style={{ maxHeight: '140px', overflowY: 'auto', marginTop: '4px' }}>
-                    {csvResult.nearMatchNotes.map((t, i) => <div key={i} style={{ color: C.textMid, fontFamily: 'monospace', fontSize: '11px' }}>{t}</div>)}
-                  </div>
-                </details>
-              )}
               {csvResult.errors.length > 0 && (
                 <details style={{ marginTop: '6px' }} open>
                   <summary style={{ cursor: 'pointer', color: '#7a5000' }}>Show {csvResult.errors.length} error{csvResult.errors.length === 1 ? '' : 's'}</summary>
@@ -548,17 +514,12 @@ function OpeningStock() {
 // philosophy the E-way-Bill-driven stock movement already uses, rather than
 // maintaining a separately-updated running total that could drift.
 const EMPTY_ADJUSTMENT = {
-  entity_id: '', product_id: '', direction: 'decrease', qty: '',
+  entity_id: '', product_name: '', direction: 'decrease', qty: '',
   reason: 'shortfall', notes: '', adjustment_date: today(),
 }
 
 function StockAdjustments() {
   const { profile } = useAuth()
-
-  // CHANGED: "Merge Duplicates" lives as a sub-view here rather than its own
-  // top-level Stock tab — it's a specific kind of stock adjustment (folding
-  // one product's stock into another), not a separate module.
-  const [subTab, setSubTab] = useState('list') // 'list' | 'merge'
 
   const [rows, setRows]         = useState([])
   const [entities, setEntities] = useState([])
@@ -584,12 +545,15 @@ function StockAdjustments() {
     setLoading(true)
     const [{ data: rs }, { data: ps }] = await Promise.all([
       fetchAllPages(() => supabase.from('stock_adjustments')
-        .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit), creator:created_by(full_name)')
+        .select('*, entity:entity_id(name,short_name), creator:created_by(full_name)')
         .order('adjustment_date', { ascending: false })
         .order('created_at', { ascending: false })),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,unit').eq('is_active', true).order('name')),
     ])
-    setRows(rs || [])
+    // CHANGED: product identity is now NAME (migration 046) — look the
+    // product master up client-side by product_name.
+    const productByName = new Map((ps || []).map(p => [p.name, p]))
+    setRows((rs || []).map(r => ({ ...r, product: productByName.get(r.product_name) || null })))
     setProducts(ps || [])
     setLoading(false)
   }, [])
@@ -633,13 +597,13 @@ function StockAdjustments() {
   useEffect(() => {
     let cancelled = false
     async function loadCurrentStock() {
-      if (!form.entity_id || !form.product_id) { setCurrentStock(null); return }
+      if (!form.entity_id || !form.product_name) { setCurrentStock(null); return }
       const map = await fetchEntityAvailableStock(form.entity_id)
-      if (!cancelled) setCurrentStock(map[form.product_id] ?? 0)
+      if (!cancelled) setCurrentStock(map[form.product_name] ?? 0)
     }
     loadCurrentStock()
     return () => { cancelled = true }
-  }, [form.entity_id, form.product_id])
+  }, [form.entity_id, form.product_name])
 
   function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
   function openNew()  { setEditing(null); setForm(EMPTY_ADJUSTMENT); setModalOpen(true) }
@@ -652,7 +616,7 @@ function StockAdjustments() {
   function openEdit(r) {
     setEditing(r)
     setForm({
-      entity_id: r.entity_id, product_id: r.product_id,
+      entity_id: r.entity_id, product_name: r.product_name,
       direction: toNum(r.qty_delta) < 0 ? 'decrease' : 'increase',
       qty: String(Math.abs(toNum(r.qty_delta))),
       reason: r.reason, notes: r.notes || '', adjustment_date: r.adjustment_date || today(),
@@ -661,13 +625,13 @@ function StockAdjustments() {
   }
 
   async function handleSave() {
-    if (!form.entity_id || !form.product_id) return setToast({ message: 'Entity and Product are required', type: 'error' })
+    if (!form.entity_id || !form.product_name) return setToast({ message: 'Entity and Product are required', type: 'error' })
     const qty = toNum(form.qty)
     if (qty <= 0) return setToast({ message: 'Quantity must be greater than zero', type: 'error' })
     setSaving(true)
     const qty_delta = form.direction === 'decrease' ? -qty : qty
     const payload = {
-      entity_id: form.entity_id, product_id: form.product_id, qty_delta,
+      entity_id: form.entity_id, product_name: form.product_name, qty_delta,
       reason: form.reason, notes: form.notes || null, adjustment_date: form.adjustment_date,
     }
     const res = editing
@@ -692,12 +656,6 @@ function StockAdjustments() {
   // product) and rows are plain inserts, not upserts — each row is a distinct
   // correction event, so re-uploading the same file intentionally creates
   // duplicate adjustment rows rather than overwriting a prior one.
-  // CHANGED: optional `product_id` column — name alone isn't a safe key once
-  // duplicate-named products exist at different rates (Stock > Adjustments >
-  // Merge Duplicates), since a plain name lookup can silently match the wrong
-  // one of several same-named products. If a row supplies product_id, it's
-  // used directly (validated against the loaded product list) instead of the
-  // name search; the product column is still required for readability/audit.
   async function handleCSV() {
     setCsvSaving(true)
     const lines = csvText.trim().split('\n').filter(l => l.trim())
@@ -705,7 +663,6 @@ function StockAdjustments() {
     const delim = detectDelimiter(lines[0])
     const header = parseCSVLine(lines[0], delim).map(h => h.trim().toLowerCase())
     const validReasons = ADJUSTMENT_REASONS.map(r => r.value)
-    const productsById = new Map(products.map(p => [p.id, p]))
     const payloads = []
     const errors = []
     for (let i = 1; i < lines.length; i++) {
@@ -714,10 +671,7 @@ function StockAdjustments() {
       header.forEach((h, j) => { row[h] = (cols[j] || '').trim() })
       const rowNum = i + 1
       const entity = entities.find(e => e.short_name?.toLowerCase() === row.entity?.toLowerCase() || e.name?.toLowerCase() === row.entity?.toLowerCase())
-      const product = row.product_id
-        ? productsById.get(row.product_id)
-        : products.find(p => p.name?.toLowerCase() === row.product?.toLowerCase())
-      if (row.product_id && !product) { errors.push(`Row ${rowNum}: product_id "${row.product_id}" not found`); continue }
+      const product = findProductByName(products, row.product)
       const qty = toNum(row.qty)
       const reason = (row.reason || '').toLowerCase()
       if (!entity)  { errors.push(`Row ${rowNum}: entity "${row.entity}" not found or not accessible to you`); continue }
@@ -728,7 +682,7 @@ function StockAdjustments() {
       // catch it here with a clear message rather than a raw insert error.
       if (reason === 'offloaded' && qty > 0) { errors.push(`Row ${rowNum}: "offloaded" qty must be negative (it can only remove stock, e.g. -5)`); continue }
       payloads.push({
-        entity_id: entity.id, product_id: product.id, qty_delta: qty, reason,
+        entity_id: entity.id, product_name: product.name, qty_delta: qty, reason,
         adjustment_date: row.adjustment_date || today(), notes: row.notes || null,
         created_by: profile?.id || null,
       })
@@ -751,15 +705,14 @@ function StockAdjustments() {
   // so an export doubles as a template; extra columns ride along at the end.
   function handleExportAdjustmentsCSV() {
     downloadCSV(`stock_adjustments_${today()}.csv`,
-      ['entity','product','qty','reason','adjustment_date','notes','product_id','recorded_by'],
+      ['entity','product','qty','reason','adjustment_date','notes','recorded_by'],
       filtered.map(r => ({
         entity: r.entity?.short_name || r.entity?.name || '',
-        product: r.product?.name || '',
+        product: r.product_name || '',
         qty: toNum(r.qty_delta),
         reason: r.reason || '',
         adjustment_date: r.adjustment_date || '',
         notes: r.notes || '',
-        product_id: r.product_id || '',
         recorded_by: r.creator?.full_name || '',
       })))
   }
@@ -791,23 +744,6 @@ function StockAdjustments() {
 
   return (
     <div>
-      {/* CHANGED: sub-tabs — "Merge Duplicates" is a specific flavour of stock
-          adjustment (folding one product's stock into another), not a
-          separate Stock module tab. */}
-      <div style={{ display: 'flex', gap: '4px', marginBottom: '16px' }}>
-        {[{ key: 'list', label: 'Adjustments' }, { key: 'merge', label: 'Merge Duplicates' }].map(t => (
-          <button key={t.key} onClick={() => setSubTab(t.key)} style={{
-            padding: '6px 14px', border: `1.5px solid ${C.border}`, cursor: 'pointer', fontFamily: 'inherit',
-            fontWeight: subTab === t.key ? 700 : 500, fontSize: '12px', borderRadius: '6px',
-            color: subTab === t.key ? '#fff' : C.textSoft,
-            background: subTab === t.key ? C.accent : C.surface,
-          }}>{t.label}</button>
-        ))}
-      </div>
-
-      {subTab === 'merge' && <MergeDuplicates />}
-
-      {subTab === 'list' && <>
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center' }}>
         <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
           style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
@@ -841,7 +777,7 @@ function StockAdjustments() {
             </FormRow>
             <FormRow label='Product' required>
               {/* CHANGED: searchable picker — a plain dropdown over thousands of products was unusable */}
-              <ProductPicker products={products} value={form.product_id} onSelect={id => setF('product_id', id)} />
+              <ProductPicker products={products} value={form.product_name} onSelect={name => setF('product_name', name)} />
             </FormRow>
           </div>
 
@@ -933,7 +869,6 @@ function StockAdjustments() {
       <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
         title='Delete Adjustment' message={`Delete this adjustment for ${confirmDelete?.product?.name}? This will change the product's actual stock figure.`} danger />
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
-      </>}
     </div>
   )
 }
@@ -1052,9 +987,12 @@ function StockPosition() {
     // truncates rather than erroring) — page through with fetchAllPages so
     // the Opening/Planned columns don't silently drop rows past row 1000,
     // same fix already applied to the Opening Stock tab's own load().
+    // CHANGED: product identity is now NAME (migration 046) — select
+    // product_name directly and resolve the product master client-side
+    // (productByName below) rather than embedding via product_id.
     const { data: opening } = await fetchAllPages(() => {
       let q = supabase.from('stock_opening_balance')
-        .select('*, entity:entity_id(name,short_name), product:product_id(name,hsn_code,unit,category)')
+        .select('*, entity:entity_id(name,short_name)')
         .eq('financial_year_id', fyFilter)
         .order('id')
       if (entityFilter) q = q.eq('entity_id', entityFilter)
@@ -1062,23 +1000,12 @@ function StockPosition() {
     })
 
     // Get PIs — incoming and outgoing per entity+product
-    // We need proforma_invoice_lines joined with proforma_invoices
     // Planned stock = opening + incoming PI qty - outgoing PI qty
-    // CHANGED: same 1000-row cap risk as opening stock above — page through.
-    const { data: piLinesRaw } = await fetchAllPages(() => supabase
-      .from('proforma_invoice_lines')
-      .select('qty, product_id, pi:pi_id(from_entity_id, to_entity_id, status, is_deleted, pi_date)')
-      .not('pi', 'is', null)
-      .neq('pi.status', 'cancelled')
-      .order('id'))
-    // CHANGED: the query above can't filter on a joined column's is_deleted
-    // directly (PostgREST .neq only applies to the joined row shape, not a
-    // second condition on it) — a soft-deleted PI kept counting toward
-    // Planned stock forever since only `status` was checked. Filter it out
-    // client-side same as fetchStockMovementData() already does for invoices.
-    // CHANGED: the as-of date applies to Planned too — only PIs dated on or
-    // before it count toward the point-in-time position.
-    const piLines = (piLinesRaw || []).filter(l => l.pi && !l.pi.is_deleted && (!asOfDate || !l.pi.pi_date || l.pi.pi_date <= asOfDate))
+    // CHANGED: fetchPlannedStockPosition() hits the server-side aggregation
+    // RPC (migration 048) when available — one round trip instead of paging
+    // through the entire proforma_invoice_lines table client-side on every
+    // load (this was the dominant cause of Stock Position being slow).
+    const plannedMap = await fetchPlannedStockPosition(asOfDate)
 
     // CHANGED: Actual Stock — the real, invoice-based position per entity.
     // This is deliberately NOT scoped to fyFilter: opening stock is entered
@@ -1093,16 +1020,17 @@ function StockPosition() {
     // round trip instead of paging through every raw invoice line.
     const actualMap = await fetchActualStockPosition(asOfDate)
 
-    // Build position map: key = entity_id + product_id
+    // Build position map: key = entity_id + product_name
+    const productByName = Object.fromEntries(products.map(p => [p.name, p]))
     const map = {}
     for (const ob of (opening || [])) {
       if (asOfDate && ob.as_of_date && ob.as_of_date > asOfDate) continue
-      const key = `${ob.entity_id}__${ob.product_id}`
+      const key = `${ob.entity_id}__${ob.product_name}`
       map[key] = {
         entity_id:   ob.entity_id,
         entity:      ob.entity,
-        product_id:  ob.product_id,
-        product:     ob.product,
+        product_name: ob.product_name,
+        product:     productByName[ob.product_name] || null,
         opening_qty: toNum(ob.qty),
         incoming:    0,
         outgoing:    0,
@@ -1111,36 +1039,32 @@ function StockPosition() {
     }
 
     // Add PI movements
-    for (const line of (piLines || [])) {
-      if (!line.pi) continue
-      const qty       = toNum(line.qty)
-      const productId = line.product_id
-      const fromKey   = `${line.pi.from_entity_id}__${productId}`
-      const toKey     = `${line.pi.to_entity_id}__${productId}`
-      if (map[fromKey]) map[fromKey].outgoing += qty
-      if (map[toKey])   map[toKey].incoming   += qty
+    for (const [key, row] of Object.entries(map)) {
+      const planned = plannedMap[key]
+      if (!planned) continue
+      row.outgoing += planned.outgoing
+      row.incoming += planned.incoming
     }
 
     // CHANGED: surface entity+product combos that have real invoice activity
     // (via actualMap) but no opening_stock row in the selected FY — e.g. a
     // pure buyer entity. Without this they'd hold real stock but be invisible
     // on this page.
-    // CHANGED: skip any combo where product_id is null — these come from
+    // CHANGED: skip any combo where product_name is null — these come from
     // invoice/PI lines with no product link (a known CSV-upload data gap,
     // not a real product) and would otherwise show up as blank, meaningless
     // rows. Counted separately below so the problem stays visible instead of
     // silently vanishing.
     const entityById  = Object.fromEntries(entities.map(e => [e.id, e]))
-    const productById = Object.fromEntries(products.map(p => [p.id, p]))
     let unresolvedLines = 0, unresolvedQty = 0
     for (const row of Object.values(actualMap)) {
-      if (!row.product_id) {
+      if (!row.product_name) {
         unresolvedLines++
         unresolvedQty += Math.abs(toNum(row.invoiced_in) - toNum(row.invoiced_out))
         continue
       }
       if (entityFilter && row.entity_id !== entityFilter) continue
-      const key = `${row.entity_id}__${row.product_id}`
+      const key = `${row.entity_id}__${row.product_name}`
       if (!map[key]) {
         // CHANGED: these rows have real actual stock but no opening-balance
         // row for the CURRENTLY SELECTED FY (e.g. the opening entry was made
@@ -1151,12 +1075,12 @@ function StockPosition() {
         map[key] = {
           entity_id:   row.entity_id,
           entity:      entityById[row.entity_id] || null,
-          product_id:  row.product_id,
-          product:     productById[row.product_id] || null,
+          product_name: row.product_name,
+          product:     productByName[row.product_name] || null,
           opening_qty: 0,
           incoming:    0,
           outgoing:    0,
-          rate:        toNum(productById[row.product_id]?.default_rate),
+          rate:        toNum(productByName[row.product_name]?.default_rate),
         }
       }
     }
@@ -1170,7 +1094,7 @@ function StockPosition() {
     // stock-movement source this app isn't counting), so the Actual Stock
     // column below shows the components for any row that's negative.
     const rows = Object.values(map).map(r => {
-      const key = `${r.entity_id}__${r.product_id}`
+      const key = `${r.entity_id}__${r.product_name}`
       const am  = actualMap[key]
       const actual_qty = am ? am.actual_qty : r.opening_qty
       // CHANGED: `rate` (used for Opening Value below) stays the historical
@@ -1474,7 +1398,7 @@ function StockPosition() {
                               </thead>
                               <tbody>
                                 {items.map(it => (
-                                  <tr key={`${it.entity_id}__${it.product_id}`}>
+                                  <tr key={`${it.entity_id}__${it.product_name}`}>
                                     <td style={{ padding: '7px 12px 7px 32px' }}>{groupBy === 'entity' ? (it.product?.category || '—') : (it.entity?.short_name || it.entity?.name)}</td>
                                     <td style={{ padding: '7px 12px' }}>{it.product?.name}</td>
                                     <td style={{ padding: '7px 12px', fontFamily: 'monospace', color: C.textMuted }}>{it.product?.hsn_code}</td>
@@ -1517,182 +1441,6 @@ function StockPosition() {
             />
         }
       </Card>
-    </div>
-  )
-}
-
-// ─── Merge Duplicates Tab ───────────────────────────────────────────────────
-// Surfaces product groups that share a name (junk-stripped) and HSN code but
-// differ in rate — the exact signature the dedupe_products.sql /
-// dedupe_rate_markup_products.sql / merge_idle_rounding_duplicates.sql
-// maintenance scripts were hand-run against in the past (see supabase/
-// maintenance/). This turns that one-off SQL review into a standing, repeatable
-// tool: suggest a keeper (the product actually carrying stock/usage), let a
-// master review/override it, then merge via the merge_products() RPC (see
-// migration 022_merge_products.sql) which atomically repoints every
-// referencing table and folds opening-stock quantities before deleting the
-// duplicate — the same repoint-then-delete shape as the maintenance scripts,
-// just parameterized and callable from the UI instead of hand-run once.
-function MergeDuplicates() {
-  const { profile } = useAuth()
-  const canMerge = hasFullAccess(profile)
-
-  const [products, setProducts] = useState([])
-  const [totals, setTotals]     = useState({}) // product_id -> { opening, actual }
-  const [loading, setLoading]   = useState(true)
-  const [keeperOverride, setKeeperOverride] = useState({}) // group.key -> product_id
-  const [confirmGroup, setConfirmGroup] = useState(null)
-  const [merging, setMerging]   = useState(false)
-  const [toast, setToast]       = useState(null)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    const [{ data: ps }, actualMap] = await Promise.all([
-      fetchAllPages(() => supabase.from('products')
-        .select('id,name,hsn_code,gst_rate,unit,default_rate,is_active,created_at')
-        .eq('is_active', true).order('name')),
-      fetchActualStockPosition(),
-    ])
-    setProducts(ps || [])
-    const t = {}
-    for (const row of Object.values(actualMap)) {
-      if (!row.product_id) continue
-      if (!t[row.product_id]) t[row.product_id] = { opening: 0, actual: 0 }
-      t[row.product_id].opening += row.opening_qty
-      t[row.product_id].actual  += row.actual_qty
-    }
-    setTotals(t)
-    setLoading(false)
-  }, [])
-
-  useEffect(() => { load() }, [load])
-
-  // CHANGED: suggested keeper = the product actually holding the most real
-  // (actual) stock, tie-broken by opening qty then oldest record — the same
-  // "prefer the one already in use" instinct as dedupe_products.sql's
-  // has_opening ranking, just using the richer actual-stock signal already
-  // available here instead of a boolean.
-  const groups = findMergeSuggestionGroups(products).map(g => {
-    const enriched = g.products
-      .map(p => ({ ...p, _opening: totals[p.id]?.opening || 0, _actual: totals[p.id]?.actual || 0 }))
-      .sort((a, b) => b._actual - a._actual || b._opening - a._opening || new Date(a.created_at) - new Date(b.created_at))
-    return { ...g, products: enriched, suggestedKeeperId: enriched[0]?.id }
-  })
-
-  function keeperFor(g) { return keeperOverride[g.key] || g.suggestedKeeperId }
-
-  function handleDownloadSuggestions() {
-    const rows = []
-    for (const g of groups) {
-      const keeperId = keeperFor(g)
-      for (const p of g.products) {
-        rows.push({
-          group: g.name, hsn_code: g.hsn_code, product_id: p.id, product_name: p.name,
-          rate: p.default_rate ?? '', gst_rate: p.gst_rate ?? '', unit: p.unit || '',
-          total_opening_qty: p._opening, total_actual_qty: p._actual,
-          suggestion: p.id === keeperId ? 'KEEP' : 'MERGE INTO KEEPER',
-        })
-      }
-    }
-    downloadCSV(`merge_stock_suggestions_${today()}.csv`,
-      ['group', 'hsn_code', 'product_id', 'product_name', 'rate', 'gst_rate', 'unit', 'total_opening_qty', 'total_actual_qty', 'suggestion'],
-      rows)
-  }
-
-  async function handleMerge(g) {
-    if (!g || merging) return
-    const keeperId = keeperFor(g)
-    const dupIds = g.products.map(p => p.id).filter(id => id !== keeperId)
-    setMerging(true)
-    const errors = []
-    for (const dupId of dupIds) {
-      const { error } = await supabase.rpc('merge_products', { p_keeper_id: keeperId, p_dup_id: dupId })
-      if (error) errors.push(error.message)
-    }
-    setMerging(false)
-    setConfirmGroup(null)
-    if (errors.length) setToast({ message: `${g.name}: ${errors.join(' • ')}`, type: 'error' })
-    else setToast({ message: `Merged ${dupIds.length} duplicate${dupIds.length === 1 ? '' : 's'} into "${g.products.find(p => p.id === keeperId)?.name}"`, type: 'success' })
-    load()
-  }
-
-  const totalDuplicateProducts = groups.reduce((s, g) => s + g.products.length - 1, 0)
-
-  return (
-    <div>
-      {!canMerge && (
-        <div style={{ background: '#fff3cc', border: '1px solid #e6c040', borderRadius: '6px', padding: '10px 14px', fontSize: '12px', color: '#7a5000', marginBottom: '16px' }}>
-          🔒 Only master users can perform a merge. You can still review and download the suggestions below.
-        </div>
-      )}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '16px' }}>
-        <StatCard label='Groups Found' value={groups.length} color={groups.length > 0 ? C.accent : undefined} />
-        <StatCard label='Duplicate Products' value={totalDuplicateProducts} />
-      </div>
-      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
-        <Btn variant='ghost' onClick={handleDownloadSuggestions} disabled={groups.length === 0}>↓ Download All Suggestions (CSV)</Btn>
-      </div>
-
-      {loading ? (
-        <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Scanning products…</div>
-      ) : groups.length === 0 ? (
-        <Card>
-          <EmptyState icon='✅' title='No merge suggestions' message='No active products currently share a name and HSN code at different rates.' />
-        </Card>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          {groups.map(g => {
-            const keeperId = keeperFor(g)
-            return (
-              <Card key={g.key}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
-                  <div>
-                    <div style={{ fontWeight: 700, fontSize: '14px' }}>{g.name}</div>
-                    <div style={{ fontSize: '11px', color: C.textMuted, fontFamily: 'monospace' }}>HSN {g.hsn_code} • {g.products.length} product records at different rates</div>
-                  </div>
-                  {canMerge && (
-                    <Btn size='sm' onClick={() => setConfirmGroup(g)} disabled={merging}>Merge {g.products.length - 1} into keeper</Btn>
-                  )}
-                </div>
-                <div style={{ overflowX: 'auto' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
-                    <thead>
-                      <tr>
-                        {['', 'Rate', 'GST %', 'Unit', 'Opening Qty', 'Actual Stock', ''].map((h, i) => (
-                          <th key={i} style={{ padding: '6px 10px', textAlign: (i >= 1 && i <= 4) ? 'right' : 'left', fontSize: '10px', fontWeight: 700, color: '#9a8a6a', textTransform: 'uppercase', letterSpacing: '0.04em', borderBottom: `1px solid ${C.border}`, whiteSpace: 'nowrap' }}>{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {g.products.map(p => (
-                        <tr key={p.id} style={{ background: p.id === keeperId ? '#e8f3ec' : 'transparent' }}>
-                          <td style={{ padding: '7px 10px' }}>
-                            <input type='radio' name={`keeper-${g.key}`} checked={p.id === keeperId}
-                              onChange={() => setKeeperOverride(o => ({ ...o, [g.key]: p.id }))}
-                              disabled={!canMerge} />
-                          </td>
-                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{formatINR(p.default_rate)}</td>
-                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{p.gst_rate}%</td>
-                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{p.unit}</td>
-                          <td style={{ padding: '7px 10px', textAlign: 'right' }}>{Number(p._opening).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
-                          <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: p.id === keeperId ? 700 : 400 }}>{Number(p._actual).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
-                          <td style={{ padding: '7px 10px' }}>{p.id === keeperId && <Badge status='active' label='Suggested keeper' />}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </Card>
-            )
-          })}
-        </div>
-      )}
-
-      <ConfirmModal open={!!confirmGroup} onClose={() => !merging && setConfirmGroup(null)} onConfirm={() => handleMerge(confirmGroup)}
-        title='Merge Duplicate Products'
-        message={confirmGroup ? `Merge ${confirmGroup.products.length - 1} product record(s) into "${confirmGroup.products.find(p => p.id === keeperFor(confirmGroup))?.name}"? Every PI/PO/Invoice/adjustment line referencing them will be repointed to the keeper, matching opening-stock quantities will be added together, and the duplicate product records will be permanently deleted. This cannot be undone.` : ''}
-        danger />
-      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )
 }

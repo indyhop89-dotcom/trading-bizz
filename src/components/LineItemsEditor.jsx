@@ -107,17 +107,22 @@ function TotalsBar({ totals, interstate, roundOffOverride, onRoundOffOverrideCha
 // told apart. Capped at 50 visible matches; narrowing the search surfaces
 // the rest.
 const PICKER_MAX_RESULTS = 50
+// CHANGED: value/onSelect now speak product NAME, not product_id — product
+// identity is name alone (see migration 046_product_name_as_key.sql), so
+// every caller stores/reads product_name directly instead of round-tripping
+// through an id. `products` array elements still carry their own `p.id` (the
+// products table keeps an internal PK), used here only as a React list key.
 export function ProductPicker({ products, value, onSelect, inp = { padding: '7px 9px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: '#fffdf6', fontSize: '13px', width: '100%', fontFamily: 'inherit', outline: 'none', boxSizing: 'border-box' } }) {
   const [query, setQuery] = useState(null) // null = idle (show selected name); string = actively searching
   const [open, setOpen] = useState(false)
-  const selected = value ? products.find(p => p.id === value) : null
-  const display = query !== null ? query : (selected?.name || '')
+  const selected = value ? products.find(p => p.name === value) : null
+  const display = query !== null ? query : (selected?.name || value || '')
   const q = (query || '').trim().toLowerCase()
   const allMatches = q
     ? products.filter(p => (p.name || '').toLowerCase().includes(q) || (p.hsn_code || '').toLowerCase().includes(q))
     : products
   const matches = allMatches.slice(0, PICKER_MAX_RESULTS)
-  function choose(id) { onSelect(id); setOpen(false); setQuery(null) }
+  function choose(name) { onSelect(name); setOpen(false); setQuery(null) }
   return (
     <div style={{ position: 'relative', marginBottom: '4px' }}>
       <input
@@ -126,7 +131,7 @@ export function ProductPicker({ products, value, onSelect, inp = { padding: '7px
         onFocus={() => { setOpen(true); setQuery('') }}
         onChange={e => { setQuery(e.target.value); setOpen(true) }}
         onBlur={() => setTimeout(() => { setOpen(false); setQuery(null) }, 150)}
-        onKeyDown={e => { if (e.key === 'Enter' && matches.length === 1) { e.preventDefault(); choose(matches[0].id) } if (e.key === 'Escape') { setOpen(false); setQuery(null); e.currentTarget.blur() } }}
+        onKeyDown={e => { if (e.key === 'Enter' && matches.length === 1) { e.preventDefault(); choose(matches[0].name) } if (e.key === 'Escape') { setOpen(false); setQuery(null); e.currentTarget.blur() } }}
         style={{ ...inp, fontStyle: selected || query !== null ? 'normal' : 'italic' }}
       />
       {open && (
@@ -142,10 +147,10 @@ export function ProductPicker({ products, value, onSelect, inp = { padding: '7px
           )}
           {matches.map(p => (
             <div key={p.id}
-              onMouseDown={e => { e.preventDefault(); choose(p.id) }}
-              style={{ padding: '6px 9px', cursor: 'pointer', fontSize: '12px', background: p.id === value ? '#f0e8d8' : 'transparent', borderBottom: '1px solid #f5efe2' }}
+              onMouseDown={e => { e.preventDefault(); choose(p.name) }}
+              style={{ padding: '6px 9px', cursor: 'pointer', fontSize: '12px', background: p.name === value ? '#f0e8d8' : 'transparent', borderBottom: '1px solid #f5efe2' }}
               onMouseEnter={e => { e.currentTarget.style.background = '#f5efe2' }}
-              onMouseLeave={e => { e.currentTarget.style.background = p.id === value ? '#f0e8d8' : 'transparent' }}>
+              onMouseLeave={e => { e.currentTarget.style.background = p.name === value ? '#f0e8d8' : 'transparent' }}>
               <div style={{ fontWeight: 600, lineHeight: 1.3 }}>{p.name}</div>
               <div style={{ fontSize: '10px', color: C.textMuted, fontFamily: 'monospace' }}>
                 {p.hsn_code || 'no HSN'}{p.default_rate != null ? ` · ₹${p.default_rate}` : ''}{p.unit ? ` · ${p.unit}` : ''}
@@ -177,7 +182,7 @@ export function ProductPicker({ products, value, onSelect, inp = { padding: '7px
  *                for an earlier period keeps the rate that was actually in force back then.
  *   readOnly   - boolean
  *   showMargin - boolean — show Margin % column + apply-all control
- *   stockMap   - Map<product_id, availableQty> — for shortfall warnings
+ *   stockMap   - Map<product_name, availableQty> — for shortfall warnings
  *
  * Margin workflow:
  *   _cost_rate  = locked purchase price (from previous leg PI via copy, or snapshotted on
@@ -211,7 +216,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
   function addLine() {
     setLines(prev => [...prev, {
       _id: Date.now(), line_no: prev.length + 1,
-      product_id: '', description: '', hsn_code: '',
+      product_name: '', description: '', hsn_code: '',
       qty: '', unit: 'Nos', rate: '', gst_rate: 18,
       taxable_amount: 0, cgst_rate: 0, cgst_amount: 0,
       sgst_rate: 0, sgst_amount: 0, igst_rate: 0, igst_amount: 0, total_amount: 0,
@@ -361,14 +366,14 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
     }))
   }
 
-  function onProductSelect(idx, productId) {
-    const p = products.find(p => p.id === productId)
-    if (!p) { updateLine(idx, 'product_id', productId); return }
+  function onProductSelect(idx, productName) {
+    const p = products.find(p => p.name === productName)
+    if (!p) { updateLine(idx, 'product_name', productName); return }
     setLines(prev => {
       const next    = [...prev]
       const updated = {
         ...next[idx],
-        product_id: p.id, description: p.name,
+        product_name: p.name, description: p.name,
         hsn_code: p.hsn_code || '', unit: p.unit || 'Nos',
         rate: p.default_rate != null ? String(p.default_rate) : '',
         _hsn_manually_set: false,
@@ -472,7 +477,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
               const idx = startIdx + i
               const isOverride = line._hsn_override
               const lineQty    = toNum(line.qty)
-              const availQty   = stockMap && line.product_id ? (stockMap[line.product_id] ?? null) : null
+              const availQty   = stockMap && line.product_name ? (stockMap[line.product_name] ?? null) : null
               const isShort    = availQty !== null && lineQty > availQty
 
               // Determine margin display colour
@@ -489,7 +494,7 @@ export default function LineItemsEditor({ lines, setLines, interstate, products 
 
                   <td style={td}>
                     {products.length > 0 && !readOnly && (
-                      <ProductPicker products={products} value={line.product_id || ''} onSelect={id => onProductSelect(idx, id)} inp={inp} />
+                      <ProductPicker products={products} value={line.product_name || ''} onSelect={name => onProductSelect(idx, name)} inp={inp} />
                     )}
                     {readOnly
                       ? <span style={{ fontSize: '12px' }}>{line.description}</span>

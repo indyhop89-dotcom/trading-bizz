@@ -1,26 +1,18 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../hooks/useAuth'
 
+// CHANGED: Google SSO is now the sole sign-in path shown in this app's UI —
+// the email/password form and its "or" divider are removed. This is a
+// front-end-only change: Supabase's own Email/Password auth provider is
+// deliberately left enabled server-side as a fallback (not something this
+// codebase controls — that's a Supabase Authentication Providers dashboard
+// setting), so nobody is at risk of being locked out if this decision is
+// ever reversed. useAuth's signIn()/password flow is untouched for the same
+// reason — only the UI that exposed it here is gone.
 export default function Login() {
-  const { signIn, signInWithGoogle, authError } = useAuth()
-  const navigate = useNavigate()
-  const [email, setEmail]                 = useState('')
-  const [password, setPassword]           = useState('')
+  const { signInWithGoogle, authError } = useAuth()
   const [error, setError]                 = useState('')
-  const [loading, setLoading]             = useState(false)
   const [googleLoading, setGoogleLoading] = useState(false)
-  const [showPassword, setShowPassword]   = useState(false)
-
-  async function handleSubmit(e) {
-    e.preventDefault()
-    setLoading(true)
-    setError('')
-    const { error } = await signIn(email, password)
-    setLoading(false)
-    if (error) setError(error.message)
-    else navigate('/')
-  }
 
   async function handleGoogle() {
     setError('')
@@ -61,9 +53,9 @@ export default function Login() {
           style={{
             width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px',
             background: '#fff', color: '#1a1208', border: '1.5px solid #e8dfc8',
-            padding: '10px', borderRadius: '6px', fontSize: '14px', fontWeight: 600,
+            padding: '11px', borderRadius: '6px', fontSize: '14px', fontWeight: 600,
             cursor: googleLoading ? 'not-allowed' : 'pointer', opacity: googleLoading ? 0.6 : 1,
-            fontFamily: 'inherit', marginBottom: '20px',
+            fontFamily: 'inherit',
           }}
         >
           <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
@@ -75,76 +67,11 @@ export default function Login() {
           {googleLoading ? 'Redirecting…' : 'Continue with Google'}
         </button>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
-          <div style={{ flex: 1, height: '1px', background: '#e8dfc8' }} />
-          <span style={{ fontSize: '11px', color: '#9a8a6a', textTransform: 'uppercase', letterSpacing: '0.05em' }}>or</span>
-          <div style={{ flex: 1, height: '1px', background: '#e8dfc8' }} />
-        </div>
-
-        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          <div>
-            <label style={{ fontSize: '11px', fontWeight: 700, color: '#7a6a4a', textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: '4px' }}>
-              Email
-            </label>
-            <input
-              type='email' value={email} onChange={e => setEmail(e.target.value)}
-              required placeholder='you@vananam.in'
-              style={{
-                width: '100%', padding: '9px 12px', boxSizing: 'border-box',
-                border: '1.5px solid #e8dfc8', borderRadius: '6px',
-                background: '#fffdf6', fontSize: '14px', color: '#1a1208',
-                outline: 'none', fontFamily: 'inherit',
-              }}
-            />
+        {shownError && (
+          <div style={{ background: '#f0e8e8', color: '#8a2020', padding: '10px 12px', borderRadius: '6px', fontSize: '13px', marginTop: '16px' }}>
+            {shownError}
           </div>
-          <div>
-            <label style={{ fontSize: '11px', fontWeight: 700, color: '#7a6a4a', textTransform: 'uppercase', letterSpacing: '0.05em', display: 'block', marginBottom: '4px' }}>
-              Password
-            </label>
-            <div style={{ position: 'relative' }}>
-              <input
-                type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)}
-                required placeholder='••••••••'
-                style={{
-                  width: '100%', padding: '9px 40px 9px 12px', boxSizing: 'border-box',
-                  border: '1.5px solid #e8dfc8', borderRadius: '6px',
-                  background: '#fffdf6', fontSize: '14px', color: '#1a1208',
-                  outline: 'none', fontFamily: 'inherit',
-                }}
-              />
-              <button
-                type='button' onClick={() => setShowPassword(s => !s)}
-                aria-label={showPassword ? 'Hide password' : 'Show password'}
-                title={showPassword ? 'Hide password' : 'Show password'}
-                style={{
-                  position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)',
-                  background: 'none', border: 'none', cursor: 'pointer', padding: '4px',
-                  color: '#9a8a6a', fontSize: '13px', lineHeight: 1,
-                }}
-              >
-                {showPassword ? '🙈' : '👁️'}
-              </button>
-            </div>
-          </div>
-
-          {shownError && (
-            <div style={{ background: '#f0e8e8', color: '#8a2020', padding: '10px 12px', borderRadius: '6px', fontSize: '13px' }}>
-              {shownError}
-            </div>
-          )}
-
-          <button
-            type='submit' disabled={loading}
-            style={{
-              background: '#1a1208', color: '#f5f0e8',
-              border: 'none', padding: '10px', borderRadius: '6px',
-              fontSize: '14px', fontWeight: 600, cursor: loading ? 'not-allowed' : 'pointer',
-              opacity: loading ? 0.6 : 1, fontFamily: 'inherit', marginTop: '4px',
-            }}
-          >
-            {loading ? 'Signing in…' : 'Sign in'}
-          </button>
-        </form>
+        )}
       </div>
     </div>
   )
