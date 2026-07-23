@@ -3,11 +3,21 @@ import { toNum } from './money'
 import { fetchAllPages } from './query'
 
 // Invoice statuses that are never real movements regardless of dispatch —
-// 'draft' invoices haven't been sent yet, 'cancelled' invoices never
-// happened. Kept separately from the E-way Bill check below because a
-// cancelled invoice must never count even if it happened to have an
-// E-way Bill number entered before it was cancelled.
-const MOVEMENT_STATUSES_EXCLUDED = ['draft', 'cancelled']
+// 'cancelled' invoices never happened, full stop, so this must never count
+// even if it happened to have an E-way Bill number entered before it was
+// cancelled. 'draft' is deliberately NOT excluded here: the app's own EWB
+// section (Invoices/index.jsx's isLocked) only locks against 'cancelled'/
+// 'paid', not 'draft' — so a user can genuinely enter a real E-way Bill
+// number on a still-draft invoice, and once that happens the goods HAVE
+// physically moved (an E-way Bill is a real government-registered dispatch
+// document) regardless of whether this app's own internal draft/submitted
+// label was ever updated to match. Excluding 'draft' here previously made
+// such a transaction's stock movement silently invisible — the EWB was
+// saved, the (buyer-side) purchase mirror was even auto-created, but Actual
+// Stock never counted it because it required BOTH an EWB AND non-draft
+// status. eway_bill_no presence is now the sole movement trigger; a plain
+// draft invoice with no EWB still correctly excludes itself via that check.
+const MOVEMENT_STATUSES_EXCLUDED = ['cancelled']
 
 // CHANGED: temporarily disabled at the user's explicit request — a real
 // business review found every "Billed Beyond Stock" / "Negative stock risk"
@@ -260,7 +270,12 @@ export function getInvoiceLifecycleStage(invoice) {
       ? { key: 'overdue', label: 'Cancelled — Reversed' } // stock had moved, then reversed
       : { key: 'cancelled', label: 'Cancelled' }           // never moved, nothing to reverse
   }
-  if (invoice.status === 'draft') return { key: 'draft', label: 'Draft' }
+  // CHANGED: check EWB before the draft label — a real E-way Bill number
+  // means stock has moved regardless of whether the invoice's own draft/
+  // submitted status was ever updated to match (see
+  // MOVEMENT_STATUSES_EXCLUDED above for the full rationale). A draft
+  // invoice with NO EWB yet still correctly falls through to 'draft' below.
   if (hasEway) return { key: 'completed', label: 'Stock Moved' }
+  if (invoice.status === 'draft') return { key: 'draft', label: 'Draft' }
   return { key: 'pending', label: 'E-way Pending' }
 }

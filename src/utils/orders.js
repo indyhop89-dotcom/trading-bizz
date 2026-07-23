@@ -20,8 +20,12 @@ export function isOrderOpenForDocs(o) {
 const activeDocs = docs => (docs || []).filter(d => d.status !== 'cancelled')
 
 // An invoice counts as "stock moved" under exactly the same rule the stock
-// calculation uses (see stock.js): non-draft, non-cancelled, E-way Bill set.
-const invoiceMoved = inv => !!inv.eway_bill_no && inv.status !== 'draft' && inv.status !== 'cancelled'
+// calculation uses (see stock.js's MOVEMENT_STATUSES_EXCLUDED): E-way Bill
+// set and not cancelled. Deliberately NOT gated on draft — the EWB section
+// isn't locked for draft invoices, so a real E-way Bill can exist on one,
+// and that's what actually moved the goods regardless of the document's own
+// internal status label.
+const invoiceMoved = inv => !!inv.eway_bill_no && inv.status !== 'cancelled'
 
 // docsByLeg: { [legId]: { pis: [], pos: [], invoices: [] } } — rows only need
 // `status` (and `eway_bill_no` for invoices).

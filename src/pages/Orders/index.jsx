@@ -112,8 +112,12 @@ function getLegStatus(pi, po, inv) {
   if (inv) {
     const stock = getInvoiceLifecycleStage(inv)
     if (inv.status === 'cancelled') return { key: stock.key, label: stock.key === 'overdue' ? 'Cancelled — Reversed' : 'Invoice Cancelled' }
-    if (inv.status === 'draft') return { key: 'draft', label: 'Invoice Drafted' }
+    // CHANGED: check stock-moved before the draft label — a real E-way Bill
+    // can exist on a still-draft invoice (its section isn't locked for
+    // draft), and that's what actually moved the goods (see
+    // getInvoiceLifecycleStage / stock.js's MOVEMENT_STATUSES_EXCLUDED).
     if (stock.key === 'completed') return { key: 'completed', label: 'Stock Moved' }
+    if (inv.status === 'draft') return { key: 'draft', label: 'Invoice Drafted' }
     return { key: inv.status, label: `Invoice ${inv.status} — Awaiting Movement` }
   }
   if (po) return { key: po.status, label: `PO ${po.status}` }

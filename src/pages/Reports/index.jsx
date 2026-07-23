@@ -898,8 +898,13 @@ function StockMovementReport({ entities }) {
     // set) is excluded to avoid showing the same movement twice — a manual
     // purchase invoice (no source_invoice_id) is the only record of that
     // movement and must still appear (see stock.js for the same rule).
+    // CHANGED: dropped the `status !== 'draft'` check — the EWB section
+    // isn't locked for draft invoices, so a real E-way Bill can exist on
+    // one, and that's the actual movement event regardless of the
+    // document's own draft/submitted label (see stock.js's
+    // MOVEMENT_STATUSES_EXCLUDED for the full rationale).
     const result = (invLines || [])
-      .filter(l => l.invoice && l.invoice.status !== 'cancelled' && l.invoice.status !== 'draft' && l.invoice.eway_bill_no && !(l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id))
+      .filter(l => l.invoice && l.invoice.status !== 'cancelled' && l.invoice.eway_bill_no && !(l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id))
       .filter(l => !entityId || l.invoice.seller_entity_id === entityId || l.invoice.buyer_entity_id === entityId)
       .map(l => ({
         eway_bill_no: l.invoice.eway_bill_no, eway_bill_date: l.invoice.eway_bill_date, invoice_no: l.invoice.invoice_no,
