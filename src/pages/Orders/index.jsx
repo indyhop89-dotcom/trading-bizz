@@ -3,7 +3,7 @@ import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
-  PageHeader, FormRow, Input, Select, Textarea, StatCard,
+  PageHeader, FormRow, Input, Select, Textarea, StatCard, MultiSelectDropdown,
 } from '../../components/UI/index'
 import DocumentChecklist from '../../components/DocumentChecklist'
 import { fmtDate, today, currentFYLabel, fyCodeForDate } from '../../utils/dates'
@@ -315,7 +315,7 @@ function OrdersList() {
   const [entities, setEntities] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch]   = useState('')
-  const [statusFilter, setStatusFilter] = useState('all')
+  const [statusFilter, setStatusFilter] = useState([])
   const [dateFrom, setDateFrom] = useState('')  // date filters
   const [dateTo, setDateTo]     = useState('')
   const [modalOpen, setModalOpen] = useState(false)
@@ -399,7 +399,7 @@ function OrdersList() {
 
   const filtered = orders.filter(o => {
     const ms  = !search||o.name.toLowerCase().includes(search.toLowerCase())||(o.order_no||'').toLowerCase().includes(search.toLowerCase())
-    const mst = statusFilter==='all'||o.status===statusFilter
+    const mst = statusFilter.length===0||statusFilter.includes(o.status)
     const mdf = !dateFrom||o.created_at>=dateFrom
     const mdt = !dateTo||o.created_at<=dateTo+'T23:59:59'
     return ms&&mst&&mdf&&mdt
@@ -429,10 +429,7 @@ function OrdersList() {
       <PageHeader title='Orders' subtitle='Track every movement of goods end-to-end' action={<Btn onClick={()=>{setForm({...EMPTY_ORDER,origin_entity_id:defaultEntityId});setModalOpen(true)}}>+ New Order</Btn>}/>
       <div style={{display:'flex',gap:'10px',marginBottom:'16px',flexWrap:'wrap'}}>
         <input value={search} onChange={e=>setSearch(e.target.value)} placeholder='Search orders…' style={{padding:'8px 12px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',flex:1,minWidth:'180px',fontFamily:'inherit'}}/>
-        <select value={statusFilter} onChange={e=>setStatusFilter(e.target.value)} style={{padding:'8px 12px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',cursor:'pointer',fontFamily:'inherit'}}>
-          <option value='all'>All statuses</option>
-          {ORDER_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}
-        </select>
+        <MultiSelectDropdown options={ORDER_STATUSES} selected={statusFilter} onChange={setStatusFilter} placeholder='All statuses'/>
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear dates</Btn>}
