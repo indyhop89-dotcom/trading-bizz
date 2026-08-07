@@ -98,7 +98,7 @@ function OpeningStock() {
   // with fetchAllPages so every row is loaded regardless of table size.
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }, actualMap, { data: offloads }] = await Promise.all([
+    const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }, actualMap] = await Promise.all([
       fetchAllPages(() => supabase.from('stock_opening_balance')
         .select('*, entity:entity_id(name,short_name), fy:financial_year_id(name)')
         .order('created_at', { ascending: false })),
@@ -106,34 +106,23 @@ function OpeningStock() {
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name')),
       supabase.from('financial_years').select('*').order('start_date', { ascending: false }),
       // CHANGED: same actual-stock aggregation Stock Position uses, so a row
-      // whose entity+product has been fully offloaded/sold (actual_qty === 0)
-      // can be hidden here too. Scoped to asOfDate so the offload check
-      // matches whatever point in time is being viewed.
+      // whose entity+product currently nets to zero actual stock (fully
+      // offloaded/sold, nothing since restocked) can be hidden here too.
+      // CHANGED: dropped the earlier "ever had an offloaded adjustment"
+      // flag — that permanently blacklisted a product/entity the moment ONE
+      // offload was ever recorded against it, so re-uploading fresh opening
+      // stock for a product offloaded in the past (a real restock) stayed
+      // invisible forever even though actual_qty was genuinely positive
+      // again. actual_qty is already a running total across every opening
+      // entry, invoice and adjustment, so it alone correctly reflects
+      // whether stock is on hand RIGHT NOW — that's the only signal needed.
       fetchActualStockPosition(asOfDate || null),
-      // CHANGED: don't rely solely on actual_qty landing on exact 0 to detect
-      // an offload — a partial/imprecise offload entry can leave actual_qty
-      // slightly off zero (rounding, or the offloaded qty not matching what
-      // was left) and the row would wrongly stay listed. Flag any
-      // entity+product that has ANY 'offloaded' adjustment on record and hide
-      // it outright — that's what "offloaded" is supposed to mean here.
-      fetchAllPages(() => {
-        let q = supabase.from('stock_adjustments').select('entity_id,product_name').eq('reason', 'offloaded')
-        if (asOfDate) q = q.lte('adjustment_date', asOfDate)
-        return q
-      }),
     ])
     // CHANGED: product identity is now NAME (migration 046) — look the
     // product master up client-side by product_name rather than embedding
     // via product_id, so this keeps working whichever of the two FK columns
     // is currently live on stock_opening_balance during the transition.
     const productByName = new Map((ps || []).map(p => [p.name, p]))
-    // CHANGED: match on productKey (trim/collapse-whitespace/case-insensitive)
-    // rather than the raw string — this catalog has a known history of stray
-    // whitespace/casing on product names (see utils/products.js), so an exact
-    // '===' match between an Adjustments-tab entry and an Opening Stock row
-    // can silently miss even when they're the same product, leaving an
-    // offloaded row stuck visible.
-    const offloadedKeys = new Set((offloads || []).map(o => `${o.entity_id}__${productKey(o.product_name)}`))
     setRows((rs || []).map(r => {
       const key = `${r.entity_id}__${r.product_name}`
       const am = actualMap[key]
@@ -141,7 +130,6 @@ function OpeningStock() {
         ...r,
         product: productByName.get(r.product_name) || null,
         actual_qty: am ? am.actual_qty : toNum(r.qty),
-        offloaded: offloadedKeys.has(`${r.entity_id}__${productKey(r.product_name)}`),
       }
     }))
     setEntities(es || [])
@@ -334,7 +322,11 @@ function OpeningStock() {
   const filtered = rows
     .filter(r => !entityFilter || r.entity_id === entityFilter)
     .filter(r => !asOfDate || !r.as_of_date || r.as_of_date <= asOfDate)
-    .filter(r => !hideOffloaded || (!r.offloaded && r.actual_qty !== 0))
+    // CHANGED: epsilon instead of exact !== 0 — actual_qty is a sum of several
+    // decimal columns (opening qty, invoice qty, adjustment qty), so a fully
+    // offloaded/sold-out row can land on something like 0.0000000001 instead
+    // of exact 0 and wrongly stay visible.
+    .filter(r => !hideOffloaded || Math.abs(r.actual_qty) > 0.001)
 
   // CHANGED: download of the (filtered) opening-stock rows. Columns lead with
   // the exact upload format (entity,product,fy,qty,unit,rate,hsn_code,
