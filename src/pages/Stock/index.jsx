@@ -73,6 +73,17 @@ function OpeningStock() {
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [entityFilter, setEntityFilter]   = useState('')
   const [toast, setToast]       = useState(null)
+  // CHANGED: once a product's actual stock (opening + invoices + adjustments,
+  // same computation Stock Position uses) has been fully offloaded/sold to
+  // zero, its opening-stock row is done being live — leaving it listed here
+  // padded the totals/qty StatCards with stock that's no longer around.
+  // Hidden by default, matching Stock Position's "sold-out" toggle; can be
+  // switched back on for a historical/audit view.
+  const [hideOffloaded, setHideOffloaded] = useState(true)
+  // CHANGED: point-in-time view — pick a date to see opening-stock entries
+  // (and offload status) as of that day; blank = live (now). Mirrors the
+  // "Stock as of" filter on the Stock Position tab.
+  const [asOfDate, setAsOfDate] = useState('')
   // CSV
   const [csvModal, setCsvModal] = useState(false)
   const [csvText, setCsvText]   = useState('')
@@ -87,25 +98,33 @@ function OpeningStock() {
   // with fetchAllPages so every row is loaded regardless of table size.
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }] = await Promise.all([
+    const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }, actualMap] = await Promise.all([
       fetchAllPages(() => supabase.from('stock_opening_balance')
         .select('*, entity:entity_id(name,short_name), fy:financial_year_id(name)')
         .order('created_at', { ascending: false })),
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name')),
       supabase.from('financial_years').select('*').order('start_date', { ascending: false }),
+      // CHANGED: same actual-stock aggregation Stock Position uses, so a row
+      // whose entity+product has been fully offloaded/sold (actual_qty === 0)
+      // can be hidden here too. Scoped to asOfDate so the offload check
+      // matches whatever point in time is being viewed.
+      fetchActualStockPosition(asOfDate || null),
     ])
     // CHANGED: product identity is now NAME (migration 046) — look the
     // product master up client-side by product_name rather than embedding
     // via product_id, so this keeps working whichever of the two FK columns
     // is currently live on stock_opening_balance during the transition.
     const productByName = new Map((ps || []).map(p => [p.name, p]))
-    setRows((rs || []).map(r => ({ ...r, product: productByName.get(r.product_name) || null })))
+    setRows((rs || []).map(r => {
+      const am = actualMap[`${r.entity_id}__${r.product_name}`]
+      return { ...r, product: productByName.get(r.product_name) || null, actual_qty: am ? am.actual_qty : toNum(r.qty) }
+    }))
     setEntities(es || [])
     setProducts(ps || [])
     setFys(fyData || [])
     setLoading(false)
-  }, [])
+  }, [asOfDate])
 
   useEffect(() => { load() }, [load])
 
@@ -288,7 +307,10 @@ function OpeningStock() {
     setCsvSaving(false)
   }
 
-  const filtered = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
+  const filtered = rows
+    .filter(r => !entityFilter || r.entity_id === entityFilter)
+    .filter(r => !asOfDate || !r.as_of_date || r.as_of_date <= asOfDate)
+    .filter(r => !hideOffloaded || r.actual_qty !== 0)
 
   // CHANGED: download of the (filtered) opening-stock rows. Columns lead with
   // the exact upload format (entity,product,fy,qty,unit,rate,hsn_code,
@@ -355,10 +377,28 @@ function OpeningStock() {
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
         <div style={{ flex: 1 }} />
+        {/* CHANGED: fully offloaded/sold-out rows (actual stock === 0) hidden
+            by default to keep totals honest — toggle back on for an audit view. */}
+        <Btn size='sm' variant={hideOffloaded ? 'ghost' : 'primary'} onClick={() => setHideOffloaded(h => !h)}>
+          {hideOffloaded ? 'Show offloaded stock' : '✓ Showing offloaded stock'}
+        </Btn>
+        {/* CHANGED: point-in-time view — pick a date to see opening-stock
+            entries as of that day; blank = live (now). */}
+        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: C.textSoft }}>
+          Stock as of
+          <input type='date' value={asOfDate} onChange={e => setAsOfDate(e.target.value)}
+            style={{ padding: '6px 10px', border: `1.5px solid ${asOfDate ? C.accent : C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+        </label>
+        {asOfDate && <Btn size='sm' variant='ghost' onClick={() => setAsOfDate('')}>✕ Back to live</Btn>}
         <Btn variant='ghost' onClick={handleExportCSV}>↓ Export CSV</Btn>
         <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
         <Btn onClick={openNew}>+ Add Opening Stock</Btn>
       </div>
+      {asOfDate && (
+        <div style={{ background: '#e8f3fd', border: '1px solid #b8d8f8', borderRadius: '6px', padding: '8px 12px', fontSize: '12px', color: '#1a4a7a', marginBottom: '12px' }}>
+          📅 Showing opening stock as of <strong>{fmtDate(asOfDate)}</strong> — entries dated after this day, and offload status, are evaluated as of this date. Clear the date to return to the live view.
+        </div>
+      )}
 
       <Card>
         {loading
