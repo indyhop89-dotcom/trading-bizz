@@ -127,7 +127,13 @@ function OpeningStock() {
     // via product_id, so this keeps working whichever of the two FK columns
     // is currently live on stock_opening_balance during the transition.
     const productByName = new Map((ps || []).map(p => [p.name, p]))
-    const offloadedKeys = new Set((offloads || []).map(o => `${o.entity_id}__${o.product_name}`))
+    // CHANGED: match on productKey (trim/collapse-whitespace/case-insensitive)
+    // rather than the raw string — this catalog has a known history of stray
+    // whitespace/casing on product names (see utils/products.js), so an exact
+    // '===' match between an Adjustments-tab entry and an Opening Stock row
+    // can silently miss even when they're the same product, leaving an
+    // offloaded row stuck visible.
+    const offloadedKeys = new Set((offloads || []).map(o => `${o.entity_id}__${productKey(o.product_name)}`))
     setRows((rs || []).map(r => {
       const key = `${r.entity_id}__${r.product_name}`
       const am = actualMap[key]
@@ -135,7 +141,7 @@ function OpeningStock() {
         ...r,
         product: productByName.get(r.product_name) || null,
         actual_qty: am ? am.actual_qty : toNum(r.qty),
-        offloaded: offloadedKeys.has(key),
+        offloaded: offloadedKeys.has(`${r.entity_id}__${productKey(r.product_name)}`),
       }
     }))
     setEntities(es || [])
