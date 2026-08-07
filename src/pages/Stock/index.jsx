@@ -98,7 +98,7 @@ function OpeningStock() {
   // with fetchAllPages so every row is loaded regardless of table size.
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }, actualMap] = await Promise.all([
+    const [{ data: rs }, { data: es }, { data: ps }, { data: fyData }, actualMap, { data: offloads }] = await Promise.all([
       fetchAllPages(() => supabase.from('stock_opening_balance')
         .select('*, entity:entity_id(name,short_name), fy:financial_year_id(name)')
         .order('created_at', { ascending: false })),
@@ -110,15 +110,33 @@ function OpeningStock() {
       // can be hidden here too. Scoped to asOfDate so the offload check
       // matches whatever point in time is being viewed.
       fetchActualStockPosition(asOfDate || null),
+      // CHANGED: don't rely solely on actual_qty landing on exact 0 to detect
+      // an offload — a partial/imprecise offload entry can leave actual_qty
+      // slightly off zero (rounding, or the offloaded qty not matching what
+      // was left) and the row would wrongly stay listed. Flag any
+      // entity+product that has ANY 'offloaded' adjustment on record and hide
+      // it outright — that's what "offloaded" is supposed to mean here.
+      fetchAllPages(() => {
+        let q = supabase.from('stock_adjustments').select('entity_id,product_name').eq('reason', 'offloaded')
+        if (asOfDate) q = q.lte('adjustment_date', asOfDate)
+        return q
+      }),
     ])
     // CHANGED: product identity is now NAME (migration 046) — look the
     // product master up client-side by product_name rather than embedding
     // via product_id, so this keeps working whichever of the two FK columns
     // is currently live on stock_opening_balance during the transition.
     const productByName = new Map((ps || []).map(p => [p.name, p]))
+    const offloadedKeys = new Set((offloads || []).map(o => `${o.entity_id}__${o.product_name}`))
     setRows((rs || []).map(r => {
-      const am = actualMap[`${r.entity_id}__${r.product_name}`]
-      return { ...r, product: productByName.get(r.product_name) || null, actual_qty: am ? am.actual_qty : toNum(r.qty) }
+      const key = `${r.entity_id}__${r.product_name}`
+      const am = actualMap[key]
+      return {
+        ...r,
+        product: productByName.get(r.product_name) || null,
+        actual_qty: am ? am.actual_qty : toNum(r.qty),
+        offloaded: offloadedKeys.has(key),
+      }
     }))
     setEntities(es || [])
     setProducts(ps || [])
@@ -310,7 +328,7 @@ function OpeningStock() {
   const filtered = rows
     .filter(r => !entityFilter || r.entity_id === entityFilter)
     .filter(r => !asOfDate || !r.as_of_date || r.as_of_date <= asOfDate)
-    .filter(r => !hideOffloaded || r.actual_qty !== 0)
+    .filter(r => !hideOffloaded || (!r.offloaded && r.actual_qty !== 0))
 
   // CHANGED: download of the (filtered) opening-stock rows. Columns lead with
   // the exact upload format (entity,product,fy,qty,unit,rate,hsn_code,
