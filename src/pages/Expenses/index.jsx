@@ -37,6 +37,7 @@ function suggestTds(category) {
 const EMPTY = {
   expense_date: today(), entity_id: '', expense_type: '',
   description: '', amount: '', gst_rate: 0,
+  is_rcm: false, rcm_gst_rate: '',
   vendor_entity_id: '', vendor_name: '', vendor_gstin: '',
   party_id: '', due_date: '',
   order_id: '', order_leg_id: '', invoice_id: '', status: 'unpaid', notes: '',
@@ -106,7 +107,7 @@ export default function Expenses() {
       supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
       supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
       supabase.from('expense_categories').select('id,name,sort_order').eq('is_active', true).order('sort_order'), // CHANGED
-      supabase.from('parties').select('id,name,gstin,payment_terms,payment_days').eq('is_deleted', false).eq('is_active', true).order('name'), // CHANGED
+      supabase.from('parties').select('id,name,gstin,payment_terms,payment_days,rcm_applicable').eq('is_deleted', false).eq('is_active', true).order('name'), // CHANGED
     ])
     setExpenses(exps || [])
     setEntities(es || [])
@@ -145,13 +146,25 @@ export default function Expenses() {
   // payment due date from the party's default payment_days.
   function selectParty(id) {
     const p = parties.find(x => x.id === id)
-    setForm(f => ({
-      ...f,
-      party_id: id,
-      vendor_name:  p ? p.name : f.vendor_name,
-      vendor_gstin: p ? (p.gstin || '') : f.vendor_gstin,
-      due_date: p && p.payment_days != null ? addDaysISO(f.expense_date, p.payment_days) : f.due_date,
-    }))
+    setForm(f => {
+      const next = {
+        ...f,
+        party_id: id,
+        vendor_name:  p ? p.name : f.vendor_name,
+        vendor_gstin: p ? (p.gstin || '') : f.vendor_gstin,
+        due_date: p && p.payment_days != null ? addDaysISO(f.expense_date, p.payment_days) : f.due_date,
+      }
+      // CHANGED: RCM auto-suggestion — vendors marked rcm_applicable in the
+      // party master default this expense to RCM (zeroes vendor GST, suggests
+      // a starting self-assessed rate); always overridable, same
+      // "suggest, never force" pattern as suggestTds.
+      if (p?.rcm_applicable && !f.is_rcm) {
+        next.is_rcm = true
+        next.rcm_gst_rate = f.rcm_gst_rate || 5
+        next.gst_rate = 0
+      }
+      return next
+    })
   }
   // Changing the expense date re-derives the due date from the selected party's
   // terms (keeps them in sync); no party ⇒ date change leaves due_date alone.
@@ -221,8 +234,9 @@ export default function Expenses() {
   }
 
   const previewAmount  = toNum(form.amount)
-  const previewGST     = roundRupees(round2(previewAmount * Number(form.gst_rate) / 100))
-  const previewTotal   = previewAmount + previewGST
+  const previewGST     = form.is_rcm ? 0 : roundRupees(round2(previewAmount * Number(form.gst_rate) / 100))
+  const previewTotal   = previewAmount + previewGST   // what's payable to the vendor
+  const previewRcmGST  = form.is_rcm ? roundRupees(round2(previewAmount * (Number(form.rcm_gst_rate) || 0) / 100)) : 0
 
   async function handleSave() {
     if (!form.entity_id || !form.description) return setToast({ message: 'Entity and description are required', type: 'error' })
@@ -230,6 +244,7 @@ export default function Expenses() {
     const amount    = roundRupees(toNum(form.amount))
     if (!amount) return setToast({ message: 'Amount is required', type: 'error' })
     if (!isValidGSTIN(form.vendor_gstin)) return setToast({ message: GSTIN_ERROR, type: 'error' })
+    if (form.is_rcm && !Number(form.rcm_gst_rate)) return setToast({ message: 'RCM GST rate is required', type: 'error' })
     setSaving(true)
     const fy = await resolveFY()
     if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
@@ -241,8 +256,9 @@ export default function Expenses() {
     // auto-generated — no manual override field, as requested.
     const entity = entities.find(e => e.id === form.entity_id)
     const expNo = await suggestNextNo({ table: 'expenses', noCol: 'expense_no', entityShort: entity?.short_name || entity?.name, fyCode: fy.code })
-    const gst_amount   = roundRupees(round2(amount * Number(form.gst_rate) / 100))
-    const total_amount = amount + gst_amount
+    const gst_amount     = form.is_rcm ? 0 : roundRupees(round2(amount * Number(form.gst_rate) / 100))
+    const total_amount   = amount + gst_amount   // vendor payable — RCM GST never added here
+    const rcm_gst_amount = form.is_rcm ? roundRupees(round2(amount * Number(form.rcm_gst_rate) / 100)) : 0
     const payload = {
       expense_no:      expNo,
       financial_year_id: fy.id,
@@ -251,9 +267,12 @@ export default function Expenses() {
       category:        form.expense_type || form.category || 'other',
       description:     form.description,
       amount,
-      gst_rate:        Number(form.gst_rate),
+      gst_rate:        form.is_rcm ? 0 : Number(form.gst_rate),
       gst_amount,
       total_amount,
+      is_rcm:          form.is_rcm,
+      rcm_gst_rate:    form.is_rcm ? Number(form.rcm_gst_rate) : null,
+      rcm_gst_amount,
       vendor_entity_id: form.vendor_entity_id || null,
       vendor_name:     form.vendor_name || null,
       vendor_gstin:    form.vendor_gstin || null,
@@ -325,7 +344,7 @@ export default function Expenses() {
     { label: 'Entity',   render: e => <span style={{ fontSize: '12px' }}>{e.entity?.short_name || e.entity?.name}</span> },
     { label: 'Type',     render: e => <Badge status={e.expense_type} label={e.expense_type} /> },
     { label: 'Desc',     render: e => <span style={{ fontSize: '12px' }}>{e.description}</span> },
-    { label: 'Vendor',   render: e => <span style={{ fontSize: '12px', color: C.textSoft }}>{e.vendor?.short_name || e.vendor?.name || e.vendor_name || '—'}</span> },
+    { label: 'Vendor',   render: e => <span style={{ fontSize: '12px', color: C.textSoft }}>{e.vendor?.short_name || e.vendor?.name || e.vendor_name || '—'}{e.is_rcm && <span style={{ marginLeft: '6px' }}><Badge status='rcm' label='RCM' /></span>}</span> },
     { label: 'Total',    right: true, render: e => <span style={{ fontWeight: 600 }}>{formatINR(e.total_amount)}</span> },
     { label: 'Status',   render: e => <Badge status={e.status} /> },
     { label: 'Docs',     render: e => <DocumentAttachments sourceType='expenses' sourceId={e.id} entityId={e.entity_id} entityName={e.entity?.name || 'General'} compact /> }, // CHANGED: entityId added
@@ -343,7 +362,7 @@ export default function Expenses() {
 
       {/* CHANGED: tab shell — expense list, party settlements, and entity-wise summary */}
       <div style={{ display: 'flex', gap: '4px', marginBottom: '20px', borderBottom: `2px solid ${C.border}` }}>
-        {['Expenses', 'Party Payments', 'Summary'].map(t => (
+        {['Expenses', 'Party Payments', 'RCM Register', 'Summary'].map(t => (
           <button key={t} onClick={() => setTab(t)} style={{
             padding: '8px 20px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
             fontWeight: tab === t ? 700 : 500, fontSize: '13px',
@@ -356,6 +375,9 @@ export default function Expenses() {
 
       {tab === 'Party Payments' && (
         <PartyPayments entities={accessEntities} parties={parties} expenses={expenses} canDelete={canDelete} defaultEntityId={defaultEntityId} />
+      )}
+      {tab === 'RCM Register' && (
+        <RcmRegister expenses={expenses} onChange={load} />
       )}
       {tab === 'Summary' && (
         <ExpenseSummary expenses={expenses} parties={parties} loading={loading} />
@@ -431,20 +453,45 @@ export default function Expenses() {
           <FormRow label='Description' required>
             <Input value={form.description} onChange={e => setF('description', e.target.value)} placeholder='What is this expense for?' />
           </FormRow>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input type='checkbox' id='exp_is_rcm' checked={form.is_rcm}
+              onChange={e => setF('is_rcm', e.target.checked)}
+              style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+            <label htmlFor='exp_is_rcm' style={{ fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
+              Reverse Charge (RCM) — vendor bills with no GST
+            </label>
+          </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='Amount (₹)' required>
               <Input type='number' value={form.amount} onChange={e => setF('amount', e.target.value)} placeholder='0.00' />
             </FormRow>
-            <FormRow label='GST %'>
-              <Select value={form.gst_rate} onChange={e => setF('gst_rate', e.target.value)}>
-                {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
-              </Select>
-            </FormRow>
+            {form.is_rcm ? (
+              <FormRow label='RCM GST %' hint='Self-assessed — payable to govt, not the vendor'>
+                <Select value={form.rcm_gst_rate} onChange={e => setF('rcm_gst_rate', e.target.value)}>
+                  <option value=''>Select rate</option>
+                  {GST_RATES.filter(r => r > 0).map(r => <option key={r} value={r}>{r}%</option>)}
+                </Select>
+              </FormRow>
+            ) : (
+              <FormRow label='GST %'>
+                <Select value={form.gst_rate} onChange={e => setF('gst_rate', e.target.value)}>
+                  {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
+                </Select>
+              </FormRow>
+            )}
           </div>
           {previewAmount > 0 && (
-            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 14px', fontSize: '13px', display: 'flex', justifyContent: 'space-between' }}>
-              <span style={{ color: C.textSoft }}>Total incl. GST</span>
-              <span style={{ fontWeight: 700 }}>{formatINR(previewTotal)}</span>
+            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: '6px', padding: '10px 14px', fontSize: '13px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: C.textSoft }}>{form.is_rcm ? 'Payable to vendor (no GST)' : 'Total incl. GST'}</span>
+                <span style={{ fontWeight: 700 }}>{formatINR(previewTotal)}</span>
+              </div>
+              {form.is_rcm && previewRcmGST > 0 && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: C.warning }}>RCM GST payable to govt (not to vendor)</span>
+                  <span style={{ fontWeight: 700, color: C.warning }}>{formatINR(previewRcmGST)}</span>
+                </div>
+              )}
             </div>
           )}
           <SectionDivider label='Party / Vendor' />
@@ -830,6 +877,88 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
 
       <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
         title='Delete Payment' message={`Delete this ${formatINR(confirmDelete?.amount || 0)} payment?`} danger />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  )
+}
+
+// ─── RCM Register tab ───────────────────────────────────────────────────────
+// Full RCM ledger: liability (computed at booking, from is_rcm/rcm_gst_rate/
+// rcm_gst_amount on the expense itself — migration 050), paid-to-govt
+// date/ref (GSTR-3B cash ledger — a manual real-world action recorded here),
+// and ITC-claimed date/ref (claimable only once paid). Rows are derived from
+// `expenses` (already loaded + RLS-scoped by the parent) — no separate fetch.
+function RcmRegister({ expenses, onChange }) {
+  const rows = (expenses || []).filter(e => e.is_rcm)
+  const [markModal, setMarkModal] = useState(null) // { row, kind: 'paid' | 'claimed' }
+  const [date, setDate] = useState(today())
+  const [ref, setRef]   = useState('')
+  const [saving, setSaving] = useState(false)
+  const [toast, setToast] = useState(null)
+
+  function openMark(row, kind) {
+    setMarkModal({ row, kind })
+    setDate((kind === 'paid' ? row.rcm_paid_date : row.rcm_itc_claimed_date) || today())
+    setRef((kind === 'paid' ? row.rcm_paid_ref : row.rcm_itc_claim_ref) || '')
+  }
+  async function confirmMark() {
+    setSaving(true)
+    const patch = markModal.kind === 'paid'
+      ? { rcm_paid_date: date, rcm_paid_ref: ref || null }
+      : { rcm_itc_claimed_date: date, rcm_itc_claim_ref: ref || null }
+    const { error } = await supabase.from('expenses').update(patch).eq('id', markModal.row.id)
+    setSaving(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setMarkModal(null)
+    setToast({ message: markModal.kind === 'paid' ? 'Marked paid to govt' : 'Marked ITC claimed', type: 'success' })
+    onChange()
+  }
+
+  const totalLiability = rows.reduce((s, r) => s + (r.rcm_gst_amount || 0), 0)
+  const totalPaid    = rows.filter(r => r.rcm_paid_date).reduce((s, r) => s + (r.rcm_gst_amount || 0), 0)
+  const totalClaimed = rows.filter(r => r.rcm_itc_claimed_date).reduce((s, r) => s + (r.rcm_gst_amount || 0), 0)
+
+  const columns = [
+    { label: 'Date',   render: r => <span style={{ fontSize: '12px' }}>{fmtDate(r.expense_date)}</span> },
+    { label: 'Entity', render: r => <span style={{ fontSize: '12px' }}>{r.entity?.short_name || r.entity?.name}</span> },
+    { label: 'Vendor', render: r => <span style={{ fontSize: '12px' }}>{r.vendor?.short_name || r.vendor?.name || r.vendor_name || '—'}</span> },
+    { label: 'Taxable', right: true, render: r => formatINR(r.amount) },
+    { label: 'RCM %',   right: true, render: r => `${r.rcm_gst_rate ?? 0}%` },
+    { label: 'RCM Liability', right: true, render: r => <span style={{ fontWeight: 600 }}>{formatINR(r.rcm_gst_amount)}</span> },
+    { label: 'Paid to Govt', render: r => r.rcm_paid_date
+        ? <Btn size='sm' variant='ghost' onClick={() => openMark(r, 'paid')}>{fmtDate(r.rcm_paid_date)}</Btn>
+        : <Btn size='sm' onClick={() => openMark(r, 'paid')}>Mark Paid</Btn> },
+    { label: 'ITC Claimed', render: r => r.rcm_itc_claimed_date
+        ? <Btn size='sm' variant='ghost' onClick={() => openMark(r, 'claimed')}>{fmtDate(r.rcm_itc_claimed_date)}</Btn>
+        : <Btn size='sm' disabled={!r.rcm_paid_date} onClick={() => openMark(r, 'claimed')}>Mark Claimed</Btn> },
+  ]
+
+  return (
+    <div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px,1fr))', gap: '12px', marginBottom: '20px' }}>
+        <StatCard label='RCM Liability' value={formatINR(totalLiability)} />
+        <StatCard label='Paid to Govt' value={formatINR(totalPaid)} color={C.success} />
+        <StatCard label='Pending to Pay' value={formatINR(totalLiability - totalPaid)} color={totalLiability - totalPaid > 0 ? C.danger : C.success} />
+        <StatCard label='ITC Claimed' value={formatINR(totalClaimed)} color={C.success} />
+        <StatCard label='Pending to Claim' value={formatINR(totalPaid - totalClaimed)} color={totalPaid - totalClaimed > 0 ? C.warning : C.textMuted} />
+      </div>
+      <Card>
+        <Table columns={columns} rows={rows}
+          emptyState={<EmptyState icon='🔄' title='No RCM expenses yet' />} />
+      </Card>
+      <Modal open={!!markModal} onClose={() => setMarkModal(null)}
+        title={markModal?.kind === 'paid' ? 'Mark RCM Paid to Govt' : 'Mark RCM ITC Claimed'} width={420}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <FormRow label='Date' required><Input type='date' value={date} onChange={e => setDate(e.target.value)} /></FormRow>
+          <FormRow label={markModal?.kind === 'paid' ? 'Challan / GSTR-3B ARN' : 'GSTR-3B period'} hint='Optional'>
+            <Input value={ref} onChange={e => setRef(e.target.value)} placeholder={markModal?.kind === 'paid' ? 'e.g. ARN AB123...' : 'e.g. Aug-2026'} />
+          </FormRow>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setMarkModal(null)}>Cancel</Btn>
+            <Btn onClick={confirmMark} disabled={saving}>{saving ? 'Saving…' : 'Confirm'}</Btn>
+          </div>
+        </div>
+      </Modal>
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

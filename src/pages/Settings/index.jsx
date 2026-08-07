@@ -1225,6 +1225,7 @@ function Users() {
 const EMPTY_PARTY = {
   name: '', gstin: '', pan: '', contact_person: '', phone: '', email: '',
   address: '', payment_terms: '', payment_days: '', notes: '', is_active: true,
+  rcm_applicable: false,
 }
 
 function Parties() {
@@ -1258,6 +1259,7 @@ function Parties() {
       contact_person: r.contact_person || '', phone: r.phone || '', email: r.email || '',
       address: r.address || '', payment_terms: r.payment_terms || '',
       payment_days: r.payment_days ?? '', notes: r.notes || '', is_active: r.is_active,
+      rcm_applicable: r.rcm_applicable || false,
     })
     setModalOpen(true)
   }
@@ -1281,6 +1283,7 @@ function Parties() {
       payment_days: days,
       notes: form.notes.trim() || null,
       is_active: form.is_active,
+      rcm_applicable: form.rcm_applicable,
     }
     const res = editing
       ? await supabase.from('parties').update(payload).eq('id', editing.id)
@@ -1312,7 +1315,7 @@ function Parties() {
 
   const columns = [
     { label: 'S.No.', render: (r, i) => <span style={{ color: C.textMuted }}>{i + 1}</span> },
-    { label: 'Name',  render: r => <span style={{ fontWeight: 600 }}>{r.name}{!r.is_active && <span style={{ color: C.textMuted, fontWeight: 400 }}> (inactive)</span>}</span> },
+    { label: 'Name',  render: r => <span style={{ fontWeight: 600 }}>{r.name}{!r.is_active && <span style={{ color: C.textMuted, fontWeight: 400 }}> (inactive)</span>}{r.rcm_applicable && <span style={{ color: C.accent, fontWeight: 400 }}> · RCM</span>}</span> },
     { label: 'GSTIN', render: r => <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{r.gstin || '—'}</span> },
     { label: 'Contact', render: r => <span style={{ fontSize: '12px', color: C.textMid }}>{r.contact_person || r.phone || '—'}</span> },
     { label: 'Payment', render: r => <span style={{ fontSize: '12px' }}>{r.payment_days != null ? `${r.payment_days} days` : (r.payment_terms || '—')}</span> },
@@ -1358,6 +1361,14 @@ function Parties() {
                 <option value='inactive'>Inactive</option>
               </Select>
             </FormRow>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <input type='checkbox' id='party_rcm' checked={form.rcm_applicable}
+              onChange={e => setF('rcm_applicable', e.target.checked)}
+              style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+            <label htmlFor='party_rcm' style={{ fontSize: '13px', fontWeight: 600, cursor: 'pointer' }}>
+              RCM applicable (bills without GST — e.g. GTA/transporter)
+            </label>
           </div>
           <FormRow label='Address'><Textarea value={form.address} onChange={e => setF('address', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>

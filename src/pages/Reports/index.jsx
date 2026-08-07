@@ -178,17 +178,30 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
 
     // CHANGED: GST-bearing expenses give input tax credit too — pulled in so the
     // month-wise net payable reflects real cash outflow, not sales−purchases only.
+    // is_rcm=false excludes RCM expenses (self-assessed GST, tracked as a
+    // liability below, not ordinary ITC) — belt-and-braces alongside
+    // gt('gst_amount',0), since RCM expenses now save gst_amount=0 anyway.
     let expensesQ = supabase.from('expenses')
       .select('gst_amount,expense_date')
-      .eq('entity_id', entityId).eq('is_deleted', false).gt('gst_amount', 0)
+      .eq('entity_id', entityId).eq('is_deleted', false).eq('is_rcm', false).gt('gst_amount', 0)
+
+    // CHANGED: RCM (Reverse Charge) — self-assessed GST on expenses like GTA
+    // freight where the vendor charges no GST. This is an output-tax
+    // liability owed to the government, paid in cash, and only later
+    // claimed back as ITC — reported separately, never folded into
+    // expenseITC above.
+    let rcmQ = supabase.from('expenses')
+      .select('rcm_gst_amount,expense_date,rcm_paid_date,rcm_itc_claimed_date')
+      .eq('entity_id', entityId).eq('is_deleted', false).eq('is_rcm', true).gt('rcm_gst_amount', 0)
 
     if (fyFilter) {
       salesQ     = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
       purchasesQ = purchasesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
       expensesQ  = expensesQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
+      rcmQ       = rcmQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
     }
 
-    const [{ data: sales }, { data: purchases }, { data: expenses }] = await Promise.all([salesQ, purchasesQ, expensesQ])
+    const [{ data: sales }, { data: purchases }, { data: expenses }, { data: rcmRows }] = await Promise.all([salesQ, purchasesQ, expensesQ, rcmQ])
 
     // CHANGED: month-wise breakdown for GST cash-flow planning. Output tax on
     // sales less ITC from BOTH purchase invoices and GST-bearing expenses, per
@@ -196,15 +209,22 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
     // carries forward).
     const monthly = {}
     const mKey = d => (d || '').slice(0, 7)  // YYYY-MM
-    const ensureM = k => (monthly[k] || (monthly[k] = { output: 0, purchaseITC: 0, expenseITC: 0 }))
+    const ensureM = k => (monthly[k] || (monthly[k] = { output: 0, purchaseITC: 0, expenseITC: 0, rcmLiability: 0 }))
     ;(sales || []).forEach(i => { ensureM(mKey(i.invoice_date)).output      += (i.cgst_amount + i.sgst_amount + i.igst_amount) })
     ;(purchases || []).forEach(i => { ensureM(mKey(i.invoice_date)).purchaseITC += (i.cgst_amount + i.sgst_amount + i.igst_amount) })
     ;(expenses || []).forEach(e => { ensureM(mKey(e.expense_date)).expenseITC  += (e.gst_amount || 0) })
+    // CHANGED: RCM liability shown per month for cash-flow planning, but never
+    // subtracted in `net` below — RCM must be paid in cash, it can't be offset
+    // against ITC, so it doesn't reduce what's payable on regular sales/purchases.
+    ;(rcmRows || []).forEach(r => { ensureM(mKey(r.expense_date)).rcmLiability += (r.rcm_gst_amount || 0) })
     const monthlyRows = Object.keys(monthly).sort().map(k => {
       const m = monthly[k]
-      return { month: k, output: m.output, purchaseITC: m.purchaseITC, expenseITC: m.expenseITC, net: Math.max(0, m.output - m.purchaseITC - m.expenseITC) }
+      return { month: k, output: m.output, purchaseITC: m.purchaseITC, expenseITC: m.expenseITC, rcmLiability: m.rcmLiability, net: Math.max(0, m.output - m.purchaseITC - m.expenseITC) }
     })
     const expenseITC = (expenses || []).reduce((s, e) => s + (e.gst_amount || 0), 0)
+    const rcmLiability = (rcmRows || []).reduce((s, r) => s + (r.rcm_gst_amount || 0), 0)
+    const rcmPaid       = (rcmRows || []).filter(r => r.rcm_paid_date).reduce((s, r) => s + (r.rcm_gst_amount || 0), 0)
+    const rcmClaimed    = (rcmRows || []).filter(r => r.rcm_itc_claimed_date).reduce((s, r) => s + (r.rcm_gst_amount || 0), 0)
 
     // Output tax
     const outputTaxable = (sales || []).reduce((s, i) => s + i.taxable_amount, 0)
@@ -225,6 +245,7 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
     setData({
       outputTaxable, outputCGST, outputSGST, outputIGST, inputTaxable, inputCGST, inputSGST, inputIGST, payableCGST, payableSGST, payableIGST,
       expenseITC, monthlyRows, // CHANGED: expense ITC + month-wise planning table
+      rcmLiability, rcmPaid, rcmClaimed, // CHANGED: RCM — reported separately, never netted into ITC
       // TDS/TCS moved to its own report (Compliance → TDS/TCS Report), which
       // aggregates invoice_payments + credit_debit_notes + expenses — this
       // card used to read only the now-legacy tds_tcs_entries table.
@@ -293,6 +314,20 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
         </div>
       )}
 
+      {data && data.rcmLiability > 0 && (
+        <Card>
+          <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>
+            RCM (Reverse Charge) — self-assessed, paid in cash, claimed as ITC separately
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px,1fr))', gap: '12px', padding: '14px 16px' }}>
+            <StatCard label='RCM Liability (period)' value={formatINR(data.rcmLiability)} color={C.danger} />
+            <StatCard label='Paid to Govt' value={formatINR(data.rcmPaid)} color={C.success} />
+            <StatCard label='ITC Claimed' value={formatINR(data.rcmClaimed)} color={C.success} />
+            <StatCard label='Pending to Claim' value={formatINR(data.rcmPaid - data.rcmClaimed)} color={C.warning} />
+          </div>
+        </Card>
+      )}
+
       {data && (
         <Card>
           <div style={{ padding: '12px 16px', fontWeight: 700, fontSize: '14px', borderBottom: `1px solid ${C.border}` }}>Month-wise GST (cash-flow planning)</div>
@@ -303,17 +338,19 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
                 <th style={thStyle}>Output Tax</th>
                 <th style={thStyle}>Purchase ITC</th>
                 <th style={thStyle}>Expense ITC</th>
+                <th style={thStyle}>RCM Liability</th>
                 <th style={thStyle}>Net Payable</th>
               </tr></thead>
               <tbody>
                 {data.monthlyRows.length === 0
-                  ? <tr><td colSpan={5} style={{ padding: '18px', textAlign: 'center', color: C.textMuted }}>No taxable activity in this period.</td></tr>
+                  ? <tr><td colSpan={6} style={{ padding: '18px', textAlign: 'center', color: C.textMuted }}>No taxable activity in this period.</td></tr>
                   : data.monthlyRows.map(m => (
                     <tr key={m.month}>
                       <td style={{ padding: '10px 14px', fontWeight: 600 }}>{monthLabel(m.month)}</td>
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.output)}</td>
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.purchaseITC)}</td>
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.expenseITC)}</td>
+                      <td style={{ padding: '10px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.rcmLiability)}</td>
                       <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, color: m.net > 0 ? C.danger : C.success, fontVariantNumeric: 'tabular-nums' }}>{formatINR(m.net)}</td>
                     </tr>
                   ))}
@@ -325,6 +362,7 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
                     <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.output, 0))}</td>
                     <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.purchaseITC, 0))}</td>
                     <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.expenseITC, 0))}</td>
+                    <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.rcmLiability, 0))}</td>
                     <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: C.danger }}>{formatINR(data.monthlyRows.reduce((s, m) => s + m.net, 0))}</td>
                   </tr>
                 </tfoot>
