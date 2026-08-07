@@ -5,7 +5,7 @@ import {
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, StatCard, CsvFileDrop,
 } from '../../components/UI/index'
 import { formatINR, toNum, round2 } from '../../utils/money'
-import { fmtDate, today } from '../../utils/dates'
+import { fmtDate, today, parseFlexibleDate } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
 // LineItemsEditor's stockMap) instead of duplicating it here.
@@ -188,10 +188,12 @@ function OpeningStock() {
       const entity = entities.find(e => e.short_name?.toLowerCase() === row.entity?.toLowerCase() || e.name?.toLowerCase() === row.entity?.toLowerCase())
       const productName = norm(row.product)
       const fy = fys.find(f => f.name?.toLowerCase() === row.fy?.toLowerCase())
+      const asOfDate = row.as_of_date ? parseFlexibleDate(row.as_of_date) : today()
       if (!entity)      { errors.push(`Row ${rowNum}: entity "${row.entity}" not found`); continue }
       if (!productName) { errors.push(`Row ${rowNum}: product name is required`); continue }
       if (!fy)          { errors.push(`Row ${rowNum}: FY "${row.fy}" not found — fill in the fy column`); continue }
-      parsed.push({ rowNum, row, entity, productName, fy })
+      if (!asOfDate)    { errors.push(`Row ${rowNum}: as_of_date "${row.as_of_date}" is not a valid date — use YYYY-MM-DD`); continue }
+      parsed.push({ rowNum, row, entity, productName, fy, asOfDate })
     }
 
     // Phase 2 — bulk-create any missing products in one request
@@ -248,7 +250,7 @@ function OpeningStock() {
           qty, unit: p.row.unit || product.unit || null, rate: toNum(p.row.rate),
           hsn_code: p.row.hsn_code || product.hsn_code || null,
           gst_rate: p.row.gst_rate ? toNum(p.row.gst_rate) : (product.gst_rate != null ? product.gst_rate : null),
-          as_of_date: p.row.as_of_date || today(),
+          as_of_date: p.asOfDate,
           _label: label,
         })
       }
@@ -674,16 +676,18 @@ function StockAdjustments() {
       const product = findProductByName(products, row.product)
       const qty = toNum(row.qty)
       const reason = (row.reason || '').toLowerCase()
+      const adjustmentDate = row.adjustment_date ? parseFlexibleDate(row.adjustment_date) : today()
       if (!entity)  { errors.push(`Row ${rowNum}: entity "${row.entity}" not found or not accessible to you`); continue }
       if (!product) { errors.push(`Row ${rowNum}: product "${row.product}" not found — add it under Stock > Products first`); continue }
       if (!qty)     { errors.push(`Row ${rowNum}: qty must be a non-zero number`); continue }
       if (!validReasons.includes(reason)) { errors.push(`Row ${rowNum}: reason must be one of ${validReasons.join(', ')}`); continue }
+      if (!adjustmentDate) { errors.push(`Row ${rowNum}: adjustment_date "${row.adjustment_date}" is not a valid date — use YYYY-MM-DD`); continue }
       // Offloading can only remove stock (matches the DB check constraint) —
       // catch it here with a clear message rather than a raw insert error.
       if (reason === 'offloaded' && qty > 0) { errors.push(`Row ${rowNum}: "offloaded" qty must be negative (it can only remove stock, e.g. -5)`); continue }
       payloads.push({
         entity_id: entity.id, product_name: product.name, qty_delta: qty, reason,
-        adjustment_date: row.adjustment_date || today(), notes: row.notes || null,
+        adjustment_date: adjustmentDate, notes: row.notes || null,
         created_by: profile?.id || null,
       })
     }
