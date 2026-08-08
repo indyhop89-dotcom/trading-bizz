@@ -561,7 +561,10 @@ export function CardHeader({ title, action, children }) {
 }
 
 // ─── Table ────────────────────────────────────────────────────────────────────
-export function Table({ columns, rows, onRowClick, emptyState, sortKey, sortDir, onSort }) {
+// CHANGED: optional `filterRow` — a <tr> of per-column filter controls
+// rendered directly under the header, Excel-style. Purely additive (default
+// undefined renders nothing) so every existing caller is unaffected.
+export function Table({ columns, rows, onRowClick, emptyState, sortKey, sortDir, onSort, filterRow }) {
   if (!rows || rows.length === 0) {
     return emptyState || <EmptyState title='No records found' message='Try adjusting your filters or create a new record.' />
   }
@@ -606,6 +609,7 @@ export function Table({ columns, rows, onRowClick, emptyState, sortKey, sortDir,
               </th>
             ))}
           </tr>
+          {filterRow}
         </thead>
         <tbody>
           {rows.map((row, ri) => (

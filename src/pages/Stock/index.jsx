@@ -116,6 +116,12 @@ function OpeningStock() {
       // again. actual_qty is already a running total across every opening
       // entry, invoice and adjustment, so it alone correctly reflects
       // whether stock is on hand RIGHT NOW — that's the only signal needed.
+      // CHANGED (see migration 052/053): actual_qty itself no longer counts
+      // offloaded adjustments, so it stopped reaching zero for a purely-
+      // offloaded row. offloaded_qty is added back in below (net_of_offloaded)
+      // purely as the local signal this "hide offloaded" toggle checks — a
+      // live number, not a permanent flag, so a genuine restock after an
+      // offload still un-hides the row correctly.
       fetchActualStockPosition(asOfDate || null),
     ])
     // CHANGED: product identity is now NAME (migration 046) — look the
@@ -130,6 +136,7 @@ function OpeningStock() {
         ...r,
         product: productByName.get(r.product_name) || null,
         actual_qty: am ? am.actual_qty : toNum(r.qty),
+        net_of_offloaded: am ? am.actual_qty + am.offloaded_qty : toNum(r.qty),
       }
     }))
     setEntities(es || [])
@@ -322,11 +329,13 @@ function OpeningStock() {
   const filtered = rows
     .filter(r => !entityFilter || r.entity_id === entityFilter)
     .filter(r => !asOfDate || !r.as_of_date || r.as_of_date <= asOfDate)
-    // CHANGED: epsilon instead of exact !== 0 — actual_qty is a sum of several
-    // decimal columns (opening qty, invoice qty, adjustment qty), so a fully
-    // offloaded/sold-out row can land on something like 0.0000000001 instead
-    // of exact 0 and wrongly stay visible.
-    .filter(r => !hideOffloaded || Math.abs(r.actual_qty) > 0.001)
+    // CHANGED: checks net_of_offloaded (actual_qty + offloaded_qty), not
+    // actual_qty alone — actual_qty no longer counts offloaded adjustments
+    // (migration 052), so it never reaches zero for a purely-offloaded row
+    // on its own. Epsilon instead of exact !== 0 — this is a sum of several
+    // decimal columns, so a fully offloaded/sold-out row can land on
+    // something like 0.0000000001 instead of exact 0 and wrongly stay visible.
+    .filter(r => !hideOffloaded || Math.abs(r.net_of_offloaded) > 0.001)
 
   // CHANGED: download of the (filtered) opening-stock rows. Columns lead with
   // the exact upload format (entity,product,fy,qty,unit,rate,hsn_code,
@@ -583,6 +592,12 @@ function StockAdjustments() {
   const [entities, setEntities] = useState([])
   const [products, setProducts] = useState([])
   const [entityFilter, setEntityFilter] = useState('')
+  // CHANGED: offloaded stock (out of the system for good) reads as just
+  // another row among shortfall/damage/found/recount corrections otherwise —
+  // a reason filter plus its own StatCard makes it visible as its own thing
+  // without changing what it does to actual_qty (unchanged: it still reduces
+  // it, same as it always has).
+  const [reasonFilter, setReasonFilter] = useState('')
   const [loading, setLoading]   = useState(true)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing]   = useState(null)
@@ -758,7 +773,26 @@ function StockAdjustments() {
     setCsvSaving(false)
   }
 
-  const filtered = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
+  const filtered = rows
+    .filter(r => !entityFilter || r.entity_id === entityFilter)
+    .filter(r => !reasonFilter || r.reason === reasonFilter)
+
+  // CHANGED: offloaded broken out from every other reason — sums qty per
+  // unit (Nos/Mts/etc. can't be added together meaningfully), scoped to the
+  // entity filter but not the reason filter, so the StatCards keep showing
+  // the full offloaded-vs-other split even while the table itself is
+  // narrowed to one reason.
+  function sumByUnit(list) {
+    const m = {}
+    for (const r of list) {
+      const u = r.product?.unit || 'Nos'
+      m[u] = (m[u] || 0) + Math.abs(toNum(r.qty_delta))
+    }
+    return Object.entries(m).map(([u, q]) => `${q.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${u}`).join(' • ') || '0'
+  }
+  const entityOnly = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
+  const offloadedRows = entityOnly.filter(r => r.reason === 'offloaded')
+  const otherRows = entityOnly.filter(r => r.reason !== 'offloaded')
 
   // CHANGED: download of the (filtered) adjustment history — columns lead
   // with the upload format (entity,product,qty,reason,adjustment_date,notes)
@@ -804,11 +838,24 @@ function StockAdjustments() {
 
   return (
     <div>
+      {/* CHANGED: offloaded (out of the system for good) broken out from
+          every other adjustment reason — same underlying data, just no
+          longer buried in one undifferentiated total. */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: '12px', marginBottom: '20px' }}>
+        <StatCard label='Offloaded (out of system)' value={sumByUnit(offloadedRows)} sub={`${offloadedRows.length} row${offloadedRows.length === 1 ? '' : 's'}`} />
+        <StatCard label='Other Adjustments' value={sumByUnit(otherRows)} sub={`${otherRows.length} row${otherRows.length === 1 ? '' : 's'}`} />
+      </div>
+
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center' }}>
         <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
           style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <select value={reasonFilter} onChange={e => setReasonFilter(e.target.value)}
+          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All reasons</option>
+          {ADJUSTMENT_REASONS.map(r => <option key={r.value} value={r.value}>{r.label.split(' (')[0]}</option>)}
         </select>
         <div style={{ flex: 1 }} />
         <Btn variant='ghost' onClick={handleExportAdjustmentsCSV}>↓ Export CSV</Btn>
@@ -949,6 +996,15 @@ function StockPosition() {
   // underlying line items, plus a grand total) so a multi-entity "All
   // entities" list isn't just one long undifferentiated table.
   const [categoryFilter, setCategoryFilter] = useState('')
+  // CHANGED: free-text filter on product name/HSN — the entity/category/FY
+  // dropdowns above narrow by a known dimension, but there was no way to jump
+  // straight to a specific product in a list that can run to hundreds of rows.
+  const [search, setSearch] = useState('')
+  // CHANGED: per-column filter row on the ungrouped detail table (Excel-
+  // style) — unitFilter is new here; Entity/Category reuse the existing
+  // entityFilter/categoryFilter state so the row and the controls above it
+  // never disagree.
+  const [unitFilter, setUnitFilter] = useState('')
   const [groupBy, setGroupBy] = useState('none')
   // CHANGED: sold-out products (actual stock exactly 0 — everything on hand
   // has moved out, nothing wrong) clutter the table once a business has been
@@ -1050,14 +1106,31 @@ function StockPosition() {
     // CHANGED: product identity is now NAME (migration 046) — select
     // product_name directly and resolve the product master client-side
     // (productByName below) rather than embedding via product_id.
-    const { data: opening } = await fetchAllPages(() => {
+    // CHANGED: opening balances aren't re-entered every FY — an entity/product
+    // opened in an earlier year with no fresh entry since would silently show
+    // Opening Qty 0 for the selected FY even though Actual Qty (all-time,
+    // below) already counts that same entry. Fetch across all FYs (not just
+    // fyFilter) and, per entity+product, keep only the latest entry at or
+    // before the selected FY — same "carries forward until restated" logic
+    // as an opening balance, without summing/double-counting separate years.
+    const { data: openingAllFYs } = await fetchAllPages(() => {
       let q = supabase.from('stock_opening_balance')
         .select('*, entity:entity_id(name,short_name)')
-        .eq('financial_year_id', fyFilter)
         .order('id')
       if (entityFilter) q = q.eq('entity_id', entityFilter)
       return q
     })
+    const fyStartById = Object.fromEntries(fys.map(f => [f.id, f.start_date]))
+    const selectedFyStart = fyStartById[fyFilter]
+    const latestOpeningByKey = {}
+    for (const ob of (openingAllFYs || [])) {
+      const obStart = fyStartById[ob.financial_year_id]
+      if (selectedFyStart && obStart > selectedFyStart) continue
+      const key = `${ob.entity_id}__${ob.product_name}`
+      const prev = latestOpeningByKey[key]
+      if (!prev || obStart > fyStartById[prev.financial_year_id]) latestOpeningByKey[key] = ob
+    }
+    const opening = Object.values(latestOpeningByKey)
 
     // Get PIs — incoming and outgoing per entity+product
     // Planned stock = opening + incoming PI qty - outgoing PI qty
@@ -1175,6 +1248,12 @@ function StockPosition() {
         actual_invoiced_in:  am ? am.invoiced_in  : 0,
         actual_invoiced_out: am ? am.invoiced_out : 0,
         actual_adjustment:   am ? am.adjustment_qty : 0,
+        // CHANGED (see migration 052/053): actual_qty no longer counts
+        // offloaded adjustments, so it alone can't tell "hide sold-out
+        // products" whether a row is genuinely gone — add offloaded_qty
+        // back in locally just for that toggle, without changing what
+        // actual_qty itself means everywhere else on this page.
+        net_of_offloaded: actual_qty + (am ? am.offloaded_qty : 0),
         billed_beyond_stock: NEGATIVE_STOCK_FLAG_ENABLED && actual_qty < 0,
       }
     })
@@ -1184,16 +1263,22 @@ function StockPosition() {
 
     setPosition(rows)
     setLoading(false)
-  }, [entityFilter, fyFilter, entities, products, asOfDate])
+  }, [entityFilter, fyFilter, entities, products, asOfDate, fys])
 
   useEffect(() => { loadPosition() }, [loadPosition])
 
   // CHANGED: category filter applied client-side (product.category comes
   // through the join, not filterable server-side without a second query)
   const categories = [...new Set(position.map(r => r.product?.category).filter(Boolean))].sort()
+  const units = [...new Set(position.map(r => r.product?.unit).filter(Boolean))].sort()
+  const searchTerm = search.trim().toLowerCase()
   const categoryOnlyFiltered = position
     .filter(r => !categoryFilter || r.product?.category === categoryFilter)
-    .filter(r => !hideSoldOut || r.actual_qty !== 0)
+    .filter(r => !unitFilter || r.product?.unit === unitFilter)
+    // CHANGED: checks net_of_offloaded, not actual_qty — see its definition
+    // above for why (offloaded no longer moves actual_qty since migration 052).
+    .filter(r => !hideSoldOut || r.net_of_offloaded !== 0)
+    .filter(r => !searchTerm || r.product?.name?.toLowerCase().includes(searchTerm) || r.product?.hsn_code?.toLowerCase().includes(searchTerm))
 
   // CHANGED: counts always reflect the category filter only, never the status
   // toggle itself — otherwise clicking "Shortfalls" would make its own count
@@ -1217,8 +1302,9 @@ function StockPosition() {
     const map = {}
     for (const r of rows) {
       const key = keyFn(r) || 'Uncategorised'
-      if (!map[key]) map[key] = { key, qty: 0, value: 0, actualValue: 0, items: [] }
-      map[key].qty         += toNum(r.actual_qty)
+      if (!map[key]) map[key] = { key, qtyByUnit: {}, value: 0, actualValue: 0, items: [] }
+      const u = r.product?.unit || 'Nos'
+      map[key].qtyByUnit[u] = (map[key].qtyByUnit[u] || 0) + toNum(r.actual_qty)
       map[key].value       += toNum(r.opening_qty) * toNum(r.rate)
       map[key].actualValue += toNum(r.actual_qty) * toNum(r.actual_rate)
       map[key].items.push(r)
@@ -1231,9 +1317,18 @@ function StockPosition() {
     ? buildGroupedRows(filteredPosition, r => r.entity?.short_name || r.entity?.name)
     : []
   const groupLabel = groupBy === 'entity' ? 'Entity' : 'Category'
-  const grandTotal = groupedRows.reduce((s, g) => ({
-    products: s.products + g.items.length, qty: s.qty + g.qty, value: s.value + g.value, actualValue: s.actualValue + g.actualValue,
-  }), { products: 0, qty: 0, value: 0, actualValue: 0 })
+  const grandTotal = groupedRows.reduce((s, g) => {
+    const qtyByUnit = { ...s.qtyByUnit }
+    for (const [u, q] of Object.entries(g.qtyByUnit)) qtyByUnit[u] = (qtyByUnit[u] || 0) + q
+    return { products: s.products + g.items.length, qtyByUnit, value: s.value + g.value, actualValue: s.actualValue + g.actualValue }
+  }, { products: 0, qtyByUnit: {}, value: 0, actualValue: 0 })
+  // CHANGED: one Qty column per unit instead of a single "17,500 Mts • 29,000
+  // Nos" string — cramming mixed units into one cell read as confusing/messy.
+  // Nos/Mts (the two units this business actually deals in) lead; anything
+  // else found in the data still gets its own column, alphabetically after.
+  const UNIT_ORDER = { Nos: 0, Mts: 1 }
+  const allUnits = [...new Set(groupedRows.flatMap(g => Object.keys(g.qtyByUnit)))]
+    .sort((a, b) => (UNIT_ORDER[a] ?? 99) - (UNIT_ORDER[b] ?? 99) || a.localeCompare(b))
 
   const totalValue       = filteredPosition.reduce((s, r) => s + toNum(r.opening_qty) * toNum(r.rate), 0)
   // CHANGED: Actual Stock is the headline number on this page now (see the
@@ -1299,6 +1394,45 @@ function StockPosition() {
       </div>
     )},
   ]
+
+  // CHANGED: per-column filter row (Excel-style) under the header of the
+  // ungrouped detail table — Entity/Category reuse the same state as the
+  // dropdowns above so both stay in sync; Unit is new. Numeric/Product/Status
+  // columns are left blank (Product already has the free-text search above;
+  // filtering numeric columns wasn't asked for).
+  const filterCellStyle = { padding: '5px 12px', borderBottom: `1px solid ${C.border}`, background: C.bg }
+  const filterSelectStyle = { width: '100%', padding: '4px 6px', border: `1px solid ${C.border}`, borderRadius: '4px', background: C.surface, fontSize: '11px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }
+  const positionFilterRow = (
+    <tr>
+      <td style={filterCellStyle} />
+      <td style={filterCellStyle}>
+        <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
+          disabled={!isMaster && entities.length <= 1} style={filterSelectStyle}>
+          {isMaster && <option value=''>All</option>}
+          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+      </td>
+      <td style={filterCellStyle}>
+        <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)} style={filterSelectStyle}>
+          <option value=''>All</option>
+          {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+        </select>
+      </td>
+      <td style={filterCellStyle} />
+      <td style={filterCellStyle}>
+        <select value={unitFilter} onChange={e => setUnitFilter(e.target.value)} style={filterSelectStyle}>
+          <option value=''>All</option>
+          {units.map(u => <option key={u} value={u}>{u}</option>)}
+        </select>
+      </td>
+      <td style={filterCellStyle} />
+      <td style={filterCellStyle} />
+      <td style={filterCellStyle} />
+      <td style={filterCellStyle} />
+      <td style={filterCellStyle} />
+      <td style={filterCellStyle} />
+    </tr>
+  )
 
   function handleExportCSV() {
     // CHANGED: export the currently filtered rows (respects entity/category
@@ -1376,6 +1510,10 @@ function StockPosition() {
           <option value=''>All categories</option>
           {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
         </select>
+        {/* CHANGED: free-text product search — filters by name or HSN code */}
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search product or HSN…'
+          style={{ padding: '7px 12px', border: `1.5px solid ${search ? C.accent : C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit', width: '200px' }} />
+        {search && <Btn size='sm' variant='ghost' onClick={() => setSearch('')}>✕ Clear search</Btn>}
         {/* CHANGED: group-by summary — report-style subtotals (qty + value)
             per category or entity, expandable to line items, with a grand
             total. Mutually exclusive; click the active one again to clear. */}
@@ -1416,7 +1554,7 @@ function StockPosition() {
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
               <thead>
                 <tr>
-                  {['', groupLabel, 'Products', 'Total Qty', 'Opening Value', 'Actual Value'].map((h, i) => (
+                  {['', groupLabel, 'Products', ...allUnits.map(u => `${u} Qty`), 'Opening Value', 'Actual Value'].map((h, i) => (
                     <th key={i} style={{
                       padding: '8px 12px', textAlign: i >= 2 ? 'right' : 'left',
                       fontSize: '11px', fontWeight: 700, color: '#9a8a6a',
@@ -1428,7 +1566,7 @@ function StockPosition() {
                 </tr>
               </thead>
               <tbody>
-                {groupedRows.map(({ key, qty, value, actualValue, items }) => {
+                {groupedRows.map(({ key, qtyByUnit, value, actualValue, items }) => {
                   const open = expandedGroups.has(key)
                   return (
                     <Fragment key={key}>
@@ -1436,13 +1574,17 @@ function StockPosition() {
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, color: C.textMuted, width: '24px' }}>{open ? '▾' : '▸'}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, fontWeight: 600 }}>{key}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', color: C.textMid }}>{items.length}</td>
-                        <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>{qty.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                        {allUnits.map(u => (
+                          <td key={u} style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>
+                            {qtyByUnit[u] != null ? Number(qtyByUnit[u]).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '—'}
+                          </td>
+                        ))}
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(value)}</td>
                         <td style={{ padding: '9px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(actualValue)}</td>
                       </tr>
                       {open && (
                         <tr>
-                          <td colSpan={6} style={{ padding: 0, borderBottom: `1px solid ${C.border}`, background: C.bg }}>
+                          <td colSpan={5 + allUnits.length} style={{ padding: 0, borderBottom: `1px solid ${C.border}`, background: C.bg }}>
                             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
                               <thead>
                                 <tr>
@@ -1483,7 +1625,11 @@ function StockPosition() {
                 <tr>
                   <td colSpan={2} style={{ padding: '10px 12px', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>Grand Total</td>
                   <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{grandTotal.products}</td>
-                  <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{grandTotal.qty.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</td>
+                  {allUnits.map(u => (
+                    <td key={u} style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>
+                      {grandTotal.qtyByUnit[u] != null ? Number(grandTotal.qtyByUnit[u]).toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '—'}
+                    </td>
+                  ))}
                   <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{formatINR(grandTotal.value)}</td>
                   <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, borderTop: `2px solid ${C.border}` }}>{formatINR(grandTotal.actualValue)}</td>
                 </tr>
@@ -1496,7 +1642,7 @@ function StockPosition() {
       <Card>
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Calculating stock position…</div>
-          : <Table columns={columns} rows={filteredPosition}
+          : <Table columns={columns} rows={filteredPosition} filterRow={positionFilterRow}
               emptyState={<EmptyState icon='📦' title={statusFilter ? 'No matching rows' : 'No stock data'} message={statusFilter ? 'Nothing matches this filter right now — try clearing it.' : 'Add opening stock first, then create PIs to see planned position.'} />}
             />
         }

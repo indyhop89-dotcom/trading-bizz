@@ -211,7 +211,7 @@ export const TEMPLATES = {
       '# product = must match an existing Product name exactly (Stock > Products) — not auto-created',
       '# qty     = signed number. Positive = stock increase (found/recount-up). Negative = stock decrease (shortfall/damage/recount-down/offloaded)',
       '# reason  = shortfall | damage | found | recount | offloaded | other',
-      '# offloaded = stock that is done being tracked here (sold outside the tool, disposed of, etc.) — qty must be negative. Only affects Actual Stock, never the P&L report.',
+      '# offloaded = stock that is done being tracked here (sold outside the tool, disposed of, etc.) — qty must be negative. Does NOT affect Actual Stock or the P&L report; tracked separately (see the Adjustments tab StatCards).',
       '# adjustment_date = YYYY-MM-DD format',
       '# notes   = optional free text',
     ],

@@ -371,6 +371,12 @@ function InvoiceList() {
       if (piIds.length) {
         await supabase.from('proforma_invoices').update({ status: 'accepted', converted_to_invoice_id: null }).in('id', piIds)
       }
+      // Same reopen for any linked PO — otherwise a bulk-deleted invoice
+      // leaves its PO stuck on 'completed'.
+      const poIds = invoices.filter(i => selected.has(i.id) && i.po_id).map(i => i.po_id)
+      if (poIds.length) {
+        await supabase.from('purchase_orders').update({ status: 'open' }).in('id', poIds)
+      }
     }
     setBulkDeleting(false)
     setConfirmBulkDelete(false)
@@ -831,6 +837,10 @@ function NewInvoice() {
     if (form.pi_id) {
       await supabase.from('proforma_invoices').update({ status: 'converted', converted_to_invoice_id: inv.id }).eq('id', form.pi_id)
     }
+    // Mark PO as completed if applicable — mirrors the PI conversion above.
+    if (form.po_id) {
+      await supabase.from('purchase_orders').update({ status: 'completed' }).eq('id', form.po_id)
+    }
 
     // CHANGED: no buyer-side purchase entry is created here anymore. Goods
     // haven't moved yet at submit time (physical movement only happens once
@@ -1179,6 +1189,11 @@ function InvoiceDetail() {
     // reopen it so it shows up as needing conversion again.
     if (!error && inv?.pi_id) {
       await supabase.from('proforma_invoices').update({ status: 'accepted', converted_to_invoice_id: null }).eq('id', inv.pi_id)
+    }
+    // Same reopen for a linked PO — otherwise a deleted invoice leaves its
+    // PO stuck on 'completed'.
+    if (!error && inv?.po_id) {
+      await supabase.from('purchase_orders').update({ status: 'open' }).eq('id', inv.po_id)
     }
     setDeleting(false); setConfirmDelete(false)
     if (error) return setToast({ message: error.message, type: 'error' })

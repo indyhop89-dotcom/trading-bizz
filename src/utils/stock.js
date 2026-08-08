@@ -59,11 +59,12 @@ export async function fetchStockMovementData() {
     // opening/invoice movements. Unlike invoice lines these have no
     // lifecycle gate (no draft/cancelled/E-way state to check) since an
     // adjustment row only exists once someone has actually recorded the
-    // correction. 'offloaded' rows are stock this tool is done tracking
-    // (sold/disposed of outside it) — they affect Actual Stock exactly like
-    // every other reason, but never P&L (Reports' P&L/Profitability tabs
-    // are computed purely from invoices/expenses, not stock_adjustments).
-    fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_name, qty_delta, adjustment_date')),
+    // correction. CHANGED (see migration 052): 'offloaded' rows (stock this
+    // tool is done tracking — sold/disposed of outside it) are deliberately
+    // EXCLUDED from actual_qty now — marking something offloaded is a
+    // reporting statement, not a stock movement this tool should keep
+    // subtracting. buildActualStockMap filters them out below.
+    fetchAllPages(() => supabase.from('stock_adjustments').select('entity_id, product_name, qty_delta, adjustment_date, reason')),
   ])
   return {
     opening: opening || [],
@@ -97,16 +98,34 @@ export async function fetchStockMovementData() {
   }
 }
 
-// Builds { "entityId__productName": { entity_id, product_name, opening_qty, invoiced_in, invoiced_out, adjustment_qty, actual_qty } }
-// actual_qty = opening + goods invoiced in (as buyer) - goods invoiced out (as seller) + manual adjustments
+// Builds { "entityId__productName": { entity_id, product_name, opening_qty, invoiced_in, invoiced_out, adjustment_qty, offloaded_qty, actual_qty } }
+// actual_qty = opening + goods invoiced in (as buyer) - goods invoiced out (as seller) + manual
+// adjustments (every reason EXCEPT 'offloaded' — see migration 052). offloaded_qty is tracked
+// separately (always <= 0) — see migration 053 / notes on OpeningStock's hideOffloaded and
+// StockPosition's hideSoldOut in Stock/index.jsx for why a caller might still need it.
 export function buildActualStockMap({ opening, invLines, adjustments = [] }) {
   const map = {}
   function ensure(entityId, productName) {
     const key = `${entityId}__${productName}`
-    if (!map[key]) map[key] = { entity_id: entityId, product_name: productName, opening_qty: 0, invoiced_in: 0, invoiced_out: 0, adjustment_qty: 0 }
+    if (!map[key]) map[key] = { entity_id: entityId, product_name: productName, opening_qty: 0, invoiced_in: 0, invoiced_out: 0, adjustment_qty: 0, offloaded_qty: 0 }
     return map[key]
   }
+  // CHANGED (see migration 051): stock_opening_balance is a restated
+  // snapshot re-entered per financial year (UNIQUE entity+product+FY), not a
+  // per-year delta — summing every row an entity+product has ever had double/
+  // triple-counts opening stock once it's been carried into a second FY.
+  // Keep only the latest (by as_of_date) row per entity+product, same
+  // contract the server-side RPC now uses. Undated rows never outrank a
+  // dated one; on a tie, later array position wins.
+  const latestOpening = {}
   for (const ob of opening) {
+    const key = `${ob.entity_id}__${ob.product_name}`
+    const prev = latestOpening[key]
+    if (!prev || !prev.as_of_date || (ob.as_of_date && ob.as_of_date >= prev.as_of_date)) {
+      latestOpening[key] = ob
+    }
+  }
+  for (const ob of Object.values(latestOpening)) {
     ensure(ob.entity_id, ob.product_name).opening_qty += toNum(ob.qty)
   }
   for (const line of invLines) {
@@ -115,7 +134,9 @@ export function buildActualStockMap({ opening, invLines, adjustments = [] }) {
     ensure(line.invoice.buyer_entity_id, line.product_name).invoiced_in   += qty
   }
   for (const adj of adjustments) {
-    ensure(adj.entity_id, adj.product_name).adjustment_qty += toNum(adj.qty_delta)
+    const row = ensure(adj.entity_id, adj.product_name)
+    if (adj.reason === 'offloaded') row.offloaded_qty += toNum(adj.qty_delta)
+    else row.adjustment_qty += toNum(adj.qty_delta)
   }
   for (const row of Object.values(map)) {
     row.actual_qty = row.opening_qty + row.invoiced_in - row.invoiced_out + row.adjustment_qty
@@ -212,6 +233,7 @@ export async function fetchActualStockPosition(asOfDate = null) {
           entity_id: row.entity_id, product_name: row.product_name,
           opening_qty: toNum(row.opening_qty), invoiced_in: toNum(row.invoiced_in),
           invoiced_out: toNum(row.invoiced_out), adjustment_qty: toNum(row.adjustment_qty),
+          offloaded_qty: toNum(row.offloaded_qty),
           actual_qty: toNum(row.actual_qty), last_purchase_rate: toNum(row.last_purchase_rate),
         }
       }

@@ -19,6 +19,85 @@ describe('buildActualStockMap — scenario A: opening stock only', () => {
   })
 })
 
+describe('buildActualStockMap — offloaded adjustments are excluded from actual_qty', () => {
+  it('a decrease adjustment with reason "offloaded" does not reduce actual_qty', () => {
+    const map = buildActualStockMap({
+      opening: [{ entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 100 }],
+      invLines: [],
+      adjustments: [{ entity_id: ENTITY_A, product_name: PRODUCT_1, qty_delta: -40, reason: 'offloaded' }],
+    })
+    expect(map[`${ENTITY_A}__${PRODUCT_1}`].actual_qty).toBe(100) // not 60
+  })
+
+  it('other adjustment reasons (shortfall/damage/found/recount/other) still apply normally', () => {
+    const map = buildActualStockMap({
+      opening: [{ entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 100 }],
+      invLines: [],
+      adjustments: [
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty_delta: -5, reason: 'shortfall' },
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty_delta: 10, reason: 'found' },
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty_delta: -40, reason: 'offloaded' },
+      ],
+    })
+    expect(map[`${ENTITY_A}__${PRODUCT_1}`].actual_qty).toBe(105) // 100 - 5 + 10, offloaded excluded
+  })
+
+  it('tracks offloaded_qty separately so callers can still detect a fully-offloaded row (net_of_offloaded = actual_qty + offloaded_qty)', () => {
+    const map = buildActualStockMap({
+      opening: [{ entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 40 }],
+      invLines: [],
+      adjustments: [{ entity_id: ENTITY_A, product_name: PRODUCT_1, qty_delta: -40, reason: 'offloaded' }],
+    })
+    const row = map[`${ENTITY_A}__${PRODUCT_1}`]
+    expect(row.actual_qty).toBe(40)
+    expect(row.offloaded_qty).toBe(-40)
+    expect(row.actual_qty + row.offloaded_qty).toBe(0) // net_of_offloaded — what the hide-toggles check
+  })
+
+  it('a genuine restock after an offload is visible via net_of_offloaded, not permanently hidden', () => {
+    // Regression guard for the exact bug the old "ever offloaded" flag had:
+    // offload everything, then restock — net_of_offloaded must reflect the
+    // restock, not stay stuck at zero forever.
+    const map = buildActualStockMap({
+      opening: [{ entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 40 }],
+      invLines: [],
+      adjustments: [
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty_delta: -40, reason: 'offloaded' },
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty_delta: 25, reason: 'found' }, // genuine restock
+      ],
+    })
+    const row = map[`${ENTITY_A}__${PRODUCT_1}`]
+    expect(row.actual_qty + row.offloaded_qty).toBe(25)
+  })
+})
+
+describe('buildActualStockMap — regression: opening balance restated across multiple FYs must not sum', () => {
+  it('keeps only the latest (by as_of_date) opening row per entity+product, not the total of every FY it was ever entered in', () => {
+    // stock_opening_balance allows one row per (entity, product, FY) — an
+    // entity/product opened in FY24 and restated again in FY25 has TWO rows.
+    // These are snapshots, not deltas: only the newer one is real stock.
+    const map = buildActualStockMap({
+      opening: [
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 29000, as_of_date: '2024-04-01' },
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 17500, as_of_date: '2025-04-01' },
+      ],
+      invLines: [],
+    })
+    expect(map[`${ENTITY_A}__${PRODUCT_1}`].actual_qty).toBe(17500) // not 46500
+  })
+
+  it('an undated row never outranks a dated one, regardless of array order', () => {
+    const map = buildActualStockMap({
+      opening: [
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 17500, as_of_date: '2025-04-01' },
+        { entity_id: ENTITY_A, product_name: PRODUCT_1, qty: 29000, as_of_date: null },
+      ],
+      invLines: [],
+    })
+    expect(map[`${ENTITY_A}__${PRODUCT_1}`].actual_qty).toBe(17500)
+  })
+})
+
 describe('buildActualStockMap — scenario C: invoice without E-way Bill', () => {
   it('does not affect actual stock (fetchStockMovementData excludes it before this point, so a raw invLines list simulating that exclusion has zero rows)', () => {
     // fetchStockMovementData() is what filters by eway_bill_no presence —
