@@ -9,7 +9,7 @@ import { fmtDate, today, parseFlexibleDate } from '../../utils/dates'
 import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '../../utils/csvTemplate'
 // CHANGED: reuse the existing, tested actual-stock logic (already powers
 // LineItemsEditor's stockMap) instead of duplicating it here.
-import { fetchActualStockPosition, fetchPlannedStockPosition, fetchEntityAvailableStock, NEGATIVE_STOCK_FLAG_ENABLED } from '../../utils/stock'
+import { fetchActualStockPosition, fetchPlannedStockPosition, fetchEntityAvailableStock, deactivateFullyOffloadedProducts, NEGATIVE_STOCK_FLAG_ENABLED } from '../../utils/stock'
 import { ProductPicker } from '../../components/LineItemsEditor'
 import { cleanProductName, findProductByName, productKey } from '../../utils/products'
 // CHANGED: needed to know the current user's role/id for entity-access scoping
@@ -712,6 +712,10 @@ function StockAdjustments() {
       : await supabase.from('stock_adjustments').insert({ ...payload, created_by: profile?.id || null })
     setSaving(false)
     if (res.error) return setToast({ message: res.error.message, type: 'error' })
+    // CHANGED: once an 'offloaded' adjustment brings a product to zero
+    // everywhere it's ever been held, deactivate it — the user doesn't want
+    // fully-offloaded products cluttering pickers/lists once they're gone.
+    if (form.reason === 'offloaded') await deactivateFullyOffloadedProducts([form.product_name])
     setToast({ message: editing ? 'Adjustment updated' : 'Adjustment recorded', type: 'success' })
     setModalOpen(false)
     load()
@@ -768,6 +772,10 @@ function StockAdjustments() {
       if (error) errors.push(`Insert failed: ${error.message}`)
       else added = payloads.length
     }
+    // CHANGED: same auto-deactivation as the single-row save, for every
+    // offloaded product this batch touched.
+    const offloadedNames = payloads.filter(p => p.reason === 'offloaded').map(p => p.product_name)
+    if (offloadedNames.length) await deactivateFullyOffloadedProducts(offloadedNames)
     setCsvResult({ added, errors })
     await load()
     setCsvSaving(false)
@@ -1259,7 +1267,12 @@ function StockPosition() {
     })
     // CHANGED: hide rows with nothing to show — no opening, no PI movement, no
     // actual stock. These carry no information and just pad the table.
-    .filter(r => !(r.opening_qty === 0 && r.incoming === 0 && r.outgoing === 0 && r.actual_qty === 0))
+    // CHANGED: epsilon instead of exact === 0 — opening_qty/actual_qty are
+    // sums of many decimal invoice quantities, so a row that's genuinely
+    // empty (e.g. invoiced_in === invoiced_out) can land on something like
+    // 0.0000000001 instead of exact 0 and wrongly survive this filter,
+    // inflating a group's Products count with rows that display as 0.00.
+    .filter(r => Math.abs(r.opening_qty) > 0.001 || Math.abs(r.incoming) > 0.001 || Math.abs(r.outgoing) > 0.001 || Math.abs(r.actual_qty) > 0.001)
 
     setPosition(rows)
     setLoading(false)
@@ -1277,7 +1290,14 @@ function StockPosition() {
     .filter(r => !unitFilter || r.product?.unit === unitFilter)
     // CHANGED: checks net_of_offloaded, not actual_qty — see its definition
     // above for why (offloaded no longer moves actual_qty since migration 052).
-    .filter(r => !hideSoldOut || r.net_of_offloaded !== 0)
+    // CHANGED: epsilon instead of exact !== 0 — net_of_offloaded is a sum of
+    // invoice quantities with decimals (e.g. invoiced_in - invoiced_out both
+    // 38.5), so a genuinely sold-out row can land on something like
+    // 0.0000000001 instead of exact 0 and wrongly survive this filter —
+    // exactly what let a 1000+ fully-sold-through products pile up under one
+    // entity's "Products" count in the grouped view despite "Show sold-out
+    // products" being off.
+    .filter(r => !hideSoldOut || Math.abs(r.net_of_offloaded) > 0.001)
     .filter(r => !searchTerm || r.product?.name?.toLowerCase().includes(searchTerm) || r.product?.hsn_code?.toLowerCase().includes(searchTerm))
 
   // CHANGED: counts always reflect the category filter only, never the status

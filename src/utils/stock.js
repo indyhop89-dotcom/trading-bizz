@@ -247,6 +247,32 @@ export async function fetchActualStockPosition(asOfDate = null) {
   return actual
 }
 
+// Auto-deactivates products (is_active = false) once they're fully offloaded
+// everywhere — called after saving an 'offloaded' stock_adjustments row. Only
+// deactivates a product if EVERY entity that has ever touched it (opening,
+// invoice movement, or adjustment — i.e. every row fetchActualStockPosition
+// returns for that product) nets to zero once offloaded_qty is folded back
+// in. A product with no stock history anywhere is left untouched — this only
+// fires as a consequence of an actual offload, not as a general cleanup.
+// Product identity is NAME (migration 046), so this matches on product_name.
+export async function deactivateFullyOffloadedProducts(productNames) {
+  const names = [...new Set((productNames || []).filter(Boolean))]
+  if (!names.length) return
+  const map = await fetchActualStockPosition()
+  const rowsByProduct = {}
+  for (const row of Object.values(map)) {
+    if (!row.product_name || !names.includes(row.product_name)) continue
+    ;(rowsByProduct[row.product_name] ||= []).push(row)
+  }
+  const toDeactivate = names.filter(name => {
+    const rows = rowsByProduct[name]
+    return rows && rows.length > 0 && rows.every(r => Math.abs(r.actual_qty + r.offloaded_qty) < 0.001)
+  })
+  if (toDeactivate.length) {
+    await supabase.from('products').update({ is_active: false }).in('name', toDeactivate)
+  }
+}
+
 // Server-side aggregation for "Planned" (PI-based) stock — mirrors
 // fetchActualStockPosition() exactly, but for proforma_invoice_lines instead
 // of invoice_lines (see migration 048_stock_planned_position_rpc.sql). Before
