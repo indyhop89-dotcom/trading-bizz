@@ -61,3 +61,62 @@ export function groupTranchesByInvoice(tranches) {
   }
   return map
 }
+
+// Builds a single chronological cash-movement list for one entity, merging
+// standalone entity_payments rows with invoice_payments tranches where that
+// entity is either the payer (entity_id) or the payee/seller (party_entity_id)
+// — entities here routinely sell as well as buy, so a ledger scoped only to
+// entity_id would look empty for a primarily-selling entity. Balance = cash
+// in − cash out, starting at 0. No opening-balance concept — this is a simple
+// running total, not double-entry accounting.
+export function buildEntityLedger(entityId, { entityPayments = [], invoicePayments = [] } = {}) {
+  const rows = []
+
+  for (const p of entityPayments) {
+    if (p.entity_id === entityId) {
+      rows.push({
+        id: p.id, source: 'entity_payment', date: p.actual_payment_date,
+        counterpartyId: p.party_entity_id, counterpartyName: p.party_name,
+        inbound: p.direction === 'received', amount: toNum(p.amount), currency: p.currency,
+        category: p.category, notes: p.notes, raw: p,
+      })
+    } else if (p.party_entity_id === entityId) {
+      // Flip side: the OTHER entity's direction determines what this one experienced.
+      rows.push({
+        id: p.id, source: 'entity_payment', date: p.actual_payment_date,
+        counterpartyId: p.entity_id, counterpartyName: null,
+        inbound: p.direction !== 'received', amount: toNum(p.amount), currency: p.currency,
+        category: p.category, notes: p.notes, raw: p,
+      })
+    }
+  }
+
+  for (const t of invoicePayments) {
+    // Cash that actually moved: settled amount + TCS collected on top (TDS is
+    // withheld, not paid out — same reasoning as index.jsx's tranche modal).
+    const cash = toNum(t.amount) + toNum(t.tcs_amount)
+    if (t.entity_id === entityId) {
+      rows.push({
+        id: t.id, source: 'invoice_payment', date: t.actual_payment_date,
+        counterpartyId: t.party_entity_id, counterpartyName: t.party_name,
+        inbound: false, amount: cash, currency: t.currency,
+        invoiceNo: t.invoice_no, notes: t.notes, raw: t,
+      })
+    } else if (t.party_entity_id === entityId) {
+      rows.push({
+        id: t.id, source: 'invoice_payment', date: t.actual_payment_date,
+        counterpartyId: t.entity_id, counterpartyName: null,
+        inbound: true, amount: cash, currency: t.currency,
+        invoiceNo: t.invoice_no, notes: t.notes, raw: t,
+      })
+    }
+  }
+
+  rows.sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.id || '').localeCompare(b.id || ''))
+  let balance = 0
+  for (const r of rows) {
+    balance += r.inbound ? r.amount : -r.amount
+    r.runningBalance = balance
+  }
+  return rows
+}

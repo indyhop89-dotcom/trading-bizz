@@ -11,7 +11,7 @@ import { fmtDate, today } from '../../utils/dates'
 import { useAuth } from '../../hooks/useAuth'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { hasFullAccess } from '../../utils/roles'
-import { computeInvoiceOutstanding, syncInvoicePaymentStatus } from '../../utils/payments'
+import { computeInvoiceOutstanding, syncInvoicePaymentStatus, buildEntityLedger } from '../../utils/payments'
 import { excludeAutoPurchaseMirrors } from '../../utils/query'
 
 // ─── TDS / TCS constants ────────────────────────────────────────────────────────
@@ -999,6 +999,262 @@ function ExpensePaymentTracker() {
   )
 }
 
+// ─── Entity Payment Ledger ──────────────────────────────────────────────────
+// Per-entity running ledger merging standalone (non-invoice) entity_payments
+// entries with invoice_payments tranches — including tranches where the
+// entity is the SELLER being paid (party_entity_id match), not just the
+// buyer, so the ledger is complete for entities that both buy and sell. See
+// buildEntityLedger (utils/payments.js) for the merge/balance logic itself.
+const ENTPAY_CATEGORIES = ['Advance', 'Loan', 'Capital Infusion', 'Refund', 'Bank Transfer', 'Other']
+
+const EMPTY_ENTPAY = {
+  entity_id: '', party_entity_id: '', party_name: '',
+  direction: 'paid', category: '', currency: 'INR', exchange_rate: '1',
+  amount: '', reference_no: '', actual_payment_date: '', notes: '',
+}
+
+function EntityPaymentLedger() {
+  // CHANGED: entpay_write is gated on has_entity_grant(entity_id) — the
+  // entity whose book this entry is recorded under, same "acting entity"
+  // concept as InvoicePaymentTracker's "To Entity".
+  const { entities: accessEntities, frozen, defaultEntityId, loading: accessLoading } = useEntityAccess()
+  const [selectedEntity, setSelectedEntity] = useState('')
+  const [entityPayments, setEntityPayments] = useState([])
+  const [invoicePayments, setInvoicePayments] = useState([])
+  const [entities, setEntities] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const [form, setForm] = useState(EMPTY_ENTPAY)
+  const [saving, setSaving] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
+  const [toast, setToast] = useState(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    const [{ data: eps }, { data: ips }, { data: es }] = await Promise.all([
+      supabase.from('entity_payments').select('*')
+        .eq('is_deleted', false).order('actual_payment_date', { ascending: true }),
+      supabase.from('invoice_payments')
+        .select('id,invoice_id,invoice_no,entity_id,party_entity_id,party_name,amount,tcs_amount,currency,actual_payment_date,notes')
+        .eq('is_deleted', false).order('actual_payment_date', { ascending: true }),
+      supabase.from('entities').select('id,name,short_name').eq('is_active', true).eq('is_deleted', false).order('name'),
+    ])
+    setEntityPayments(eps || [])
+    setInvoicePayments(ips || [])
+    setEntities(es || [])
+    setLoading(false)
+  }, [])
+
+  useEffect(() => { load() }, [load])
+  useEffect(() => { if (defaultEntityId && !selectedEntity) setSelectedEntity(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const entityMap = useMemo(() => new Map(entities.map(e => [e.id, e])), [entities])
+
+  const ledger = useMemo(
+    () => selectedEntity ? buildEntityLedger(selectedEntity, { entityPayments, invoicePayments }) : [],
+    [selectedEntity, entityPayments, invoicePayments]
+  )
+  const filteredLedger = ledger.filter(r => (!dateFrom || r.date >= dateFrom) && (!dateTo || r.date <= dateTo))
+  const totalIn  = filteredLedger.filter(r => r.inbound).reduce((s, r) => s + r.amount, 0)
+  const totalOut = filteredLedger.filter(r => !r.inbound).reduce((s, r) => s + r.amount, 0)
+  const closingBalance = filteredLedger.length ? filteredLedger[filteredLedger.length - 1].runningBalance : 0
+
+  function setF(k, v) {
+    setForm(f => {
+      const u = { ...f, [k]: v }
+      if (k === 'party_entity_id' && v) u.party_name = ''
+      return u
+    })
+  }
+
+  function openNew() {
+    setEditing(null)
+    setForm({ ...EMPTY_ENTPAY, entity_id: selectedEntity || defaultEntityId, actual_payment_date: today() })
+    setModalOpen(true)
+  }
+
+  function openEdit(row) {
+    const p = row.raw
+    setEditing(p)
+    setForm({
+      entity_id: p.entity_id || '', party_entity_id: p.party_entity_id || '', party_name: p.party_name || '',
+      direction: p.direction || 'paid', category: p.category || '',
+      currency: p.currency || 'INR', exchange_rate: p.exchange_rate != null ? String(p.exchange_rate) : '1',
+      amount: p.amount != null ? String(p.amount) : '', reference_no: p.reference_no || '',
+      actual_payment_date: p.actual_payment_date || '', notes: p.notes || '',
+    })
+    setModalOpen(true)
+  }
+
+  async function handleSave() {
+    if (!form.entity_id) return setToast({ message: 'Select an entity', type: 'error' })
+    if (!toNum(form.amount)) return setToast({ message: 'Amount is required', type: 'error' })
+    if (!form.actual_payment_date) return setToast({ message: 'Payment date is required', type: 'error' })
+    setSaving(true)
+    const payload = {
+      entity_id: form.entity_id, party_entity_id: form.party_entity_id || null,
+      party_name: form.party_name || null, direction: form.direction,
+      category: form.category || null, currency: form.currency,
+      exchange_rate: toNum(form.exchange_rate) || 1, amount: toNum(form.amount),
+      reference_no: form.reference_no || null, actual_payment_date: form.actual_payment_date,
+      notes: form.notes || null, updated_at: new Date(),
+    }
+    let error
+    if (editing) { const r = await supabase.from('entity_payments').update(payload).eq('id', editing.id); error = r.error }
+    else         { const r = await supabase.from('entity_payments').insert(payload); error = r.error }
+    setSaving(false)
+    if (error) return setToast({ message: error.message, type: 'error' })
+    setToast({ message: editing ? 'Entry updated' : 'Entry recorded', type: 'success' })
+    setModalOpen(false); load()
+  }
+
+  async function handleDelete() {
+    await supabase.from('entity_payments').update({ is_deleted: true }).eq('id', confirmDelete.raw.id)
+    setConfirmDelete(null); load()
+  }
+
+  const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '10px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', whiteSpace: 'nowrap' }
+  const td = { padding: '9px 12px', borderBottom: `1px solid #f0e8d8`, fontSize: '12px', verticalAlign: 'middle' }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', alignItems: 'flex-end', flexWrap: 'wrap' }}>
+        <div style={{ width: '180px' }}>
+          <FormRow label='Entity' hint={frozen ? 'Locked to the only entity you have access to' : undefined}>
+            <Select value={selectedEntity} onChange={e => setSelectedEntity(e.target.value)} disabled={frozen}>
+              <option value=''>Select entity</option>
+              {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+            </Select>
+          </FormRow>
+        </div>
+        <div style={{ width: '130px' }}><FormRow label='From Date'><Input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} /></FormRow></div>
+        <div style={{ width: '130px' }}><FormRow label='To Date'><Input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} /></FormRow></div>
+        <div style={{ flex: 1 }} />
+        <Btn onClick={() => openNew()} disabled={!selectedEntity}>+ Add Entry</Btn>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
+        <StatCard label='Total In'        value={formatINR(totalIn)} color={C.success} />
+        <StatCard label='Total Out'       value={formatINR(totalOut)} color={C.warning} />
+        <StatCard label='Closing Balance' value={formatINR(closingBalance)} color={closingBalance >= 0 ? C.success : C.danger} />
+        <StatCard label='Entries'         value={filteredLedger.length} />
+      </div>
+
+      <Card>
+        {!selectedEntity ? (
+          <EmptyState icon='📒' title='Select an entity to view its ledger' />
+        ) : loading || accessLoading ? (
+          <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
+        ) : filteredLedger.length === 0 ? (
+          <EmptyState icon='📒' title='No entries found' action={<Btn onClick={() => openNew()}>+ Add Entry</Btn>} />
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <div style={{ padding: '10px 12px', fontSize: '11px', color: C.textMuted }}>Balance sums amounts at face value — does not FX-convert mixed currencies.</div>
+            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: '1100px' }}>
+              <thead><tr>
+                {['#','Date','Type','Counterparty','In','Out','Running Balance','Ref / Invoice','Notes',''].map((h,i) => (
+                  <th key={i} style={{ ...th, textAlign: i >= 4 && i <= 6 ? 'right' : 'left' }}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {filteredLedger.map((r, i) => (
+                  <tr key={r.id} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
+                    <td style={{ ...td, color: C.textMuted }}>{i+1}</td>
+                    <td style={td}>{fmtDate(r.date)}</td>
+                    <td style={td}>
+                      <span style={{ fontSize: '10px', fontWeight: 700, padding: '2px 8px', borderRadius: '4px', background: r.source === 'entity_payment' ? '#ede8f3' : '#e8f0f3', color: r.source === 'entity_payment' ? '#3a1a6a' : '#1a4a6a' }}>
+                        {r.source === 'entity_payment' ? 'Standalone' : 'Invoice Settlement'}
+                      </span>
+                    </td>
+                    <td style={td}>{entityMap.get(r.counterpartyId)?.short_name || entityMap.get(r.counterpartyId)?.name || r.counterpartyName || '—'}</td>
+                    <td style={{ ...td, textAlign: 'right', color: C.success, fontWeight: r.inbound ? 600 : 400 }}>{r.inbound ? <AmtCell amount={r.amount} currency={r.currency} /> : '—'}</td>
+                    <td style={{ ...td, textAlign: 'right', color: C.warning, fontWeight: !r.inbound ? 600 : 400 }}>{!r.inbound ? <AmtCell amount={r.amount} currency={r.currency} /> : '—'}</td>
+                    <td style={{ ...td, textAlign: 'right', fontWeight: 600, color: r.runningBalance >= 0 ? C.success : C.danger }}><AmtCell amount={r.runningBalance} currency='INR' /></td>
+                    <td style={{ ...td, fontFamily: 'monospace', fontSize: '11px' }}>{r.source === 'entity_payment' ? (r.raw.reference_no || '—') : (r.invoiceNo || '—')}</td>
+                    <td style={{ ...td, maxWidth: '160px' }}>{r.notes || '—'}</td>
+                    <td style={td}>
+                      {r.source === 'entity_payment' ? (
+                        <div style={{ display: 'flex', gap: '4px' }}>
+                          <Btn size='xs' variant='ghost' onClick={() => openEdit(r)}>Edit</Btn>
+                          <Btn size='xs' variant='ghost' onClick={() => setConfirmDelete(r)} style={{ color: C.danger }}>Del</Btn>
+                        </div>
+                      ) : (
+                        <span style={{ fontSize: '11px', color: C.textMuted }}>via Invoice Payments</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editing ? 'Edit Entry' : 'Add Entity Payment'} width={640}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <SectionDivider label='Entity & Direction' />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Entity' hint={frozen ? 'Locked to the only entity you have access to' : undefined}>
+              <Select value={form.entity_id} onChange={e => setF('entity_id', e.target.value)} disabled={frozen}>
+                <option value=''>Select</option>
+                {accessEntities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Direction'>
+              <Select value={form.direction} onChange={e => setF('direction', e.target.value)}>
+                <option value='paid'>Paid (cash out)</option>
+                <option value='received'>Received (cash in)</option>
+              </Select>
+            </FormRow>
+          </div>
+
+          <SectionDivider label='Counterparty' />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Party (in-system)'>
+              <Select value={form.party_entity_id} onChange={e => setF('party_entity_id', e.target.value)}>
+                <option value=''>Any</option>
+                {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Party Name (if not in system)'>
+              <Input value={form.party_name} onChange={e => setF('party_name', e.target.value)} disabled={!!form.party_entity_id} />
+            </FormRow>
+          </div>
+
+          <SectionDivider label='Amount' />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Category'>
+              <Select value={form.category} onChange={e => setF('category', e.target.value)}>
+                <option value=''>Select</option>
+                {ENTPAY_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Currency'><Select value={form.currency} onChange={e => setF('currency', e.target.value)}>{CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}</Select></FormRow>
+            <FormRow label='Amount' required><Input type='number' value={form.amount} onChange={e => setF('amount', e.target.value)} /></FormRow>
+            <FormRow label='Reference No'><Input value={form.reference_no} onChange={e => setF('reference_no', e.target.value)} /></FormRow>
+          </div>
+
+          <SectionDivider label='Date & Notes' />
+          <FormRow label='Payment Date' required><Input type='date' value={form.actual_payment_date} onChange={e => setF('actual_payment_date', e.target.value)} /></FormRow>
+          <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
+            <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editing ? 'Save Changes' : 'Record Entry'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      <ConfirmModal open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={handleDelete}
+        title='Delete Entry' message='Delete this entry? This cannot be undone.' danger />
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+    </div>
+  )
+}
+
 // ─── Shell ────────────────────────────────────────────────────────────────────
 export default function Payments() {
   // CHANGED: ?tab=expense deep-links straight to the Expense Payments tab
@@ -1013,7 +1269,7 @@ export default function Payments() {
         <p style={{ fontSize: '13px', color: C.textMuted, margin: '4px 0 0' }}>Track invoice and expense payment status</p>
       </div>
       <div style={{ display: 'flex', gap: '4px', marginBottom: '24px', borderBottom: `2px solid ${C.border}` }}>
-        {['Invoice Payments', 'Expense Payments'].map(t => (
+        {['Invoice Payments', 'Expense Payments', 'Entity Ledger'].map(t => (
           <button key={t} onClick={() => setTab(t)} style={{
             padding: '8px 20px', border: 'none', cursor: 'pointer', fontFamily: 'inherit',
             fontWeight: tab === t ? 700 : 500, fontSize: '13px',
@@ -1025,6 +1281,7 @@ export default function Payments() {
       </div>
       {tab === 'Invoice Payments' && <InvoicePaymentTracker />}
       {tab === 'Expense Payments' && <ExpensePaymentTracker />}
+      {tab === 'Entity Ledger' && <EntityPaymentLedger />}
     </div>
   )
 }
