@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../../supabaseClient'
 import { fetchAllPages, excludeAutoPurchaseMirrors } from '../../utils/query'
-import { C, Card, FormRow, Select, StatCard, Badge } from '../../components/UI/index'
+import { C, Card, FormRow, Select, StatCard, Badge, Btn } from '../../components/UI/index'
 import { formatINR, toNum } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchActualStockPosition } from '../../utils/stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
+import { downloadCSV } from '../../utils/csvTemplate'
 
 // CHANGED: "Compliance" is one tab in the main row, sitting next to Party
 // Ledger. Selecting it reveals a second-level sub-tab row for its two
@@ -20,6 +21,48 @@ const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Se
 function monthLabel(ym) {
   const [y, m] = (ym || '').split('-')
   return m ? `${MONTH_NAMES[Number(m) - 1]} ${y}` : (ym || '—')
+}
+
+// ─── Custom date range (overrides FY when set) ─────────────────────────────
+// A custom From/To range always wins over the Financial Year dropdown when
+// either bound is set; otherwise falls back to the FY's own start/end;
+// otherwise no bound at all ("all time"). Shared by every report tab below
+// instead of each one hand-rolling its own FY-range logic.
+function resolveDateRange(fyFilter, dateFrom, dateTo) {
+  if (dateFrom || dateTo) return { start: dateFrom || null, end: dateTo || null }
+  return fyFilter ? { start: fyFilter.start_date, end: fyFilter.end_date } : null
+}
+// Applies a resolved range to a Supabase query builder on one date column.
+function applyDateRange(query, range, col) {
+  if (!range) return query
+  if (range.start) query = query.gte(col, range.start)
+  if (range.end)   query = query.lte(col, range.end)
+  return query
+}
+// Client-side membership test — for tabs that merge multiple sources before
+// filtering, where a server-side .gte/.lte per source isn't practical.
+function inDateRange(d, range) {
+  if (!range) return true
+  if (!d) return true
+  if (range.start && d < range.start) return false
+  if (range.end && d > range.end) return false
+  return true
+}
+// Shared From/To date filter inputs — same pair of controls in every tab's
+// filter bar, styled like the date inputs already used elsewhere (e.g.
+// src/pages/PI/index.jsx).
+function DateRangeFields({ dateFrom, setDateFrom, dateTo, setDateTo, toHint }) {
+  const dateInputStyle = { padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }
+  return (
+    <>
+      <FormRow label='From Date'>
+        <input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} style={dateInputStyle} />
+      </FormRow>
+      <FormRow label='To Date' hint={toHint}>
+        <input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} style={dateInputStyle} />
+      </FormRow>
+    </>
+  )
 }
 
 // CHANGED: hoisted out of PLReport's render body — it only ever depended on
@@ -44,6 +87,8 @@ function PLReport({ entities, fys, defaultEntityId }) {
   const [entityId, setEntityId] = useState('')
   useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
   const [fyId, setFyId]         = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [data, setData]         = useState(null)
   const [loading, setLoading]   = useState(false)
 
@@ -55,7 +100,7 @@ function PLReport({ entities, fys, defaultEntityId }) {
     // Sales: invoices where seller_entity_id = entityId
     // Purchases: invoices where buyer_entity_id = entityId
     // Expenses: expenses where entity_id = entityId
-    const fyFilter = fys.find(f => f.id === fyId)
+    const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
 
     // CHANGED: excludeAutoPurchaseMirrors — without it, every internal-to-
     // internal purchase this entity made shows up twice (its seller's real
@@ -75,11 +120,9 @@ function PLReport({ entities, fys, defaultEntityId }) {
       .select('id,total_amount,amount,gst_amount,expense_type,expense_date')
       .eq('entity_id', entityId).eq('is_deleted', false)
 
-    if (fyFilter) {
-      salesQ     = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
-      purchasesQ = purchasesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
-      expensesQ  = expensesQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
-    }
+    salesQ     = applyDateRange(salesQ, range, 'invoice_date')
+    purchasesQ = applyDateRange(purchasesQ, range, 'invoice_date')
+    expensesQ  = applyDateRange(expensesQ, range, 'expense_date')
 
     const [{ data: sales }, { data: purchases }, { data: expenses }] = await Promise.all([salesQ, purchasesQ, expensesQ])
 
@@ -99,6 +142,19 @@ function PLReport({ entities, fys, defaultEntityId }) {
     setLoading(false)
   }
 
+  function handleExportCSV() {
+    if (!data) return
+    const rows = [
+      { metric: 'Sales (Taxable)', value: data.totalSales },
+      { metric: 'Purchases (Taxable)', value: data.totalPurchases },
+      { metric: 'Gross Profit', value: data.grossProfit },
+      { metric: 'Expenses', value: data.totalExpenses },
+      { metric: 'Net Profit', value: data.netProfit },
+      ...Object.entries(data.expenseByType).map(([type, amount]) => ({ metric: `Expense: ${type}`, value: amount })),
+    ]
+    downloadCSV(`pl_report_${today()}.csv`, ['metric', 'value'], rows)
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
@@ -114,10 +170,12 @@ function PLReport({ entities, fys, defaultEntityId }) {
             {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
         <button onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!data}>↓ Export CSV</Btn>
       </div>
 
       {data && (
@@ -152,13 +210,15 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
   const [entityId, setEntityId] = useState('')
   useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
   const [fyId, setFyId]         = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [data, setData]         = useState(null)
   const [loading, setLoading]   = useState(false)
 
   async function runReport() {
     if (!entityId) return
     setLoading(true)
-    const fyFilter = fys.find(f => f.id === fyId)
+    const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
 
     // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. Without it, an
     // entity that buys from an internal upstream entity has that purchase
@@ -194,12 +254,10 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
       .select('rcm_gst_amount,expense_date,rcm_paid_date,rcm_itc_claimed_date')
       .eq('entity_id', entityId).eq('is_deleted', false).eq('is_rcm', true).gt('rcm_gst_amount', 0)
 
-    if (fyFilter) {
-      salesQ     = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
-      purchasesQ = purchasesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
-      expensesQ  = expensesQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
-      rcmQ       = rcmQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
-    }
+    salesQ     = applyDateRange(salesQ, range, 'invoice_date')
+    purchasesQ = applyDateRange(purchasesQ, range, 'invoice_date')
+    expensesQ  = applyDateRange(expensesQ, range, 'expense_date')
+    rcmQ       = applyDateRange(rcmQ, range, 'expense_date')
 
     const [{ data: sales }, { data: purchases }, { data: expenses }, { data: rcmRows }] = await Promise.all([salesQ, purchasesQ, expensesQ, rcmQ])
 
@@ -253,6 +311,12 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
     setLoading(false)
   }
 
+  function handleExportCSV() {
+    if (!data) return
+    downloadCSV(`gst_summary_${today()}.csv`, ['month', 'output', 'purchaseITC', 'expenseITC', 'rcmLiability', 'net'],
+      data.monthlyRows.map(r => ({ ...r, month: monthLabel(r.month) })))
+  }
+
   const thStyle = { padding: '10px 14px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', textAlign: 'right' }
 
   return (
@@ -270,10 +334,12 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
             {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
         <button onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!data}>↓ Export CSV</Btn>
       </div>
 
       {data && (
@@ -393,14 +459,16 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
   const [entityId, setEntityId] = useState('')
   useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
   const [fyId, setFyId]       = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [data, setData]       = useState(null)
   const [loading, setLoading] = useState(false)
 
   async function runReport() {
     if (!entityId) return
     setLoading(true)
-    const fyFilter = fys.find(f => f.id === fyId)
-    const inRange = d => !fyFilter || !d || (d >= fyFilter.start_date && d <= fyFilter.end_date)
+    const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
+    const inRange = d => inDateRange(d, range)
 
     const [{ data: ips }, { data: cdns }, { data: exps }] = await Promise.all([ // exps = party_payments (expense-side TDS/TCS)
       supabase.from('invoice_payments')
@@ -466,6 +534,11 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
     setLoading(false)
   }
 
+  function handleExportCSV() {
+    if (!data) return
+    downloadCSV(`tds_tcs_report_${today()}.csv`, ['source', 'doc', 'date', 'section', 'kind', 'direction', 'amount'], data.rows)
+  }
+
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
 
   return (
@@ -483,10 +556,12 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
             {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
         <button onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!data}>↓ Export CSV</Btn>
       </div>
 
       {data && (
@@ -546,13 +621,15 @@ function Ledger({ entities, fys, defaultEntityId }) {
   useEffect(() => { if (defaultEntityId && !ourEntityId) setOurEntity(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
   const [partyId, setPartyId]       = useState('all')
   const [fyId, setFyId]             = useState('')
+  const [dateFrom, setDateFrom]     = useState('')
+  const [dateTo, setDateTo]         = useState('')
   const [rows, setRows]             = useState([])
   const [loading, setLoading]       = useState(false)
 
   async function runReport() {
     if (!ourEntityId) return
     setLoading(true)
-    const fyFilter = fys.find(f => f.id === fyId)
+    const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
 
     // Sales invoices (Dr for our entity)
     // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. A sale to an
@@ -563,28 +640,28 @@ function Ledger({ entities, fys, defaultEntityId }) {
       .select('id,invoice_no,invoice_date,total_amount,buyer_entity_id,buyer:buyer_entity_id(name,short_name)')
       .eq('seller_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled'))
     if (partyId !== 'all') salesQ = salesQ.eq('buyer_entity_id', partyId)
-    if (fyFilter) salesQ = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
+    salesQ = applyDateRange(salesQ, range, 'invoice_date')
 
     // Purchase invoices (Cr for our entity)
     let purchasesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,invoice_no,invoice_date,total_amount,seller_entity_id,seller:seller_entity_id(name,short_name)')
       .eq('buyer_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled'))
     if (partyId !== 'all') purchasesQ = purchasesQ.eq('seller_entity_id', partyId)
-    if (fyFilter) purchasesQ = purchasesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
+    purchasesQ = applyDateRange(purchasesQ, range, 'invoice_date')
 
     // Receipts (Cr for our entity)
     let receiptsQ = supabase.from('payments')
       .select('id,payment_no,payment_date,net_amount,party_entity_id,party:party_entity_id(name,short_name),party_name')
       .eq('entity_id', ourEntityId).eq('payment_type', 'receipt').eq('is_deleted', false)
     if (partyId !== 'all') receiptsQ = receiptsQ.eq('party_entity_id', partyId)
-    if (fyFilter) receiptsQ = receiptsQ.gte('payment_date', fyFilter.start_date).lte('payment_date', fyFilter.end_date)
+    receiptsQ = applyDateRange(receiptsQ, range, 'payment_date')
 
     // Payments sent (Dr for our entity)
     let paymentsQ = supabase.from('payments')
       .select('id,payment_no,payment_date,net_amount,party_entity_id,party:party_entity_id(name,short_name),party_name')
       .eq('entity_id', ourEntityId).eq('payment_type', 'payment').eq('is_deleted', false)
     if (partyId !== 'all') paymentsQ = paymentsQ.eq('party_entity_id', partyId)
-    if (fyFilter) paymentsQ = paymentsQ.gte('payment_date', fyFilter.start_date).lte('payment_date', fyFilter.end_date)
+    paymentsQ = applyDateRange(paymentsQ, range, 'payment_date')
 
     const [{ data: sales }, { data: purchases }, { data: receipts }, { data: paymentsMade }] = await Promise.all([salesQ, purchasesQ, receiptsQ, paymentsQ])
 
@@ -592,17 +669,42 @@ function Ledger({ entities, fys, defaultEntityId }) {
     let bdEventsQ = supabase.from('bill_discounting_events')
       .select('id,discounting_date,net_proceeds,bank_name,bank:bank_id(name,short_name)')
       .eq('entity_id', ourEntityId).eq('is_deleted', false)
-    if (fyFilter) bdEventsQ = bdEventsQ.gte('discounting_date', fyFilter.start_date).lte('discounting_date', fyFilter.end_date)
+    bdEventsQ = applyDateRange(bdEventsQ, range, 'discounting_date')
 
     let bdRepaysQ = supabase.from('bill_discounting_repayments')
       .select('id,repayment_date,amount,interest_amount,total_payment,event_id, event:event_id(entity_id,bank_name,bank:bank_id(name,short_name))')
       .order('repayment_date')
-    if (fyFilter) bdRepaysQ = bdRepaysQ.gte('repayment_date', fyFilter.start_date).lte('repayment_date', fyFilter.end_date)
+    bdRepaysQ = applyDateRange(bdRepaysQ, range, 'repayment_date')
 
-    const [{ data: bdEvents }, { data: bdRepays }] = await Promise.all([bdEventsQ, bdRepaysQ])
+    // Standalone (non-invoice) entries recorded in Payments → Entity Ledger —
+    // matches whichever side of `entity_payments` names our entity, so an
+    // entry recorded under the OTHER party's book still shows up here (with
+    // its direction flipped relative to us), same logic as buildEntityLedger
+    // in utils/payments.js.
+    let entPayQ = supabase.from('entity_payments')
+      .select('id,actual_payment_date,entity_id,party_entity_id,party_name,direction,amount,reference_no,notes')
+      .eq('is_deleted', false).or(`entity_id.eq.${ourEntityId},party_entity_id.eq.${ourEntityId}`)
+    entPayQ = applyDateRange(entPayQ, range, 'actual_payment_date')
+
+    const [{ data: bdEvents }, { data: bdRepays }, { data: entPayments }] = await Promise.all([bdEventsQ, bdRepaysQ, entPayQ])
 
     // Filter repayments to this entity
     const myRepays = (bdRepays || []).filter(r => r.event?.entity_id === ourEntityId)
+
+    const entityById = Object.fromEntries(entities.map(e => [e.id, e]))
+    // Dr when OUR entity paid out (a receivable-like advance, same
+    // convention as "Payment Out" above), Cr when our entity received (same
+    // convention as "Receipt" above) — flipped when the entry was recorded
+    // under the OTHER entity's book instead of ours.
+    const entPayRows = (entPayments || [])
+      .filter(p => partyId === 'all' || p.entity_id === partyId || p.party_entity_id === partyId)
+      .map(p => {
+        const weAreBookOwner = p.entity_id === ourEntityId
+        const dr = weAreBookOwner ? p.direction === 'paid' : p.direction === 'received'
+        const partyEntity = weAreBookOwner ? p.party_entity_id : p.entity_id
+        const party = entityById[partyEntity]?.short_name || entityById[partyEntity]?.name || (weAreBookOwner ? p.party_name : null)
+        return { date: p.actual_payment_date, doc: p.reference_no || '—', party, type: 'Standalone Payment', dr: dr ? p.amount : 0, cr: dr ? 0 : p.amount, _raw: p }
+      })
 
     const ledgerRows = [
       ...(sales || []).map(i => ({ date: i.invoice_date, doc: i.invoice_no, party: i.buyer?.short_name || i.buyer?.name, type: 'Sales Invoice', dr: i.total_amount, cr: 0, _raw: i })),
@@ -612,6 +714,7 @@ function Ledger({ entities, fys, defaultEntityId }) {
       // Bill Discounting — disbursement is Dr (cash in), repayment is Cr (cash out)
       ...(bdEvents || []).map(e => ({ date: e.discounting_date, doc: '—', party: e.bank?.name || e.bank_name, type: 'BD Disbursement', dr: e.net_proceeds || 0, cr: 0, _raw: e })),
       ...myRepays.map(r => ({ date: r.repayment_date, doc: '—', party: r.event?.bank?.name || r.event?.bank_name, type: 'BD Repayment', dr: 0, cr: (r.total_payment || r.amount) || 0, _raw: r })),
+      ...entPayRows,
     ].sort((a, b) => new Date(a.date) - new Date(b.date))
 
     // Add running balance
@@ -623,6 +726,10 @@ function Ledger({ entities, fys, defaultEntityId }) {
 
     setRows(withBalance)
     setLoading(false)
+  }
+
+  function handleExportCSV() {
+    downloadCSV(`ledger_${today()}.csv`, ['date', 'doc', 'party', 'type', 'dr', 'cr', 'balance'], rows)
   }
 
   const totalDr = rows.reduce((s, r) => s + r.dr, 0)
@@ -652,10 +759,12 @@ function Ledger({ entities, fys, defaultEntityId }) {
             {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
         <button onClick={runReport} disabled={!ourEntityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !ourEntityId ? 'not-allowed' : 'pointer', opacity: !ourEntityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={rows.length === 0}>↓ Export CSV</Btn>
       </div>
 
       {rows.length > 0 && (
@@ -726,12 +835,18 @@ function Ledger({ entities, fys, defaultEntityId }) {
 // checked one at a time.
 function ProfitabilityReport({ entities, fys }) {
   const [fyId, setFyId]       = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
+  // CHANGED: Group By — entities now carry group_id (→ entity_groups), so this
+  // already-cross-entity report can roll figures up by group instead of by
+  // individual entity, reusing the exact same aggregation logic below.
+  const [groupBy, setGroupBy] = useState('entity')
   const [rows, setRows]       = useState(null)
   const [loading, setLoading] = useState(false)
 
   async function runReport() {
     setLoading(true)
-    const fyFilter = fys.find(f => f.id === fyId)
+    const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
     // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. Without it,
     // any entity buying from another internal entity has its purchases
     // (hence gross profit here) double-counted, skewing this cross-entity
@@ -739,33 +854,46 @@ function ProfitabilityReport({ entities, fys }) {
     let salesQ     = excludeAutoPurchaseMirrors(supabase.from('invoices').select('seller_entity_id, taxable_amount, invoice_date').eq('is_deleted', false).neq('status', 'cancelled'))
     let purchasesQ = excludeAutoPurchaseMirrors(supabase.from('invoices').select('buyer_entity_id, taxable_amount, invoice_date').eq('is_deleted', false).neq('status', 'cancelled'))
     let expensesQ  = supabase.from('expenses').select('entity_id, amount, expense_date').eq('is_deleted', false)
-    if (fyFilter) {
-      salesQ     = salesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
-      purchasesQ = purchasesQ.gte('invoice_date', fyFilter.start_date).lte('invoice_date', fyFilter.end_date)
-      expensesQ  = expensesQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
-    }
-    const [{ data: sales }, { data: purchases }, { data: expenses }] = await Promise.all([salesQ, purchasesQ, expensesQ])
+    salesQ     = applyDateRange(salesQ, range, 'invoice_date')
+    purchasesQ = applyDateRange(purchasesQ, range, 'invoice_date')
+    expensesQ  = applyDateRange(expensesQ, range, 'expense_date')
+    const [{ data: sales }, { data: purchases }, { data: expenses }, { data: groups }] = await Promise.all([
+      salesQ, purchasesQ, expensesQ,
+      supabase.from('entity_groups').select('id,name'),
+    ])
 
-    const byEntity = new Map()
-    function ensure(id) {
-      if (!id) return null
-      if (!byEntity.has(id)) byEntity.set(id, { sales: 0, purchases: 0, expenses: 0 })
-      return byEntity.get(id)
+    const entityById = Object.fromEntries(entities.map(e => [e.id, e]))
+    const groupById   = Object.fromEntries((groups || []).map(g => [g.id, g]))
+    const bucketKey = entityId => groupBy === 'group' ? (entityById[entityId]?.group_id || 'ungrouped') : entityId
+
+    const byKey = new Map()
+    function ensure(entityId) {
+      if (!entityId) return null
+      const key = bucketKey(entityId)
+      if (!byKey.has(key)) byKey.set(key, { sales: 0, purchases: 0, expenses: 0 })
+      return byKey.get(key)
     }
     for (const s of (sales || []))     { const r = ensure(s.seller_entity_id); if (r) r.sales += s.taxable_amount }
     for (const p of (purchases || [])) { const r = ensure(p.buyer_entity_id);  if (r) r.purchases += p.taxable_amount }
     for (const e of (expenses || []))  { const r = ensure(e.entity_id);       if (r) r.expenses += e.amount }
 
-    const entityById = Object.fromEntries(entities.map(e => [e.id, e]))
-    const result = [...byEntity.entries()]
-      .map(([id, v]) => {
+    const result = [...byKey.entries()]
+      .map(([key, v]) => {
         const grossProfit = v.sales - v.purchases
         const netProfit    = grossProfit - v.expenses
-        return { entity: entityById[id], ...v, grossProfit, netProfit, margin: v.sales > 0 ? (netProfit / v.sales * 100) : null }
+        const label = groupBy === 'group'
+          ? (key === 'ungrouped' ? 'Ungrouped' : (groupById[key]?.name || 'Ungrouped'))
+          : (entityById[key]?.short_name || entityById[key]?.name || '—')
+        return { label, ...v, grossProfit, netProfit, margin: v.sales > 0 ? (netProfit / v.sales * 100) : null }
       })
       .sort((a, b) => b.netProfit - a.netProfit)
     setRows(result)
     setLoading(false)
+  }
+
+  function handleExportCSV() {
+    if (!rows) return
+    downloadCSV(`profitability_${today()}.csv`, ['label', 'sales', 'purchases', 'grossProfit', 'expenses', 'netProfit', 'margin'], rows)
   }
 
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
@@ -779,17 +907,25 @@ function ProfitabilityReport({ entities, fys }) {
             {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
+        <FormRow label='Group By'>
+          <Select value={groupBy} onChange={e => setGroupBy(e.target.value)} style={{ minWidth: '140px' }}>
+            <option value='entity'>Entity</option>
+            <option value='group'>Group</option>
+          </Select>
+        </FormRow>
         <button onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
       </div>
       {rows && (
         <Card>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
               <thead><tr>
-                <th style={{ ...th, textAlign: 'left' }}>Entity</th>
+                <th style={{ ...th, textAlign: 'left' }}>{groupBy === 'group' ? 'Group' : 'Entity'}</th>
                 <th style={{ ...th, textAlign: 'right' }}>Sales</th>
                 <th style={{ ...th, textAlign: 'right' }}>Purchases</th>
                 <th style={{ ...th, textAlign: 'right' }}>Gross Profit</th>
@@ -800,7 +936,7 @@ function ProfitabilityReport({ entities, fys }) {
               <tbody>
                 {rows.map((r, i) => (
                   <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
-                    <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontWeight: 600 }}>{r.entity?.short_name || r.entity?.name || '—'}</td>
+                    <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontWeight: 600 }}>{r.label}</td>
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right' }}>{formatINR(r.sales)}</td>
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right' }}>{formatINR(r.purchases)}</td>
                     <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right' }}>{formatINR(r.grossProfit)}</td>
@@ -826,6 +962,12 @@ function ProfitabilityReport({ entities, fys }) {
 function ActualStockReport({ entities, defaultEntityId }) {
   const [entityId, setEntityId] = useState('')
   useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
+  // CHANGED: stock position is a point-in-time snapshot, not a range — only
+  // "To Date" is meaningful, wired to fetchActualStockPosition's existing
+  // as-of param (utils/stock.js). "From Date" is still shown for filter-bar
+  // consistency with every other report, but has no effect (see its hint).
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [rows, setRows]     = useState(null)
   const [loading, setLoading] = useState(false)
 
@@ -835,7 +977,7 @@ function ActualStockReport({ entities, defaultEntityId }) {
     // RPC (migration 041) when available, instead of downloading every raw
     // invoice line just to sum them per entity+product in the browser.
     const [map, { data: products }] = await Promise.all([
-      fetchActualStockPosition(),
+      fetchActualStockPosition(dateTo || null),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,unit,category')),
     ])
     const productByName = Object.fromEntries((products || []).map(p => [p.name, p]))
@@ -853,6 +995,13 @@ function ActualStockReport({ entities, defaultEntityId }) {
     setLoading(false)
   }
 
+  function handleExportCSV() {
+    if (!rows) return
+    downloadCSV(`actual_stock_${today()}.csv`,
+      ['entity', 'product', 'category', 'opening_qty', 'invoiced_in', 'invoiced_out', 'actual_qty'],
+      rows.map(r => ({ ...r, entity: r.entity?.short_name || r.entity?.name || '', product: r.product?.name || '', category: r.product?.category || '' })))
+  }
+
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
   const totalQty = (rows || []).reduce((s, r) => s + r.actual_qty, 0)
 
@@ -865,10 +1014,13 @@ function ActualStockReport({ entities, defaultEntityId }) {
             {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo}
+          toHint="Stock position is a snapshot — only 'To Date' applies, used as the as-of date." />
         <button onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
       </div>
 
       {rows && (
@@ -920,11 +1072,14 @@ function StockMovementReport({ entities }) {
   // business in one table. Matches on either side of the movement (an
   // entity cares about both what left and what arrived).
   const [entityId, setEntityId] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [rows, setRows]       = useState(null)
   const [loading, setLoading] = useState(false)
 
   async function runReport() {
     setLoading(true)
+    const range = resolveDateRange(null, dateFrom, dateTo)
     const [{ data: invLines }] = await Promise.all([
       fetchAllPages(() => supabase.from('invoice_lines')
         .select('qty, product_name, invoice:invoice_id(invoice_no, eway_bill_no, eway_bill_date, status, invoice_type, seller_entity_id, buyer_entity_id, source_invoice_id, seller:seller_entity_id(name,short_name), buyer:buyer_entity_id(name,short_name))')
@@ -942,6 +1097,7 @@ function StockMovementReport({ entities }) {
     const result = (invLines || [])
       .filter(l => l.invoice && l.invoice.status !== 'cancelled' && l.invoice.eway_bill_no && !(l.invoice.invoice_type === 'purchase' && l.invoice.source_invoice_id))
       .filter(l => !entityId || l.invoice.seller_entity_id === entityId || l.invoice.buyer_entity_id === entityId)
+      .filter(l => inDateRange(l.invoice.eway_bill_date, range))
       .map(l => ({
         eway_bill_no: l.invoice.eway_bill_no, eway_bill_date: l.invoice.eway_bill_date, invoice_no: l.invoice.invoice_no,
         product: l.product_name || '⚠ No product',
@@ -950,6 +1106,11 @@ function StockMovementReport({ entities }) {
       .sort((a, b) => new Date(b.eway_bill_date || 0) - new Date(a.eway_bill_date || 0))
     setRows(result)
     setLoading(false)
+  }
+
+  function handleExportCSV() {
+    if (!rows) return
+    downloadCSV(`stock_movements_${today()}.csv`, ['eway_bill_date', 'eway_bill_no', 'invoice_no', 'product', 'qty', 'from', 'to'], rows)
   }
 
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
@@ -963,10 +1124,12 @@ function StockMovementReport({ entities }) {
             {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
         <button onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
       </div>
       {rows && (
         <Card>
@@ -1008,11 +1171,14 @@ function StockMovementReport({ entities }) {
 // this is the same rule findLinesMissingProductName() blocks on save, surfaced
 // here for lines that slipped through before that validation existed.
 function MissingProductReport() {
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [rows, setRows]       = useState(null)
   const [loading, setLoading] = useState(false)
 
   async function runReport() {
     setLoading(true)
+    const range = resolveDateRange(null, dateFrom, dateTo)
     const [{ data: piLines }, { data: poLines }, { data: invLines }] = await Promise.all([
       supabase.from('proforma_invoice_lines').select('qty, product_name, pi:pi_id(pi_no, pi_date, from_entity:from_entity_id(name,short_name))').is('product_name', null),
       supabase.from('purchase_order_lines').select('qty, product_name, po:po_id(po_no, po_date, buyer:buyer_entity_id(name,short_name))').is('product_name', null),
@@ -1022,19 +1188,30 @@ function MissingProductReport() {
       ...(piLines || []).filter(l => l.pi && Number(l.qty) > 0).map(l => ({ source: 'PI', doc: l.pi.pi_no, date: l.pi.pi_date, entity: l.pi.from_entity?.short_name || l.pi.from_entity?.name, qty: l.qty })),
       ...(poLines || []).filter(l => l.po && Number(l.qty) > 0).map(l => ({ source: 'PO', doc: l.po.po_no, date: l.po.po_date, entity: l.po.buyer?.short_name || l.po.buyer?.name, qty: l.qty })),
       ...(invLines || []).filter(l => l.invoice && Number(l.qty) > 0).map(l => ({ source: 'Invoice', doc: l.invoice.invoice_no, date: l.invoice.invoice_date, entity: l.invoice.seller?.short_name || l.invoice.seller?.name, qty: l.qty })),
-    ].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
+    ]
+      .filter(l => inDateRange(l.date, range))
+      .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
     setRows(result)
     setLoading(false)
+  }
+
+  function handleExportCSV() {
+    if (!rows) return
+    downloadCSV(`missing_products_${today()}.csv`, ['source', 'doc', 'date', 'entity', 'qty'], rows)
   }
 
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-      <button onClick={runReport} disabled={loading}
-        style={{ alignSelf: 'flex-start', padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
-        {loading ? 'Running…' : 'Run Report'}
-      </button>
+      <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
+        <button onClick={runReport} disabled={loading}
+          style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
+          {loading ? 'Running…' : 'Run Report'}
+        </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
+      </div>
       {rows && (
         <>
           {rows.length > 0 && (
@@ -1133,6 +1310,8 @@ function AgeingTable({ title, list }) {
 function AgeingReport({ entities, defaultEntityId }) {
   const [entityId, setEntityId] = useState('')
   useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [rows, setRows]       = useState(null)
   const [loading, setLoading] = useState(false)
 
@@ -1153,9 +1332,13 @@ function AgeingReport({ entities, defaultEntityId }) {
       const { data: tranches } = await supabase.from('invoice_payments').select('invoice_id, amount, tds_amount, adjustments').eq('is_deleted', false).in('invoice_id', invIds)
       tranchesByInvoice = groupTranchesByInvoice(tranches)
     }
+    // CHANGED: custom date range scopes WHICH invoices are included (by
+    // invoice_date) — the overdue-days math itself stays relative to today,
+    // unchanged, since ageing is inherently an "as of now" view.
+    const range = resolveDateRange(null, dateFrom, dateTo)
     const todayStr = today()
     function toRows(list, partyKey) {
-      return (list || []).map(inv => {
+      return (list || []).filter(inv => inDateRange(inv.invoice_date, range)).map(inv => {
         const { pending } = computeInvoiceOutstanding(inv, tranchesByInvoice.get(inv.id))
         const dueDate = inv.due_date || inv.invoice_date
         const daysOverdue = Math.floor((new Date(todayStr) - new Date(dueDate)) / 86400000)
@@ -1164,6 +1347,15 @@ function AgeingReport({ entities, defaultEntityId }) {
     }
     setRows({ receivables: toRows(receivables, 'buyer'), payables: toRows(payables, 'seller') })
     setLoading(false)
+  }
+
+  function handleExportCSV() {
+    if (!rows) return
+    const combined = [
+      ...rows.receivables.map(r => ({ ...r, type: 'Receivable' })),
+      ...rows.payables.map(r => ({ ...r, type: 'Payable' })),
+    ]
+    downloadCSV(`ageing_${today()}.csv`, ['type', 'invoice_no', 'party', 'due_date', 'daysOverdue', 'pending'], combined)
   }
 
   return (
@@ -1175,10 +1367,12 @@ function AgeingReport({ entities, defaultEntityId }) {
             {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
         <button onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
       </div>
       {rows && (
         <>
@@ -1199,23 +1393,23 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
   useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
   const [partyId, setPartyId]   = useState('')
   const [fyId, setFyId]         = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [rows, setRows]         = useState(null)
   const [loading, setLoading]   = useState(false)
 
   async function runReport() {
     if (!entityId || !partyId) return
     setLoading(true)
-    const fyFilter = fys.find(f => f.id === fyId)
+    const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
     let expQ = supabase.from('expenses')
       .select('id,expense_no,expense_date,description,total_amount,net_payable')
       .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
     let payQ = supabase.from('party_payments')
       .select('id,payment_date,amount,tds_amount,reference,mode')
       .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
-    if (fyFilter) {
-      expQ = expQ.gte('expense_date', fyFilter.start_date).lte('expense_date', fyFilter.end_date)
-      payQ = payQ.gte('payment_date', fyFilter.start_date).lte('payment_date', fyFilter.end_date)
-    }
+    expQ = applyDateRange(expQ, range, 'expense_date')
+    payQ = applyDateRange(payQ, range, 'payment_date')
     const [{ data: exps }, { data: pays }] = await Promise.all([expQ, payQ])
 
     const ledger = [
@@ -1231,6 +1425,11 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
     let bal = 0
     setRows(ledger.map(r => { bal += r.bill - r.paid; return { ...r, balance: bal } }))
     setLoading(false)
+  }
+
+  function handleExportCSV() {
+    if (!rows) return
+    downloadCSV(`party_ledger_${today()}.csv`, ['date', 'doc', 'type', 'desc', 'bill', 'paid', 'balance'], rows)
   }
 
   const totalBill = (rows || []).reduce((s, r) => s + r.bill, 0)
@@ -1259,10 +1458,12 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
             {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
           </Select>
         </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
         <button onClick={runReport} disabled={!entityId || !partyId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: (!entityId || !partyId) ? 'not-allowed' : 'pointer', opacity: (!entityId || !partyId) ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
       </div>
 
       {rows && (

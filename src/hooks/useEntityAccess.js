@@ -27,13 +27,13 @@ export function useEntityAccess() {
       setLoading(true)
       if (hasFullAccess(profile)) {
         const { data } = await supabase.from('entities')
-          .select('id,name,short_name,gstin,state_code,type')
+          .select('id,name,short_name,gstin,state_code,type,group_id')
           .eq('is_active', true).eq('is_deleted', false).order('name')
         if (!cancelled) setEntities(data || [])
       } else {
         const [{ data: entityGrants }, { data: groupGrants }] = await Promise.all([
           supabase.from('user_entity_access')
-            .select('expires_at, entity:entity_id(id,name,short_name,gstin,state_code,type)')
+            .select('expires_at, entity:entity_id(id,name,short_name,gstin,state_code,type,group_id)')
             .eq('user_id', profile.id),
           supabase.from('user_group_access').select('expires_at, group_id').eq('user_id', profile.id),
         ])
@@ -50,7 +50,7 @@ export function useEntityAccess() {
         let groupEntities = []
         if (activeGroupIds.length) {
           const { data } = await supabase.from('entities')
-            .select('id,name,short_name,gstin,state_code,type')
+            .select('id,name,short_name,gstin,state_code,type,group_id')
             .in('group_id', activeGroupIds).eq('is_active', true).eq('is_deleted', false)
           groupEntities = data || []
         }
