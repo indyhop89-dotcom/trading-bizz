@@ -105,7 +105,8 @@ function PIList() {
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
   const [statusFilter, setStatus] = useState([])
-  const [entityFilter, setEntityF] = useState('')
+  const [fromEntityFilter, setFromEntityF] = useState('')
+  const [toEntityFilter, setToEntityF] = useState('')
   const [orderFilter, setOrderF] = useState('')
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]         = useState(EMPTY_FORM)
@@ -293,9 +294,10 @@ function PIList() {
       p.from_entity?.name?.toLowerCase().includes(search.toLowerCase()) ||
       p.to_entity?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter.length === 0 || statusFilter.includes(p.status)
-    const me  = !entityFilter || p.from_entity_id === entityFilter || p.to_entity_id === entityFilter
+    const mfe = !fromEntityFilter || p.from_entity_id === fromEntityFilter
+    const mte = !toEntityFilter   || p.to_entity_id === toEntityFilter
     const mo  = !orderFilter || p.order_id === orderFilter
-    return ms && mst && me && mdf && mdt && mo
+    return ms && mst && mfe && mte && mdf && mdt && mo
   })
 
   // ── CSV bulk upload ──────────────────────────────────────────────────────────
@@ -531,9 +533,14 @@ function PIList() {
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search PI no, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
         <MultiSelectDropdown options={PI_STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
-        <select value={entityFilter} onChange={e => setEntityF(e.target.value)}
+        <select value={fromEntityFilter} onChange={e => setFromEntityF(e.target.value)} title='From Entity'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All entities</option>
+          <option value=''>All From Entities</option>
+          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <select value={toEntityFilter} onChange={e => setToEntityF(e.target.value)} title='To Entity'
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All To Entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
         <select value={orderFilter} onChange={e => setOrderF(e.target.value)}

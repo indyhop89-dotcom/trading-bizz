@@ -86,7 +86,8 @@ function POList() {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatus] = useState([])
-  const [entityFilter, setEntityF] = useState('')
+  const [buyerEntityFilter, setBuyerEntityF] = useState('')
+  const [sellerEntityFilter, setSellerEntityF] = useState('')
   const [orderFilter, setOrderF] = useState('')
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]     = useState(EMPTY_FORM)
@@ -470,9 +471,10 @@ function POList() {
       p.buyer?.name?.toLowerCase().includes(search.toLowerCase()) ||
       p.seller?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter.length === 0 || statusFilter.includes(p.status)
-    const me  = !entityFilter || p.buyer_entity_id === entityFilter || p.seller_entity_id === entityFilter
+    const mbe = !buyerEntityFilter  || p.buyer_entity_id === buyerEntityFilter
+    const mse = !sellerEntityFilter || p.seller_entity_id === sellerEntityFilter
     const mo  = !orderFilter || p.order_id === orderFilter
-    return ms && mst && mdf && mdt && me && mo
+    return ms && mst && mdf && mdt && mbe && mse && mo
   })
 
   function toggleSelect(id) {
@@ -533,9 +535,14 @@ function POList() {
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search PO no, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
         <MultiSelectDropdown options={PO_STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
-        <select value={entityFilter} onChange={e => setEntityF(e.target.value)}
+        <select value={buyerEntityFilter} onChange={e => setBuyerEntityF(e.target.value)} title='Buyer Entity'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All entities</option>
+          <option value=''>All Buyer Entities</option>
+          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <select value={sellerEntityFilter} onChange={e => setSellerEntityF(e.target.value)} title='Seller Entity'
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All Seller Entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
         <select value={orderFilter} onChange={e => setOrderF(e.target.value)}

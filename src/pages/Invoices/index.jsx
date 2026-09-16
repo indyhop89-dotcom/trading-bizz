@@ -144,7 +144,8 @@ function InvoiceList() {
   const [search, setSearch]     = useState('')
   const [statusFilter, setStatus] = useState([])
   const [typeFilter, setType]   = useState('all')
-  const [entityFilter, setEntityF] = useState('')
+  const [sellerEntityFilter, setSellerEntityF] = useState('')
+  const [buyerEntityFilter, setBuyerEntityF] = useState('')
   const [orderFilter, setOrderF] = useState('')
   const [orders, setOrders]     = useState([])
   const [toast, setToast]       = useState(null)
@@ -342,13 +343,14 @@ function InvoiceList() {
       i.buyer?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter.length === 0 || statusFilter.includes(i.status)
     const mt  = typeFilter === 'all' || i.invoice_type === typeFilter
-    const me  = !entityFilter || i.seller_entity_id === entityFilter || i.buyer_entity_id === entityFilter
+    const mse = !sellerEntityFilter || i.seller_entity_id === sellerEntityFilter
+    const mbe = !buyerEntityFilter  || i.buyer_entity_id === buyerEntityFilter
     const mo  = !orderFilter || i.order_id === orderFilter
     // CHANGED: dateFrom/dateTo inputs were rendered but never actually
     // applied — every invoice matched regardless of the date range picked.
     const mdf = !dateFrom || i.invoice_date >= dateFrom
     const mdt = !dateTo   || i.invoice_date <= dateTo
-    return ms && mst && mt && me && mo && mdf && mdt
+    return ms && mst && mt && mse && mbe && mo && mdf && mdt
   })
 
   // summary totals
@@ -446,9 +448,14 @@ function InvoiceList() {
           <option value='purchase'>Purchase</option>
         </select>
         <MultiSelectDropdown options={INV_STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
-        <select value={entityFilter} onChange={e => setEntityF(e.target.value)}
+        <select value={sellerEntityFilter} onChange={e => setSellerEntityF(e.target.value)} title='Seller Entity'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All entities</option>
+          <option value=''>All Seller Entities</option>
+          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+        </select>
+        <select value={buyerEntityFilter} onChange={e => setBuyerEntityF(e.target.value)} title='Buyer Entity'
+          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value=''>All Buyer Entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
         <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
