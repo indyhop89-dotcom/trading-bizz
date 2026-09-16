@@ -7,7 +7,7 @@ import { fmtDate, today } from '../../utils/dates'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchActualStockPosition } from '../../utils/stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
-import { matchPurchasesToSales } from '../../utils/margin'
+import { matchPurchasesToSales, calcMarginPct } from '../../utils/margin'
 import { downloadCSV } from '../../utils/csvTemplate'
 
 // CHANGED: "Compliance" is one tab in the main row, sitting next to Party
@@ -1056,7 +1056,7 @@ function MarginReport({ entities, fys, defaultEntityId }) {
         saleInvoices: sInvs.map(i => i.invoice_no).join(', '),
         purchaseDate: pInvs[0].invoice_date, saleDate: sInvs[0].invoice_date,
         qty: purchQty, purchaseAmount: purchTotal, saleAmount: saleTotal,
-        margin: round2(saleTotal - purchTotal),
+        margin: round2(saleTotal - purchTotal), marginPct: calcMarginPct(purchTotal, saleTotal),
       })
       for (const i of pInvs) legMatchedPurchInvIds.add(i.id)
       for (const i of sInvs) legMatchedSaleInvIds.add(i.id)
@@ -1079,7 +1079,7 @@ function MarginReport({ entities, fys, defaultEntityId }) {
           supplierName: r.purchase.supplierName, customerName: r.sale.customerName,
           purchaseInvoices: r.purchase.invoice_no, saleInvoices: r.sale.invoice_no,
           purchaseDate: r.purchase.invoice_date, saleDate: r.sale.invoice_date,
-          qty: round2(r.qty), purchaseAmount, saleAmount, margin: round2(saleAmount - purchaseAmount),
+          qty: round2(r.qty), purchaseAmount, saleAmount, margin: round2(saleAmount - purchaseAmount), marginPct: calcMarginPct(purchaseAmount, saleAmount),
         }
       }
       if (r.side === 'purchase') {
@@ -1088,7 +1088,7 @@ function MarginReport({ entities, fys, defaultEntityId }) {
           supplierName: r.purchase.supplierName, customerName: '—',
           purchaseInvoices: r.purchase.invoice_no, saleInvoices: '—',
           purchaseDate: r.purchase.invoice_date, saleDate: null,
-          qty: round2(r.qty), purchaseAmount: round2(r.qty * (Number(r.purchase.rate) || 0)), saleAmount: null, margin: null,
+          qty: round2(r.qty), purchaseAmount: round2(r.qty * (Number(r.purchase.rate) || 0)), saleAmount: null, margin: null, marginPct: null,
         }
       }
       return {
@@ -1096,7 +1096,7 @@ function MarginReport({ entities, fys, defaultEntityId }) {
         supplierName: '—', customerName: r.sale.customerName,
         purchaseInvoices: '—', saleInvoices: r.sale.invoice_no,
         purchaseDate: null, saleDate: r.sale.invoice_date,
-        qty: round2(r.qty), purchaseAmount: null, saleAmount: round2(r.qty * (Number(r.sale.rate) || 0)), margin: null,
+        qty: round2(r.qty), purchaseAmount: null, saleAmount: round2(r.qty * (Number(r.sale.rate) || 0)), margin: null, marginPct: null,
       }
     })
 
@@ -1109,7 +1109,7 @@ function MarginReport({ entities, fys, defaultEntityId }) {
   function handleExportCSV() {
     if (!rows) return
     downloadCSV(`margin_report_${today()}.csv`,
-      ['matchType', 'supplierName', 'purchaseInvoices', 'purchaseDate', 'customerName', 'saleInvoices', 'saleDate', 'qty', 'purchaseAmount', 'saleAmount', 'margin'],
+      ['matchType', 'supplierName', 'purchaseInvoices', 'purchaseDate', 'customerName', 'saleInvoices', 'saleDate', 'qty', 'purchaseAmount', 'saleAmount', 'margin', 'marginPct'],
       rows)
   }
 
@@ -1173,10 +1173,11 @@ function MarginReport({ entities, fys, defaultEntityId }) {
                   <th style={{ ...th, textAlign: 'right' }}>Purchase Value</th>
                   <th style={{ ...th, textAlign: 'right' }}>Sale Value</th>
                   <th style={{ ...th, textAlign: 'right' }}>Margin</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Margin %</th>
                   <th style={{ ...th, textAlign: 'left' }}>Matched Via</th>
                 </tr></thead>
                 <tbody>
-                  {rows.length === 0 && <tr><td colSpan={11} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No purchases found for this selection.</td></tr>}
+                  {rows.length === 0 && <tr><td colSpan={12} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No purchases found for this selection.</td></tr>}
                   {rows.map((r, i) => (
                     <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
                       <td style={td}>{r.supplierName}</td>
@@ -1189,6 +1190,7 @@ function MarginReport({ entities, fys, defaultEntityId }) {
                       <td style={{ ...td, textAlign: 'right' }}>{r.purchaseAmount != null ? formatINR(r.purchaseAmount) : '—'}</td>
                       <td style={{ ...td, textAlign: 'right' }}>{r.saleAmount != null ? formatINR(r.saleAmount) : '—'}</td>
                       <td style={{ ...td, textAlign: 'right', fontWeight: 700, color: r.margin == null ? C.textMuted : r.margin >= 0 ? C.success : C.danger }}>{r.margin != null ? formatINR(r.margin) : '—'}</td>
+                      <td style={{ ...td, textAlign: 'right', fontWeight: 700, color: r.marginPct == null ? C.textMuted : r.marginPct >= 0 ? C.success : C.danger }}>{r.marginPct != null ? `${r.marginPct >= 0 ? '+' : ''}${r.marginPct.toFixed(1)}%` : '—'}</td>
                       <td style={td}><Badge status={r.matchType === 'Order Leg' ? 'completed' : r.matchType === 'FIFO' ? 'active' : 'pending'} label={r.matchType} /></td>
                     </tr>
                   ))}
