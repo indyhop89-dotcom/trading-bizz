@@ -2,18 +2,19 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../../supabaseClient'
 import { fetchAllPages, excludeAutoPurchaseMirrors } from '../../utils/query'
 import { C, Card, FormRow, Select, StatCard, Badge, Btn } from '../../components/UI/index'
-import { formatINR, toNum } from '../../utils/money'
+import { formatINR, formatQty, toNum, round2 } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchActualStockPosition } from '../../utils/stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
+import { matchPurchasesToSales } from '../../utils/margin'
 import { downloadCSV } from '../../utils/csvTemplate'
 
 // CHANGED: "Compliance" is one tab in the main row, sitting next to Party
 // Ledger. Selecting it reveals a second-level sub-tab row for its two
 // reports (GST Summary, TDS/TCS Report) rather than splitting the main row
 // into groups.
-const TABS = ['P&L', 'Party Ledger', 'Compliance', 'Ledger', 'Profitability', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing']
+const TABS = ['P&L', 'Party Ledger', 'Compliance', 'Ledger', 'Profitability', 'Margin Report', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing']
 const COMPLIANCE_TABS = ['GST Summary', 'TDS/TCS Report']
 
 // 'YYYY-MM' → 'Jul 2026' for the month-wise GST table
@@ -955,6 +956,255 @@ function ProfitabilityReport({ entities, fys }) {
   )
 }
 
+// ─── Margin Report ────────────────────────────────────────────────────────────
+// For a chosen middleman entity (e.g. MVL, bought from VRVPL and resold to
+// Anugan), matches what they paid a supplier to what they charged their
+// onward customer, so the margin they kept on that specific trade is
+// visible. Two matching strategies, in priority order:
+//   1. Order/Leg pairing — when the purchase invoice's leg is followed, on
+//      the SAME order, by a leg where this entity is the from_entity, that
+//      next leg's sale invoices are trusted as the exact match (an Order's
+//      legs are built by the user specifically to chain one trade through
+//      several entities, so they're assumed to correspond 1:1 — same
+//      convention as computeLegMargin in Orders/index.jsx).
+//   2. FIFO by product + date — for every purchase/sale NOT covered by a
+//      leg pairing (most invoices, since Orders are opt-in), there's no
+//      lot/batch id to match on (see utils/margin.js's matchPurchasesToSales
+//      header), so the entity's oldest unconsumed purchase of a product is
+//      matched to its oldest unmatched sale of that same product.
+// Leftover purchased qty not yet resold, or sold qty with no matching
+// purchase found (e.g. from opening stock, or excluded by the Supplier
+// filter), is shown with no margin rather than guessed at.
+function MarginReport({ entities, fys, defaultEntityId }) {
+  const [entityId, setEntityId]     = useState('')
+  useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
+  const [supplierId, setSupplierId] = useState('all')
+  const [fyId, setFyId]             = useState('')
+  const [dateFrom, setDateFrom]     = useState('')
+  const [dateTo, setDateTo]         = useState('')
+  const [rows, setRows]             = useState(null)
+  const [loading, setLoading]       = useState(false)
+
+  async function runReport() {
+    if (!entityId) return
+    setLoading(true)
+    const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
+
+    // Purchases into this entity (the supply side) — date-range bound, since
+    // this defines the scope of goods being traced. excludeAutoPurchaseMirrors:
+    // see utils/query.js — otherwise an internal supplier's sale double-counts
+    // as this entity's purchase too.
+    let purchQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
+      .select('id,invoice_no,invoice_date,seller_entity_id,order_leg_id,taxable_amount,total_qty,seller:seller_entity_id(name,short_name)')
+      .eq('buyer_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled'))
+    if (supplierId !== 'all') purchQ = purchQ.eq('seller_entity_id', supplierId)
+    purchQ = applyDateRange(purchQ, range, 'invoice_date')
+
+    // Sales out of this entity — deliberately NOT date-bound, so a purchase
+    // near the end of the selected range can still find its matching sale
+    // even if that sale falls after the range.
+    let saleQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
+      .select('id,invoice_no,invoice_date,buyer_entity_id,order_leg_id,taxable_amount,total_qty,buyer:buyer_entity_id(name,short_name)')
+      .eq('seller_entity_id', entityId).eq('is_deleted', false).neq('status', 'cancelled'))
+
+    const [{ data: purchInvoices }, { data: saleInvoices }] = await Promise.all([purchQ, saleQ])
+    const purchIds = (purchInvoices || []).map(i => i.id)
+    const saleIds  = (saleInvoices || []).map(i => i.id)
+
+    const [{ data: purchLinesRaw }, { data: saleLinesRaw }] = await Promise.all([
+      purchIds.length ? fetchAllPages(() => supabase.from('invoice_lines').select('invoice_id,product_name,qty,rate').in('invoice_id', purchIds)) : Promise.resolve({ data: [] }),
+      saleIds.length  ? fetchAllPages(() => supabase.from('invoice_lines').select('invoice_id,product_name,qty,rate').in('invoice_id', saleIds))  : Promise.resolve({ data: [] }),
+    ])
+
+    const purchById = Object.fromEntries((purchInvoices || []).map(i => [i.id, i]))
+    const saleById   = Object.fromEntries((saleInvoices || []).map(i => [i.id, i]))
+
+    // Order/leg pairing — see header comment. A purchase leg's SAME-order
+    // next leg, when that next leg's from_entity is this entity, is trusted
+    // as the exact match.
+    const legIds = [...new Set([...(purchInvoices || []), ...(saleInvoices || [])].map(i => i.order_leg_id).filter(Boolean))]
+    let legById = {}, legByOrderAndNo = {}
+    if (legIds.length) {
+      const { data: legs } = await supabase.from('order_legs').select('id,order_id,leg_no,from_entity_id,to_entity_id').in('id', legIds)
+      for (const l of (legs || [])) { legById[l.id] = l; legByOrderAndNo[`${l.order_id}__${l.leg_no}`] = l.id }
+    }
+
+    // Group purchase/sale invoices by leg — a leg invoiced in several
+    // tranches is matched as one aggregate pair (same convention as
+    // computeLegMargin in Orders/index.jsx).
+    const purchByLeg = {}, saleByLeg = {}
+    for (const i of (purchInvoices || [])) if (i.order_leg_id) (purchByLeg[i.order_leg_id] ||= []).push(i)
+    for (const i of (saleInvoices  || [])) if (i.order_leg_id) (saleByLeg[i.order_leg_id]  ||= []).push(i)
+
+    const legMatchedRows = []
+    const legMatchedPurchInvIds = new Set()
+    const legMatchedSaleInvIds  = new Set()
+    for (const [legId, pInvs] of Object.entries(purchByLeg)) {
+      const leg = legById[legId]
+      if (!leg) continue
+      const nextLegId = legByOrderAndNo[`${leg.order_id}__${leg.leg_no + 1}`]
+      const sInvs = nextLegId ? saleByLeg[nextLegId] : null
+      if (!sInvs || !sInvs.length) continue
+      const purchTotal = round2(pInvs.reduce((s, i) => s + toNum(i.taxable_amount), 0))
+      const purchQty   = round2(pInvs.reduce((s, i) => s + toNum(i.total_qty), 0))
+      const saleTotal  = round2(sInvs.reduce((s, i) => s + toNum(i.taxable_amount), 0))
+      legMatchedRows.push({
+        matchType: 'Order Leg',
+        supplierName: pInvs[0].seller?.short_name || pInvs[0].seller?.name || '—',
+        customerName: sInvs[0].buyer?.short_name || sInvs[0].buyer?.name || '—',
+        purchaseInvoices: pInvs.map(i => i.invoice_no).join(', '),
+        saleInvoices: sInvs.map(i => i.invoice_no).join(', '),
+        purchaseDate: pInvs[0].invoice_date, saleDate: sInvs[0].invoice_date,
+        qty: purchQty, purchaseAmount: purchTotal, saleAmount: saleTotal,
+        margin: round2(saleTotal - purchTotal),
+      })
+      for (const i of pInvs) legMatchedPurchInvIds.add(i.id)
+      for (const i of sInvs) legMatchedSaleInvIds.add(i.id)
+    }
+
+    // Everything not covered by a leg pairing falls to FIFO-by-product-date.
+    const remainingPurchLines = (purchLinesRaw || [])
+      .filter(l => !legMatchedPurchInvIds.has(l.invoice_id))
+      .map(l => ({ ...l, invoice_date: purchById[l.invoice_id]?.invoice_date, invoice_no: purchById[l.invoice_id]?.invoice_no, supplierName: purchById[l.invoice_id]?.seller?.short_name || purchById[l.invoice_id]?.seller?.name || '—' }))
+    const remainingSaleLines = (saleLinesRaw || [])
+      .filter(l => !legMatchedSaleInvIds.has(l.invoice_id))
+      .map(l => ({ ...l, invoice_date: saleById[l.invoice_id]?.invoice_date, invoice_no: saleById[l.invoice_id]?.invoice_no, customerName: saleById[l.invoice_id]?.buyer?.short_name || saleById[l.invoice_id]?.buyer?.name || '—' }))
+
+    const fifoRows = matchPurchasesToSales(remainingPurchLines, remainingSaleLines).map(r => {
+      if (r.matched) {
+        const purchaseAmount = round2(r.qty * r.purchaseRate)
+        const saleAmount = round2(r.qty * r.saleRate)
+        return {
+          matchType: 'FIFO',
+          supplierName: r.purchase.supplierName, customerName: r.sale.customerName,
+          purchaseInvoices: r.purchase.invoice_no, saleInvoices: r.sale.invoice_no,
+          purchaseDate: r.purchase.invoice_date, saleDate: r.sale.invoice_date,
+          qty: round2(r.qty), purchaseAmount, saleAmount, margin: round2(saleAmount - purchaseAmount),
+        }
+      }
+      if (r.side === 'purchase') {
+        return {
+          matchType: 'Unsold',
+          supplierName: r.purchase.supplierName, customerName: '—',
+          purchaseInvoices: r.purchase.invoice_no, saleInvoices: '—',
+          purchaseDate: r.purchase.invoice_date, saleDate: null,
+          qty: round2(r.qty), purchaseAmount: round2(r.qty * (Number(r.purchase.rate) || 0)), saleAmount: null, margin: null,
+        }
+      }
+      return {
+        matchType: 'Unattributed Sale',
+        supplierName: '—', customerName: r.sale.customerName,
+        purchaseInvoices: '—', saleInvoices: r.sale.invoice_no,
+        purchaseDate: null, saleDate: r.sale.invoice_date,
+        qty: round2(r.qty), purchaseAmount: null, saleAmount: round2(r.qty * (Number(r.sale.rate) || 0)), margin: null,
+      }
+    })
+
+    const allRows = [...legMatchedRows, ...fifoRows]
+      .sort((a, b) => (a.purchaseDate || a.saleDate || '').localeCompare(b.purchaseDate || b.saleDate || ''))
+    setRows(allRows)
+    setLoading(false)
+  }
+
+  function handleExportCSV() {
+    if (!rows) return
+    downloadCSV(`margin_report_${today()}.csv`,
+      ['matchType', 'supplierName', 'purchaseInvoices', 'purchaseDate', 'customerName', 'saleInvoices', 'saleDate', 'qty', 'purchaseAmount', 'saleAmount', 'margin'],
+      rows)
+  }
+
+  const matchedRows   = (rows || []).filter(r => r.margin !== null)
+  const totalPurchase = round2(matchedRows.reduce((s, r) => s + r.purchaseAmount, 0))
+  const totalSale     = round2(matchedRows.reduce((s, r) => s + r.saleAmount, 0))
+  const totalMargin   = round2(totalSale - totalPurchase)
+
+  const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
+  const td = { padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+      <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+        <FormRow label='Entity' hint='The middleman whose margin you want'>
+          <Select value={entityId} onChange={e => setEntityId(e.target.value)} style={{ minWidth: '200px' }}>
+            <option value=''>Select entity</option>
+            {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+          </Select>
+        </FormRow>
+        <FormRow label='Supplier' hint='Optional — restrict to purchases from one supplier'>
+          <Select value={supplierId} onChange={e => setSupplierId(e.target.value)} style={{ minWidth: '180px' }}>
+            <option value='all'>All suppliers</option>
+            {entities.filter(e => e.id !== entityId).map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
+          </Select>
+        </FormRow>
+        <FormRow label='Financial Year'>
+          <Select value={fyId} onChange={e => setFyId(e.target.value)} style={{ minWidth: '160px' }}>
+            <option value=''>All time</option>
+            {fys.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+          </Select>
+        </FormRow>
+        <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} toHint='Bounds the purchase side; matching sales are found regardless of date' />
+        <button onClick={runReport} disabled={!entityId || loading}
+          style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
+          {loading ? 'Running…' : 'Run Report'}
+        </button>
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
+      </div>
+
+      {rows && (
+        <>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px,1fr))', gap: '12px' }}>
+            <StatCard label='Matched Purchases' value={formatINR(totalPurchase)} />
+            <StatCard label='Matched Sales' value={formatINR(totalSale)} />
+            <StatCard label='Margin Kept' value={formatINR(totalMargin)} color={totalMargin >= 0 ? C.success : C.danger}
+              sub={totalSale > 0 ? `${((totalMargin / totalSale) * 100).toFixed(1)}%` : undefined} />
+          </div>
+
+          <Card>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                <thead><tr>
+                  <th style={{ ...th, textAlign: 'left' }}>Supplier</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Purchase Inv.</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Purchase Date</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Customer</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Sale Inv.</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Sale Date</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Qty</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Purchase Value</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Sale Value</th>
+                  <th style={{ ...th, textAlign: 'right' }}>Margin</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Matched Via</th>
+                </tr></thead>
+                <tbody>
+                  {rows.length === 0 && <tr><td colSpan={11} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No purchases found for this selection.</td></tr>}
+                  {rows.map((r, i) => (
+                    <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
+                      <td style={td}>{r.supplierName}</td>
+                      <td style={{ ...td, fontFamily: 'monospace', fontSize: '12px' }}>{r.purchaseInvoices}</td>
+                      <td style={{ ...td, color: C.textSoft }}>{r.purchaseDate ? fmtDate(r.purchaseDate) : '—'}</td>
+                      <td style={td}>{r.customerName}</td>
+                      <td style={{ ...td, fontFamily: 'monospace', fontSize: '12px' }}>{r.saleInvoices}</td>
+                      <td style={{ ...td, color: C.textSoft }}>{r.saleDate ? fmtDate(r.saleDate) : '—'}</td>
+                      <td style={{ ...td, textAlign: 'right' }}>{formatQty(r.qty)}</td>
+                      <td style={{ ...td, textAlign: 'right' }}>{r.purchaseAmount != null ? formatINR(r.purchaseAmount) : '—'}</td>
+                      <td style={{ ...td, textAlign: 'right' }}>{r.saleAmount != null ? formatINR(r.saleAmount) : '—'}</td>
+                      <td style={{ ...td, textAlign: 'right', fontWeight: 700, color: r.margin == null ? C.textMuted : r.margin >= 0 ? C.success : C.danger }}>{r.margin != null ? formatINR(r.margin) : '—'}</td>
+                      <td style={td}><Badge status={r.matchType === 'Order Leg' ? 'completed' : r.matchType === 'FIFO' ? 'active' : 'pending'} label={r.matchType} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
+      {!loading && !rows && (
+        <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Select an entity, then Run Report.</div>
+      )}
+    </div>
+  )
+}
+
 // ─── Entity-wise Actual Stock ─────────────────────────────────────────────────
 // Reuses the exact same calc that powers the Stock page and LineItemsEditor's
 // availability check — one source of truth, never a second stock report that
@@ -1575,6 +1825,7 @@ export default function Reports() {
       {tab === 'Party Ledger' && <PartyLedger entities={entities} parties={parties} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Ledger'      && <Ledger entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Profitability' && <ProfitabilityReport entities={entities} fys={fys} />}
+      {tab === 'Margin Report' && <MarginReport entities={entities} fys={fys} defaultEntityId={defaultEntityId} />}
       {tab === 'Actual Stock'    && <ActualStockReport entities={entities} defaultEntityId={defaultEntityId} />}
       {tab === 'Stock Movements' && <StockMovementReport entities={entities} />}
       {tab === 'Missing Products' && <MissingProductReport />}
