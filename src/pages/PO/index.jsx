@@ -779,6 +779,18 @@ function PODetail() {
   const [linesCsvText, setLinesCsvText]     = useState('')
   const [linesCsvResult, setLinesCsvResult] = useState(null)
   const [linesCsvSaving, setLinesCsvSaving] = useState(false)
+  // CHANGED: Order / Leg are now editable after save (they could only be set
+  // on the New PO form before). Loaded the first time Edit is opened.
+  const [orders, setOrders] = useState([])
+  const [legs, setLegs]     = useState([])
+
+  async function loadLegs(orderId) {
+    if (!orderId) { setLegs([]); return }
+    const { data } = await supabase.from('order_legs')
+      .select('id,leg_no,from_entity:from_entity_id(name,short_name),to_entity:to_entity_id(name,short_name)')
+      .eq('order_id', orderId).order('leg_no')
+    setLegs(data || [])
+  }
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -824,7 +836,11 @@ function PODetail() {
       po_no: po.po_no || '', po_date: po.po_date || '', delivery_date: po.delivery_date || '',
       status: po.status || 'open', notes: po.notes || '', is_interstate: po.is_interstate,
       payment_terms: po.payment_terms || '', delivery_timeline: po.delivery_timeline || '', mode_of_transport: po.mode_of_transport || 'Road',
+      // CHANGED: link fields are editable too
+      order_id: po.order_id || '', order_leg_id: po.order_leg_id || '',
     })
+    supabase.from('orders').select('id,name,description,status').eq('is_deleted', false).order('name').then(({ data }) => setOrders(data || []))
+    loadLegs(po.order_id)
     setEditLines(lines.map(l => ({ ...l, _id: l.id, _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '' })))
     setEditRoundOffOverride('')
     setEditing(true)
@@ -886,7 +902,10 @@ function PODetail() {
     const computedLines = editLines.map(l => computeLine(l, editForm.is_interstate))
     const totals = computeTotals(computedLines, editRoundOffOverride)
     const { error: poErr } = await supabase.from('purchase_orders').update({
-      ...editForm, po_no: poNo, delivery_date: editForm.delivery_date || null, ...totals, updated_at: new Date(),
+      ...editForm, po_no: poNo, delivery_date: editForm.delivery_date || null,
+      // CHANGED: uuid columns — '' must go in as null
+      order_id: editForm.order_id || null, order_leg_id: editForm.order_leg_id || null,
+      ...totals, updated_at: new Date(),
     }).eq('id', id)
     if (poErr) { setSaving(false); return setToast({ message: poErr.message, type: 'error' }) }
     const { error: delErr } = await supabase.from('purchase_order_lines').delete().eq('po_id', id)
@@ -1003,6 +1022,19 @@ function PODetail() {
             <FormRow label='Mode of Transport'>
               <Select value={editForm.mode_of_transport} onChange={e=>setEditForm(f=>({...f,mode_of_transport:e.target.value}))}>{TRANSPORT_MODES.map(m=><option key={m} value={m}>{m}</option>)}</Select>
             </FormRow>
+            {/* CHANGED: link / relink / unlink the order and leg. PIs are linked in the "Linked PIs" panel below, which now stays visible while editing. */}
+            <FormRow label='Order'>
+              <Select value={editForm.order_id} onChange={e=>{setEditForm(f=>({...f,order_id:e.target.value,order_leg_id:''}));loadLegs(e.target.value)}}>
+                <option value=''>No order</option>
+                {orders.filter(o=>isOrderOpenForDocs(o)||o.id===editForm.order_id).map(o=><option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Order Leg'>
+              <Select value={editForm.order_leg_id} onChange={e=>setEditForm(f=>({...f,order_leg_id:e.target.value}))} disabled={!editForm.order_id||!legs.length}>
+                <option value=''>Select leg</option>
+                {legs.map(l=><option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name||l.from_entity?.name} → {l.to_entity?.short_name||l.to_entity?.name}</option>)}
+              </Select>
+            </FormRow>
           </div>
           <div style={{marginTop:'8px'}}><FormRow label='Notes'><Textarea value={editForm.notes} onChange={e=>setEditForm(f=>({...f,notes:e.target.value}))} rows={2}/></FormRow></div>
         </Card>
@@ -1031,7 +1063,8 @@ function PODetail() {
 
       {/* CHANGED: every PI raised against this PO, with a running qty/value
           total against the PO's own — one PO can cover several PIs. */}
-      {!editing && (
+      {/* CHANGED: was hidden while editing — linking PIs is part of editing a PO. Link / Unlink here save immediately, independent of "Save Changes". */}
+      {(
         <div style={{ marginTop: '20px' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap', marginBottom: '10px' }}>
             <div style={{ fontWeight: 700, fontSize: '14px' }}>Linked PIs{linkedPIs.length > 0 ? ` (${linkedPIs.length})` : ''}</div>

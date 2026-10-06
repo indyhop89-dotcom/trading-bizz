@@ -1113,6 +1113,15 @@ function InvoiceDetail() {
   const [linesCsvText, setLinesCsvText]     = useState('')
   const [linesCsvResult, setLinesCsvResult] = useState(null)
   const [linesCsvSaving, setLinesCsvSaving] = useState(false)
+  // CHANGED: Order / Leg / Linked PI / Linked PO are now editable after save
+  // (they could only be set on the New Invoice form before). Pick lists are
+  // loaded the first time Edit is opened; linkNames is just the PI/PO number
+  // for the read-only details strip.
+  const [orders, setOrders]       = useState([])
+  const [legs, setLegs]           = useState([])
+  const [pis, setPIs]             = useState([])
+  const [pos, setPOs]             = useState([])
+  const [linkNames, setLinkNames] = useState({ pi_no: '', po_no: '' })
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -1139,9 +1148,63 @@ function InvoiceDetail() {
     setHsnMap(buildHSNMap(hsnRows || []))
     setProducts(prods || [])
     setLoading(false)
+    // CHANGED: PI / PO numbers for the details strip. Separate small lookups
+    // (not an embed on the main query) so a failure here can never stop the
+    // invoice itself from loading.
+    if (i) {
+      const [piRes, poRes] = await Promise.all([
+        i.pi_id ? supabase.from('proforma_invoices').select('pi_no').eq('id', i.pi_id).maybeSingle() : Promise.resolve({ data: null }),
+        i.po_id ? supabase.from('purchase_orders').select('po_no').eq('id', i.po_id).maybeSingle() : Promise.resolve({ data: null }),
+      ])
+      setLinkNames({ pi_no: piRes.data?.pi_no || '', po_no: poRes.data?.po_no || '' })
+    }
   }, [id])
 
   useEffect(() => { load() }, [load])
+
+  // CHANGED: pick lists for the link fields in edit mode.
+  async function loadLinkOptions() {
+    const [{ data: os }, { data: piData }, { data: poData }] = await Promise.all([
+      supabase.from('orders').select('id,name,description,status').eq('is_deleted', false).order('name'),
+      supabase.from('proforma_invoices').select('id,pi_no,status,po_id,from_entity_id,to_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
+      supabase.from('purchase_orders').select('id,po_no,status,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
+    ])
+    setOrders(os || [])
+    setPIs(piData || [])
+    setPOs(poData || [])
+  }
+
+  async function loadLegs(orderId) {
+    if (!orderId) { setLegs([]); return }
+    const { data } = await supabase.from('order_legs')
+      .select('id,leg_no,from_entity:from_entity_id(name,short_name),to_entity:to_entity_id(name,short_name)')
+      .eq('order_id', orderId).order('leg_no')
+    setLegs(data || [])
+  }
+
+  // CHANGED: picking a PI / PO in edit mode only changes the LINK. It fills
+  // the PO (from the PI) and the order / leg when those are still blank, and
+  // never touches line items — this invoice may already have an E-way Bill
+  // and moved stock.
+  function handleEditPISelect(piId) {
+    const pi = pis.find(p => p.id === piId)
+    setEditForm(f => ({
+      ...f, pi_id: piId,
+      po_id:        f.po_id        || pi?.po_id        || '',
+      order_id:     f.order_id     || pi?.order_id     || '',
+      order_leg_id: f.order_leg_id || (!f.order_id || f.order_id === pi?.order_id ? pi?.order_leg_id : '') || '',
+    }))
+    if (pi?.order_id && !editForm.order_id) loadLegs(pi.order_id)
+  }
+  function handleEditPOSelect(poId) {
+    const po = pos.find(p => p.id === poId)
+    setEditForm(f => ({
+      ...f, po_id: poId,
+      order_id:     f.order_id     || po?.order_id     || '',
+      order_leg_id: f.order_leg_id || (!f.order_id || f.order_id === po?.order_id ? po?.order_leg_id : '') || '',
+    }))
+    if (po?.order_id && !editForm.order_id) loadLegs(po.order_id)
+  }
 
   async function updateStatus(status) {
     // CHANGED: if this invoice's E-way Bill was already generated, cancelling
@@ -1296,7 +1359,11 @@ function InvoiceDetail() {
       payment_terms: inv.payment_terms || '',
       status: inv.status || 'draft', notes: inv.notes || '', is_interstate: inv.is_interstate,
       bill_from: inv.bill_from || '', bill_to: inv.bill_to || '', ship_from: inv.ship_from || '', ship_to: inv.ship_to || '',
+      // CHANGED: link fields are editable too
+      order_id: inv.order_id || '', order_leg_id: inv.order_leg_id || '', pi_id: inv.pi_id || '', po_id: inv.po_id || '',
     })
+    loadLinkOptions()
+    loadLegs(inv.order_id)
     setEditLines(lines.map(l => ({ ...l, _id: l.id, _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '' })))
     setEditRoundOffOverride('')
     setEditing(true)
@@ -1365,12 +1432,28 @@ function InvoiceDetail() {
     // paid — recompute it from the invoice's own paid_amount rather than
     // resetting it, so an edit after partial payment doesn't wipe that out.
     const outstanding = round2(totals.total_amount - (Number(inv.paid_amount) || 0))
+    const links = {
+      pi_id: editForm.pi_id || null, po_id: editForm.po_id || null,
+      order_id: editForm.order_id || null, order_leg_id: editForm.order_leg_id || null,
+    }
+    const linksChanged = Object.keys(links).some(k => (links[k] || null) !== (inv[k] || null))
     const { error: invErr } = await supabase.from('invoices').update({
       ...editForm, invoice_no: invoiceNo, due_date: editForm.due_date || null,
       payment_terms: editForm.payment_terms || null,
+      // CHANGED: uuid columns — '' must go in as null
+      ...links,
       ...totals, outstanding_amount: outstanding, updated_at: new Date(),
     }).eq('id', id)
     if (invErr) { setSaving(false); return setToast({ message: invErr.message, type: 'error' }) }
+    // CHANGED: the buyer-side purchase mirror (created when the E-way Bill was
+    // saved) carries its own copy of these links — keep it in step, otherwise
+    // it would go on pointing at the old PI / PO / order.
+    let mirrorWarn = ''
+    if (linksChanged) {
+      const { error: mirrorErr } = await supabase.from('invoices').update({ ...links, updated_at: new Date() })
+        .eq('source_invoice_id', id).eq('invoice_type', 'purchase')
+      if (mirrorErr) mirrorWarn = mirrorErr.message
+    }
     const { error: delErr } = await supabase.from('invoice_lines').delete().eq('invoice_id', id)
     if (delErr) { setSaving(false); return setToast({ message: `Could not clear old line items: ${delErr.message}. Invoice header was updated but lines were left unchanged to avoid duplicates.`, type: 'error' }) }
     const linesPayload = computedLines.map((l, i) => toInvoiceLinePayload(l, id, i + 1))
@@ -1380,10 +1463,16 @@ function InvoiceDetail() {
     }
     // CHANGED: edited quantities (or status) change how much of the linked
     // PI/PO is invoiced — keep their status in step.
-    if (inv.pi_id) await syncLinkedDocStatus('pi', inv.pi_id, { allowReopen: true })
-    if (inv.po_id) await syncLinkedDocStatus('po', inv.po_id, { allowReopen: true })
+    // CHANGED: when the link itself was changed, BOTH sides need re-deriving —
+    // the PI/PO this invoice was moved off (may reopen) and the one it was
+    // moved onto (may become partial / converted / completed).
+    for (const piId of new Set([inv.pi_id, links.pi_id].filter(Boolean))) await syncLinkedDocStatus('pi', piId, { allowReopen: true })
+    for (const poId of new Set([inv.po_id, links.po_id].filter(Boolean))) await syncLinkedDocStatus('po', poId, { allowReopen: true })
     setSaving(false); setEditing(false)
-    setToast({ message: 'Invoice updated', type: 'success' }); load()
+    setToast(mirrorWarn
+      ? { message: `Invoice updated, but the buyer purchase entry could not be re-linked: ${mirrorWarn}`, type: 'error' }
+      : { message: 'Invoice updated', type: 'success' })
+    load()
   }
 
   if (loading) return <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
@@ -1450,6 +1539,9 @@ function InvoiceDetail() {
         <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={inv.is_interstate ? 'export' : 'domestic'} label={inv.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
         {inv.einvoice_irn && <div><span style={{ color: C.textMuted }}>IRN:</span> <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{inv.einvoice_irn}</span></div>}
         {inv.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{inv.orders.name}</strong></div>}
+        {/* CHANGED: show what this invoice is linked to */}
+        {inv.pi_id && <div><span style={{ color: C.textMuted }}>PI:</span> <strong style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }} onClick={() => navigate(`/pi/${inv.pi_id}`)}>{linkNames.pi_no || inv.pi_id.slice(0, 8)}</strong></div>}
+        {inv.po_id && <div><span style={{ color: C.textMuted }}>PO:</span> <strong style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }} onClick={() => navigate(`/po/${inv.po_id}`)}>{linkNames.po_no || inv.po_id.slice(0, 8)}</strong></div>}
       </div>
 
       {/* Outstanding */}
@@ -1473,6 +1565,31 @@ function InvoiceDetail() {
             <FormRow label='Due Date' hint={editForm.payment_terms?'Auto-set from payment terms — override if needed':undefined}><Input type='date' value={editForm.due_date} onChange={e=>setEditForm(f=>({...f,due_date:e.target.value}))}/></FormRow>
             <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{INV_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
             <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
+            {/* CHANGED: link / relink / unlink — Order, Leg, PI, PO. Only PIs and POs between this invoice's own seller and buyer are offered. Changing a link never changes the line items. */}
+            <FormRow label='Order'>
+              <Select value={editForm.order_id} onChange={e=>{setEditForm(f=>({...f,order_id:e.target.value,order_leg_id:''}));loadLegs(e.target.value)}}>
+                <option value=''>No order</option>
+                {orders.filter(o=>isOrderOpenForDocs(o)||o.id===editForm.order_id).map(o=><option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Order Leg'>
+              <Select value={editForm.order_leg_id} onChange={e=>setEditForm(f=>({...f,order_leg_id:e.target.value}))} disabled={!editForm.order_id||!legs.length}>
+                <option value=''>Select leg</option>
+                {legs.map(l=><option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name||l.from_entity?.name} → {l.to_entity?.short_name||l.to_entity?.name}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Linked PI' hint='Line items are not changed'>
+              <Select value={editForm.pi_id} onChange={e=>handleEditPISelect(e.target.value)}>
+                <option value=''>No PI linked</option>
+                {pis.filter(p=>p.id===editForm.pi_id||(p.status!=='cancelled'&&p.from_entity_id===inv.seller_entity_id&&p.to_entity_id===inv.buyer_entity_id&&(!editForm.order_id||!p.order_id||p.order_id===editForm.order_id))).map(p=><option key={p.id} value={p.id}>{p.pi_no||p.id.slice(0,8)}</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Linked PO' hint='Line items are not changed'>
+              <Select value={editForm.po_id} onChange={e=>handleEditPOSelect(e.target.value)}>
+                <option value=''>No PO linked</option>
+                {pos.filter(p=>p.id===editForm.po_id||(p.status!=='cancelled'&&p.seller_entity_id===inv.seller_entity_id&&p.buyer_entity_id===inv.buyer_entity_id&&(!editForm.order_id||!p.order_id||p.order_id===editForm.order_id))).map(p=><option key={p.id} value={p.id}>{p.po_no||p.id.slice(0,8)}</option>)}
+              </Select>
+            </FormRow>
             <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>
             <FormRow label='Bill To'><Input value={editForm.bill_to} onChange={e=>setEditForm(f=>({...f,bill_to:e.target.value}))}/></FormRow>
             <FormRow label='Ship From'><Input value={editForm.ship_from} onChange={e=>setEditForm(f=>({...f,ship_from:e.target.value}))}/></FormRow>
