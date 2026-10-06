@@ -20,7 +20,7 @@ import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductName, findLinesExceedingStock } from '../../utils/stock'
-import { isOrderOpenForDocs } from '../../utils/orders'
+import { isOrderOpenForDocs, orderLabel } from '../../utils/orders'
 import { PAYMENT_TERMS_OPTIONS } from '../../utils/paymentTerms'
 import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
@@ -55,6 +55,7 @@ const EMPTY_FORM = {
   pi_date: today(), valid_upto: '', status: 'draft',
   from_entity_id: '', to_entity_id: '',
   order_id: '', order_leg_id: '',
+  po_id: '', // CHANGED: the PO this PI is raised against — several PIs can share one PO (migration 056)
   is_interstate: false, notes: '',
   bill_from: '', bill_to: '', ship_from: '', ship_to: '',
   pi_no: '', // CHANGED: optional manual PI number — blank suggests one via suggestNextNo()
@@ -97,6 +98,7 @@ function PIList() {
   const [pis, setPIs]           = useState([])
   const [entities, setEntities] = useState([])
   const [orders, setOrders]     = useState([])
+  const [pos, setPOs]           = useState([]) // CHANGED: feeds the Linked PO dropdown
   // CHANGED: needed to resolve/auto-create products for CSV-uploaded lines —
   // previously this handler never set product_id at all, which silently
   // broke stock tracking (Planned Stock) for every CSV-created PI line.
@@ -132,13 +134,14 @@ function PIList() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: ps }, { data: es }, { data: os }, { data: hsnRows }, { data: prods }] = await Promise.all([
+    const [{ data: poData }, { data: ps }, { data: es }, { data: os }, { data: hsnRows }, { data: prods }] = await Promise.all([
+      supabase.from('purchase_orders').select('id,po_no,status,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('proforma_invoices')
         .select('*, from_entity:from_entity_id(name,short_name), to_entity:to_entity_id(name,short_name), orders(name)')
         .eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       // `status` so the New PI modal can offer only still-open orders
-      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
+      supabase.from('orders').select('id,name,description,status').eq('is_deleted', false).order('name'),
       supabase.from('hsn_master').select('*').eq('is_active', true),
       // CHANGED: for CSV product resolution below. Paginated — products can
       // exceed PostgREST's default 1000-row cap, which would otherwise
@@ -146,7 +149,7 @@ function PIList() {
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
     setPIs(ps||[]); setEntities(es||[]); setOrders(os||[]); setHsnMap(buildHSNMap(hsnRows||[]))
-    setProducts(prods||[])
+    setProducts(prods||[]); setPOs(poData||[])
     setLoading(false)
   }, [])
 
@@ -184,6 +187,22 @@ function PIList() {
       .select('id, leg_no, from_entity:from_entity_id(name,short_name), to_entity:to_entity_id(name,short_name)')
       .eq('order_id', orderId).order('leg_no')
     setLegs(data || [])
+  }
+
+  // CHANGED: raising this PI against an existing PO — fills in whatever the
+  // PO already tells us (seller → From, buyer → To, order, leg) without
+  // overwriting anything already chosen. Goes through setF so the tax type
+  // is re-derived from the two entities.
+  function handlePOSelect(poId) {
+    const po = pos.find(p => p.id === poId)
+    setF('po_id', poId)
+    if (!po) return
+    if (!form.from_entity_id && po.seller_entity_id) setF('from_entity_id', po.seller_entity_id)
+    if (!form.to_entity_id && po.buyer_entity_id)    setF('to_entity_id', po.buyer_entity_id)
+    if (!form.order_id && po.order_id) {
+      setF('order_id', po.order_id); loadLegs(po.order_id)
+      if (po.order_leg_id) setF('order_leg_id', po.order_leg_id)
+    }
   }
 
   const [piLines, setPILines] = useState([])
@@ -238,6 +257,7 @@ function PIList() {
     const payload = { ...form, ...totals, pi_no: piNo, copied_from_pi_id: copiedFromPiId || null }
     if (!payload.order_id)     delete payload.order_id
     if (!payload.order_leg_id) delete payload.order_leg_id
+    if (!payload.po_id)        delete payload.po_id
     if (!payload.valid_upto)   delete payload.valid_upto
     const { data: pi, error: piErr } = await supabase.from('proforma_invoices').insert(payload).select().single()
     if (piErr) { setSaving(false); return setToast({ message: piErr.message, type: 'error' }) }
@@ -546,7 +566,7 @@ function PIList() {
         <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All orders</option>
-          {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+          {orders.map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
         </select>
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
@@ -670,13 +690,24 @@ function PIList() {
               <Select value={form.order_id} onChange={e => { setF('order_id', e.target.value); loadLegs(e.target.value) }}>
                 <option value=''>No order</option>
                 {/* CHANGED: only orders still open for documents — completed/cancelled hidden (current selection stays visible) */}
-                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Order Leg'>
               <Select value={form.order_leg_id} onChange={e => setF('order_leg_id', e.target.value)} disabled={!form.order_id || !legs.length}>
                 <option value=''>Select leg</option>
                 {legs.map(l => <option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name || l.from_entity?.name} → {l.to_entity?.short_name || l.to_entity?.name}</option>)}
+              </Select>
+            </FormRow>
+            {/* CHANGED: several PIs can be raised against the same PO. Narrowed
+                to POs between the chosen From/To entities once those are set. */}
+            <FormRow label='Linked PO' hint='Optional — the PO this PI is raised against'>
+              <Select value={form.po_id} onChange={e => handlePOSelect(e.target.value)}>
+                <option value=''>No PO linked</option>
+                {pos.filter(p => p.id === form.po_id || (p.status !== 'cancelled'
+                  && (!form.from_entity_id || p.seller_entity_id === form.from_entity_id)
+                  && (!form.to_entity_id || p.buyer_entity_id === form.to_entity_id)))
+                  .map(p => <option key={p.id} value={p.id}>{p.po_no || p.id.slice(0, 8)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Payment Terms' hint='Shown on the generated PI PDF/Excel'>
@@ -752,6 +783,7 @@ function PIDetail() {
   const [editForm, setEditForm]   = useState({})
   const [hsnMap, setHsnMap]       = useState(new Map())
   const [orders, setOrders]       = useState([])
+  const [pos, setPOs]             = useState([]) // CHANGED: feeds the Linked PO display + edit dropdown
   const [legs, setLegs]           = useState([])
   const [loading, setLoading]     = useState(true)
   const [saving, setSaving]       = useState(false)
@@ -769,7 +801,8 @@ function PIDetail() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [{ data: p }, { data: ls }, { data: hsnRows }, { data: os }, { data: prods }] = await Promise.all([
+    const [{ data: poData }, { data: p }, { data: ls }, { data: hsnRows }, { data: os }, { data: prods }] = await Promise.all([
+      supabase.from('purchase_orders').select('id,po_no,status,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('proforma_invoices').select('*, from_entity:from_entity_id(name,short_name,gstin,state_code,address,city), to_entity:to_entity_id(name,short_name,gstin,state_code,address,city), orders(name), order_legs(leg_no)').eq('id',id).single(),
       // CHANGED: a plain .select() caps at PostgREST's default 1000-row
       // response — a PI with more line items than that silently lost the
@@ -777,10 +810,10 @@ function PIDetail() {
       // column (which is recomputed directly in Postgres, no REST cap).
       fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id',id).order('line_no')),
       supabase.from('hsn_master').select('*').eq('is_active',true),
-      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
+      supabase.from('orders').select('id,name,description,status').eq('is_deleted', false).order('name'),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
-    setPI(p); setLines(ls||[]); setHsnMap(buildHSNMap(hsnRows||[])); setOrders(os||[]); setProducts(prods||[]); setLoading(false)
+    setPI(p); setLines(ls||[]); setHsnMap(buildHSNMap(hsnRows||[])); setOrders(os||[]); setProducts(prods||[]); setPOs(poData||[]); setLoading(false)
   }, [id])
 
   useEffect(() => { load() }, [load])
@@ -807,7 +840,7 @@ function PIDetail() {
     if (lines.length > MAX_EDITABLE_LINES) {
       return setToast({message:`This PI has ${lines.length} line items, above the ${MAX_EDITABLE_LINES} safety limit. If this isn't expected, it's likely duplicated by a past bug — run supabase/maintenance/dedupe_line_items.sql to clean it up.`,type:'error'})
     }
-    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||'',order_id:pi.order_id||'',order_leg_id:pi.order_leg_id||'',payment_terms:pi.payment_terms||'',delivery_timeline:pi.delivery_timeline||'',mode_of_transport:pi.mode_of_transport||'Road'})
+    setEditForm({pi_no:pi.pi_no||'',pi_date:pi.pi_date||'',valid_upto:pi.valid_upto||'',status:pi.status||'draft',notes:pi.notes||'',is_interstate:pi.is_interstate,bill_from:pi.bill_from||'',bill_to:pi.bill_to||'',ship_from:pi.ship_from||'',ship_to:pi.ship_to||'',order_id:pi.order_id||'',order_leg_id:pi.order_leg_id||'',po_id:pi.po_id||'',payment_terms:pi.payment_terms||'',delivery_timeline:pi.delivery_timeline||'',mode_of_transport:pi.mode_of_transport||'Road'})
     setEditLines(lines.map(l=>({...l,_id:l.id,_hsn_resolved_rate:null,_hsn_override:false,_hsn_manually_set:false,_cost_rate:null,_margin_pct:''})))
     setEditRoundOffOverride('')
     if (pi.order_id) loadLegs(pi.order_id)
@@ -838,7 +871,7 @@ function PIDetail() {
     // deletes empty optional fields from its payload); this edit path never
     // did, so saving any PI with no valid_upto always failed silently until
     // now — same bug, edit side.
-    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,valid_upto:editForm.valid_upto||null,order_id:editForm.order_id||null,order_leg_id:editForm.order_leg_id||null,...totals,updated_at:new Date()}).eq('id',id)
+    const { error: piErr } = await supabase.from('proforma_invoices').update({...editForm,pi_no:piNo,valid_upto:editForm.valid_upto||null,order_id:editForm.order_id||null,order_leg_id:editForm.order_leg_id||null,po_id:editForm.po_id||null,...totals,updated_at:new Date()}).eq('id',id)
     if (piErr) { setSaving(false); return setToast({message:piErr.message,type:'error'}) }
     // CHANGED: this delete's result was never checked. If it silently failed
     // (RLS/timeout) while the insert below still ran, every re-save stacked
@@ -1008,6 +1041,8 @@ function PIDetail() {
         {pi.valid_upto && <div><span style={{ color: C.textMuted }}>Valid until:</span> <strong>{fmtDate(pi.valid_upto)}</strong></div>}
         <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={pi.is_interstate ? 'export' : 'domestic'} label={pi.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
         {pi.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{pi.orders.name}{pi.order_legs?.leg_no ? ` — Leg ${pi.order_legs.leg_no}` : ''}</strong></div>}
+        {/* CHANGED: the PO this PI is raised against (several PIs can share one) */}
+        {pi.po_id && <div><span style={{ color: C.textMuted }}>PO:</span> <strong style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }} onClick={() => navigate(`/po/${pi.po_id}`)}>{pos.find(p => p.id === pi.po_id)?.po_no || 'View PO'}</strong></div>}
       </div>
 
       {editing&&(
@@ -1023,13 +1058,20 @@ function PIDetail() {
               <Select value={editForm.order_id} onChange={e=>{setEditForm(f=>({...f,order_id:e.target.value,order_leg_id:''}));loadLegs(e.target.value)}}>
                 <option value=''>No order</option>
                 {/* CHANGED: only still-open orders (current selection stays visible) */}
-                {orders.filter(o=>isOrderOpenForDocs(o)||o.id===editForm.order_id).map(o=><option key={o.id} value={o.id}>{o.name}</option>)}
+                {orders.filter(o=>isOrderOpenForDocs(o)||o.id===editForm.order_id).map(o=><option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Order Leg'>
               <Select value={editForm.order_leg_id} onChange={e=>setEditForm(f=>({...f,order_leg_id:e.target.value}))} disabled={!editForm.order_id||!legs.length}>
                 <option value=''>Select leg</option>
                 {legs.map(l=><option key={l.id} value={l.id}>Leg {l.leg_no}: {l.from_entity?.short_name||l.from_entity?.name} → {l.to_entity?.short_name||l.to_entity?.name}</option>)}
+              </Select>
+            </FormRow>
+            {/* CHANGED: link / relink / unlink the PO this PI is raised against — only POs between this PI's own seller and buyer */}
+            <FormRow label='Linked PO'>
+              <Select value={editForm.po_id} onChange={e=>setEditForm(f=>({...f,po_id:e.target.value}))}>
+                <option value=''>No PO linked</option>
+                {pos.filter(p=>p.id===editForm.po_id||(p.status!=='cancelled'&&p.seller_entity_id===pi.from_entity_id&&p.buyer_entity_id===pi.to_entity_id)).map(p=><option key={p.id} value={p.id}>{p.po_no||p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>

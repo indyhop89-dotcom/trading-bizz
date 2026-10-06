@@ -56,7 +56,8 @@ const MOVEMENT_TYPES    = ['domestic', 'export', 'blended']
 const CARGO_STATUSES    = ['awaiting_cargo','cargo_dispatched','cargo_received','ready_for_pi','ready_for_invoice','completed']
 const MOVEMENT_STATUSES = ['pending','in_transit','delivered']
 
-const EMPTY_ORDER = { name:'', movement_type:'domestic', status:'open', origin_entity_id:'', destination_entity_id:'', notes:'' }
+// CHANGED: `description` — short label for what the order is ("Monofilaments", "Garments"), migration 056
+const EMPTY_ORDER = { name:'', description:'', movement_type:'domestic', status:'open', origin_entity_id:'', destination_entity_id:'', notes:'' }
 const EMPTY_LEG   = { from_entity_id:'', to_entity_id:'', movement_status:'pending', cargo_status:'awaiting_cargo', dispatch_date:'', delivery_date:'', notes:'' }
 
 // Resolve current FY — next_order_no takes ONLY fy_id (no ent_id)
@@ -398,7 +399,7 @@ function OrdersList() {
   }
 
   const filtered = orders.filter(o => {
-    const ms  = !search||o.name.toLowerCase().includes(search.toLowerCase())||(o.order_no||'').toLowerCase().includes(search.toLowerCase())
+    const ms  = !search||o.name.toLowerCase().includes(search.toLowerCase())||(o.order_no||'').toLowerCase().includes(search.toLowerCase())||(o.description||'').toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter.length===0||statusFilter.includes(o.status)
     const mdf = !dateFrom||o.created_at>=dateFrom
     const mdt = !dateTo||o.created_at<=dateTo+'T23:59:59'
@@ -469,7 +470,7 @@ function OrdersList() {
                       {canDelete && <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}} onClick={e=>e.stopPropagation()}>
                         <input type='checkbox' checked={selected.has(o.id)} onChange={()=>toggleSelect(o.id)} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
                       </td>}
-                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.description&&<div style={{fontSize:'12px',color:C.textSoft}}>{o.description}</div>}{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
                       <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><Badge status={o.movement_type}/></td>
                       <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.origin)}</td>
                       <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.destination)}</td>
@@ -498,6 +499,9 @@ function OrdersList() {
           </div>
           <FormRow label='Order Name' required hint='e.g. "Siddi → Retail → MVL Jun-25"'>
             <Input value={form.name} onChange={e=>setF('name',e.target.value)} placeholder='Descriptive name'/>
+          </FormRow>
+          <FormRow label='Description' hint='What this order is — shown beside the name in lists and dropdowns'>
+            <Input value={form.description} onChange={e=>setF('description',e.target.value)} placeholder='e.g. Monofilaments, Garments'/>
           </FormRow>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
             <FormRow label='Movement Type' required>
@@ -869,9 +873,9 @@ function OrderDetail() {
       <button onClick={()=>navigate('/orders')} style={{background:'none',border:'none',color:C.textMuted,fontSize:'13px',cursor:'pointer',padding:0,fontFamily:'inherit',marginBottom:'4px'}}>← Orders</button>
       <PageHeader
         title={order.name}
-        subtitle={`${order.order_no?order.order_no+' · ':''}${order.financial_years?.name||''}`}
+        subtitle={`${order.description?order.description+' · ':''}${order.order_no?order.order_no+' · ':''}${order.financial_years?.name||''}`}
         action={<div style={{display:'flex',gap:'8px'}}>
-          <Btn variant='ghost' onClick={()=>{setOrderForm({name:order.name,movement_type:order.movement_type,status:order.status,origin_entity_id:order.origin_entity_id||'',destination_entity_id:order.destination_entity_id||'',notes:order.notes||''});setEditOrderModal(true)}}>Edit Order</Btn>
+          <Btn variant='ghost' onClick={()=>{setOrderForm({name:order.name,description:order.description||'',movement_type:order.movement_type,status:order.status,origin_entity_id:order.origin_entity_id||'',destination_entity_id:order.destination_entity_id||'',notes:order.notes||''});setEditOrderModal(true)}}>Edit Order</Btn>
           <Btn onClick={openNewLeg}>+ Add Leg</Btn>
           {/* CHANGED: master-only order delete, same convention as PI/PO/Invoices */}
           {canDelete && <Btn variant='danger' onClick={()=>setConfirmDeleteOrder(true)} disabled={deletingOrder}>{deletingOrder?'Deleting…':'Delete Order'}</Btn>}
@@ -988,6 +992,7 @@ function OrderDetail() {
       <Modal open={editOrderModal} onClose={()=>setEditOrderModal(false)} title='Edit Order' width={560}>
         <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
           <FormRow label='Name' required><Input value={orderForm.name||''} onChange={e=>setOF('name',e.target.value)}/></FormRow>
+          <FormRow label='Description' hint='What this order is — shown beside the name in lists and dropdowns'><Input value={orderForm.description||''} onChange={e=>setOF('description',e.target.value)} placeholder='e.g. Garments'/></FormRow>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
             <FormRow label='Movement Type'><Select value={orderForm.movement_type||'domestic'} onChange={e=>setOF('movement_type',e.target.value)}>{MOVEMENT_TYPES.map(t=><option key={t} value={t}>{t}</option>)}</Select></FormRow>
             <FormRow label='Status'><Select value={orderForm.status||'open'} onChange={e=>setOF('status',e.target.value)}>{ORDER_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>

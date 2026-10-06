@@ -20,7 +20,7 @@ import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchEntityAvailableStock, findLinesMissingProductName, findLinesExceedingStock, getInvoiceLifecycleStage } from '../../utils/stock'
-import { isOrderOpenForDocs } from '../../utils/orders'
+import { isOrderOpenForDocs, orderLabel } from '../../utils/orders'
 import { PAYMENT_TERMS_OPTIONS, dueDateForTerms } from '../../utils/paymentTerms'
 import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
@@ -28,6 +28,8 @@ import { isValidEwayBill, EWAY_BILL_ERROR } from '../../utils/validation'
 // CHANGED: buildInvoiceDoc moved to utils/documentBuilders.js — see that
 // file's header comment (same rationale as PI/index.jsx's buildPIDoc move).
 import { buildInvoiceDoc } from '../../utils/documentBuilders'
+// CHANGED: one PI/PO can now be billed across several invoices — see utils/docLinks.js.
+import { fetchRemainingLines, syncLinkedDocStatus } from '../../utils/docLinks'
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
 
@@ -183,7 +185,7 @@ function InvoiceList() {
       // silently drop products past that point from CSV matching.
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
       supabase.from('hsn_master').select('*').eq('is_active', true),
-      supabase.from('orders').select('id,name').eq('is_deleted', false).order('name'),
+      supabase.from('orders').select('id,name,description').eq('is_deleted', false).order('name'),
     ])
     setInvoices(invs || [])
     setEntities(es || [])
@@ -368,17 +370,15 @@ function InvoiceList() {
     const { error } = await supabase.from('invoices').update({ is_deleted: true }).in('id', [...selected])
     // Same reopen-the-source-PI fix as the single-invoice delete above —
     // otherwise a bulk-deleted invoice leaves its PI stuck on 'converted'.
+    // CHANGED: re-derived from whatever invoices are LEFT on each PI/PO
+    // (a PI can carry several) instead of blindly reopening it.
     if (!error) {
-      const piIds = invoices.filter(i => selected.has(i.id) && i.pi_id).map(i => i.pi_id)
-      if (piIds.length) {
-        await supabase.from('proforma_invoices').update({ status: 'accepted', converted_to_invoice_id: null }).in('id', piIds)
-      }
-      // Same reopen for any linked PO — otherwise a bulk-deleted invoice
-      // leaves its PO stuck on 'completed'.
-      const poIds = invoices.filter(i => selected.has(i.id) && i.po_id).map(i => i.po_id)
-      if (poIds.length) {
-        await supabase.from('purchase_orders').update({ status: 'open' }).in('id', poIds)
-      }
+      const piIds = [...new Set(invoices.filter(i => selected.has(i.id) && i.pi_id).map(i => i.pi_id))]
+      for (const piId of piIds) await syncLinkedDocStatus('pi', piId, { allowReopen: true })
+      // Same for any linked PO — otherwise a bulk-deleted invoice leaves its
+      // PO stuck on 'completed'.
+      const poIds = [...new Set(invoices.filter(i => selected.has(i.id) && i.po_id).map(i => i.po_id))]
+      for (const poId of poIds) await syncLinkedDocStatus('po', poId, { allowReopen: true })
     }
     setBulkDeleting(false)
     setConfirmBulkDelete(false)
@@ -461,7 +461,7 @@ function InvoiceList() {
         <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All orders</option>
-          {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+          {orders.map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
         </select>
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
@@ -537,11 +537,11 @@ function NewInvoice() {
   const [orders, setOrders]     = useState([])
   const [pis, setPIs]           = useState([])
   const [pos, setPOs]           = useState([])
-  // Which PI/PO ids already have a (non-deleted) invoice raised against them —
-  // used to hide them from the Linked PI/PO dropdowns so the same PI/PO can't
-  // be invoiced twice by accident.
-  const [usedPiIds, setUsedPiIds] = useState(new Set())
-  const [usedPoIds, setUsedPoIds] = useState(new Set())
+  // CHANGED: a PI/PO can now be invoiced more than once (partial dispatches),
+  // so the Linked PI/PO dropdowns no longer hide one just because an invoice
+  // exists against it — only once it's FULLY invoiced (PI 'converted' / PO
+  // 'completed', kept in step by syncLinkedDocStatus). Picking a part-invoiced
+  // one prefills just the remaining quantity.
   // setter-only: loadLegs() populates this for a leg-picker that was never
   // wired into the form; kept as-is rather than guessing at the missing UI
   // or deleting a fetch something else may still depend on.
@@ -579,21 +579,18 @@ function NewInvoice() {
     Promise.all([
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       // `status` so the Order dropdown can offer only still-open orders
-      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
-      supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,total_amount,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
-      supabase.from('purchase_orders').select('id,po_no,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
+      supabase.from('orders').select('id,name,description,status').eq('is_deleted', false).order('name'),
+      supabase.from('proforma_invoices').select('id,pi_no,status,po_id,from_entity_id,to_entity_id,total_amount,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
+      supabase.from('purchase_orders').select('id,po_no,status,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate').eq('is_active', true).order('name')),
-      fetchAllPages(() => supabase.from('invoices').select('pi_id,po_id').eq('is_deleted', false)),
-    ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }, { data: prods }, { data: invRefs }]) => {
+    ]).then(([{ data: es }, { data: os }, { data: piData }, { data: poData }, { data: hsnRows }, { data: prods }]) => {
       setEntities(es || [])
       setOrders(os || [])
       setPIs(piData || [])
       setPOs(poData || [])
       setHsnMap(buildHSNMap(hsnRows || []))
       setProducts(prods || [])
-      setUsedPiIds(new Set((invRefs || []).map(r => r.pi_id).filter(Boolean)))
-      setUsedPoIds(new Set((invRefs || []).map(r => r.po_id).filter(Boolean)))
     })
   }, [])
 
@@ -604,12 +601,15 @@ function NewInvoice() {
     if (!pi) return
     setF('seller_entity_id', pi.from_entity_id)
     setF('buyer_entity_id',  pi.to_entity_id)
+    if (pi.po_id) setF('po_id', pi.po_id) // CHANGED: carry the PI's PO across — see handlePISelect
     // Load PI lines
-    // CHANGED: same 1000-row REST cap as elsewhere — a source PI with more
-    // lines than that would otherwise convert to an invoice missing the rest.
-    fetchAllPages(() => supabase.from('proforma_invoice_lines').select('*').eq('pi_id', fromPiId).order('line_no')).then(({ data }) => {
-      if (data) setLines(data.map(l => ({ ...l, _id: l.id })))
-    })
+    // CHANGED: only what's still left to invoice on this PI (see
+    // prefillFromSource) — it may already be part-invoiced. Tax type is
+    // derived from the PI's own entities here because the setF() calls
+    // above haven't landed in `form` yet.
+    const se = entities.find(e => e.id === pi.from_entity_id)
+    const be = entities.find(e => e.id === pi.to_entity_id)
+    prefillFromSource('pi', fromPiId, pi.pi_no, !!(se?.state_code && be?.state_code && se.state_code !== be.state_code))
     // setF is intentionally omitted below: it's a plain (unmemoized) function
     // recreated every render, so including it would rerun this effect on
     // every render instead of only when fromPiId/pis actually change.
@@ -675,6 +675,9 @@ function NewInvoice() {
     setForm(f => ({
       ...f,
       pi_id: piId,
+      // CHANGED: a PI raised against a PO (proforma_invoices.po_id) carries
+      // that PO onto the invoice too, so the PO's invoiced progress counts it.
+      po_id: f.po_id || pi?.po_id || '',
       seller_entity_id: f.seller_entity_id || pi?.from_entity_id || '',
       buyer_entity_id:  f.buyer_entity_id  || pi?.to_entity_id   || '',
       order_id:         f.order_id         || pi?.order_id       || '',
@@ -682,32 +685,43 @@ function NewInvoice() {
     }))
     if (pi?.order_id && !form.order_id) loadLegs(pi.order_id)
     if (!piId || lines.length > 0) return
+    prefillFromSource('pi', piId, pi?.pi_no, form.is_interstate)
+  }
+
+  // CHANGED: shared by Linked PI, Linked PO and the "Convert to Invoice"
+  // entry point — previously three near-identical copies that each pulled
+  // the source's FULL lines. A PI/PO can now be billed across several
+  // invoices, so this prefills only what is still left to invoice on it
+  // (source qty minus every active invoice already raised against it, per
+  // product — see utils/docLinks.js).
+  async function prefillFromSource(kind, docId, docNo, interstate) {
+    const label = docNo || (kind === 'pi' ? 'This PI' : 'This PO')
     setLinesLoading(true)
     try {
-      const { data: piLines, error } = await withTimeout(
-        fetchAllPages(() => supabase.from('proforma_invoice_lines')
-          .select('product_name,description,hsn_code,qty,unit,rate,gst_rate,line_no')
-          .eq('pi_id', piId).order('line_no')),
-        20000, 'Loading PI line items',
+      const { lines: remaining, invoiceCount, error } = await withTimeout(
+        fetchRemainingLines(kind, docId), 20000, `Loading ${kind.toUpperCase()} line items`,
       )
-      if (error) { setToast({ message: `Could not load PI lines: ${error.message}`, type: 'error' }); return }
-      if (piLines?.length) {
+      if (error) { setToast({ message: `Could not load ${kind.toUpperCase()} lines: ${error.message}`, type: 'error' }); return }
+      if (remaining.length) {
         // computeLine() is normally only run by LineItemsEditor's own onChange
         // handlers — lines injected directly via setLines skip it, leaving
         // taxable_amount/total_amount at 0. Run it up front so the preview is
         // correct immediately.
-        setLines(piLines.map((l, i) => computeLine({
+        setLines(remaining.map((l, i) => computeLine({
           _id: Date.now() + i, line_no: i + 1,
           product_name: l.product_name || '', description: l.description,
           hsn_code: l.hsn_code, qty: l.qty, unit: l.unit,
           rate: l.rate, gst_rate: l.gst_rate,
           _hsn_resolved_rate: null, _hsn_override: false, _cost_rate: null, _margin_pct: '',
-        }, form.is_interstate)))
+        }, interstate)))
+        if (invoiceCount) setToast({ message: `${label} already has ${invoiceCount} invoice(s) against it — the lines below are the remaining quantity only.`, type: 'info' })
+      } else if (invoiceCount) {
+        setToast({ message: `${label} is already fully invoiced — nothing is left to bill. Add lines manually if this is an extra invoice.`, type: 'info' })
       } else {
-        setToast({ message: `${pi?.pi_no || 'This PI'} has no line items saved — add lines manually below, or open the PI to check it.`, type: 'info' })
+        setToast({ message: `${label} has no line items saved — add lines manually below, or open it to check.`, type: 'info' })
       }
     } catch (e) {
-      setToast({ message: `Could not load PI lines: ${e.message}`, type: 'error' })
+      setToast({ message: `Could not load ${kind.toUpperCase()} lines: ${e.message}`, type: 'error' })
     } finally {
       setLinesLoading(false)
     }
@@ -725,31 +739,7 @@ function NewInvoice() {
     }))
     if (po?.order_id && !form.order_id) loadLegs(po.order_id)
     if (!poId || lines.length > 0) return
-    setLinesLoading(true)
-    try {
-      const { data: poLines, error } = await withTimeout(
-        fetchAllPages(() => supabase.from('purchase_order_lines')
-          .select('product_name,description,hsn_code,qty,unit,rate,gst_rate,line_no')
-          .eq('po_id', poId).order('line_no')),
-        20000, 'Loading PO line items',
-      )
-      if (error) { setToast({ message: `Could not load PO lines: ${error.message}`, type: 'error' }); return }
-      if (poLines?.length) {
-        setLines(poLines.map((l, i) => computeLine({
-          _id: Date.now() + i, line_no: i + 1,
-          product_name: l.product_name || '', description: l.description,
-          hsn_code: l.hsn_code, qty: l.qty, unit: l.unit,
-          rate: l.rate, gst_rate: l.gst_rate,
-          _hsn_resolved_rate: null, _hsn_override: false, _cost_rate: null, _margin_pct: '',
-        }, form.is_interstate)))
-      } else {
-        setToast({ message: `${po?.po_no || 'This PO'} has no line items saved — add lines manually below, or open the PO to check it.`, type: 'info' })
-      }
-    } catch (e) {
-      setToast({ message: `Could not load PO lines: ${e.message}`, type: 'error' })
-    } finally {
-      setLinesLoading(false)
-    }
+    prefillFromSource('po', poId, po?.po_no, form.is_interstate)
   }
 
   async function handleSave(skipStockCheck = false) {
@@ -841,13 +831,11 @@ function NewInvoice() {
     // (never written) below for invoices created before this change.
 
     // Mark PI as converted if applicable
-    if (form.pi_id) {
-      await supabase.from('proforma_invoices').update({ status: 'converted', converted_to_invoice_id: inv.id }).eq('id', form.pi_id)
-    }
-    // Mark PO as completed if applicable — mirrors the PI conversion above.
-    if (form.po_id) {
-      await supabase.from('purchase_orders').update({ status: 'completed' }).eq('id', form.po_id)
-    }
+    // CHANGED: only once the PI is FULLY invoiced — a part-invoiced PI stays
+    // open so the rest can be billed on a later invoice.
+    if (form.pi_id) await syncLinkedDocStatus('pi', form.pi_id)
+    // Same for the PO — 'partial' until fully invoiced, then 'completed'.
+    if (form.po_id) await syncLinkedDocStatus('po', form.po_id)
 
     // CHANGED: no buyer-side purchase entry is created here anymore. Goods
     // haven't moved yet at submit time (physical movement only happens once
@@ -963,7 +951,7 @@ function NewInvoice() {
               <Select value={form.pi_id} onChange={e => handlePISelect(e.target.value)}>
                 <option value=''>No PI</option>
                 {pis
-                  .filter(p => (!form.order_id || p.order_id === form.order_id) && (p.id === form.pi_id || !usedPiIds.has(p.id)))
+                  .filter(p => (!form.order_id || p.order_id === form.order_id) && (p.id === form.pi_id || p.status !== 'converted'))
                   .map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
@@ -971,7 +959,7 @@ function NewInvoice() {
               <Select value={form.po_id} onChange={e => handlePOSelect(e.target.value)}>
                 <option value=''>No PO</option>
                 {pos
-                  .filter(p => (!form.order_id || p.order_id === form.order_id) && (p.id === form.po_id || !usedPoIds.has(p.id)))
+                  .filter(p => (!form.order_id || p.order_id === form.order_id) && (p.id === form.po_id || p.status !== 'completed'))
                   .map(p => <option key={p.id} value={p.id}>{p.po_no || p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
@@ -979,7 +967,7 @@ function NewInvoice() {
               <Select value={form.order_id} onChange={e => { setF('order_id', e.target.value); loadLegs(e.target.value) }}>
                 <option value=''>No order</option>
                 {/* CHANGED: only orders still open for documents — completed/cancelled hidden (current selection stays visible) */}
-                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
               </Select>
             </FormRow>
           </div>
@@ -1166,6 +1154,12 @@ function InvoiceDetail() {
     const cancellingAfterEway = status === 'cancelled' && !!inv.eway_bill_no
     const { error } = await supabase.from('invoices').update({ status, updated_at: new Date() }).eq('id', id)
     if (error) return setToast({ message: error.message, type: 'error' })
+    // CHANGED: a cancelled invoice no longer counts against its PI/PO — free
+    // that quantity up so it can be invoiced again.
+    if (status === 'cancelled') {
+      if (inv.pi_id) await syncLinkedDocStatus('pi', inv.pi_id, { allowReopen: true })
+      if (inv.po_id) await syncLinkedDocStatus('po', inv.po_id, { allowReopen: true })
+    }
 
     if (cancellingAfterEway) {
       await supabase.from('invoices').update({ status: 'cancelled', updated_at: new Date() })
@@ -1194,14 +1188,12 @@ function InvoiceDetail() {
     // Deleting an invoice that was converted from a PI left the source PI
     // stuck on status 'converted' pointing at a now soft-deleted invoice —
     // reopen it so it shows up as needing conversion again.
-    if (!error && inv?.pi_id) {
-      await supabase.from('proforma_invoices').update({ status: 'accepted', converted_to_invoice_id: null }).eq('id', inv.pi_id)
-    }
-    // Same reopen for a linked PO — otherwise a deleted invoice leaves its
-    // PO stuck on 'completed'.
-    if (!error && inv?.po_id) {
-      await supabase.from('purchase_orders').update({ status: 'open' }).eq('id', inv.po_id)
-    }
+    // CHANGED: re-derived from the invoices still standing against the PI
+    // (it can carry several) instead of blindly reopening it.
+    if (!error && inv?.pi_id) await syncLinkedDocStatus('pi', inv.pi_id, { allowReopen: true })
+    // Same for a linked PO — otherwise a deleted invoice leaves its PO stuck
+    // on 'completed'.
+    if (!error && inv?.po_id) await syncLinkedDocStatus('po', inv.po_id, { allowReopen: true })
     setDeleting(false); setConfirmDelete(false)
     if (error) return setToast({ message: error.message, type: 'error' })
     navigate('/invoices')
@@ -1386,6 +1378,10 @@ function InvoiceDetail() {
       const { error: lErr } = await supabase.from('invoice_lines').insert(linesPayload)
       if (lErr) { setSaving(false); return setToast({ message: lErr.message, type: 'error' }) }
     }
+    // CHANGED: edited quantities (or status) change how much of the linked
+    // PI/PO is invoiced — keep their status in step.
+    if (inv.pi_id) await syncLinkedDocStatus('pi', inv.pi_id, { allowReopen: true })
+    if (inv.po_id) await syncLinkedDocStatus('po', inv.po_id, { allowReopen: true })
     setSaving(false); setEditing(false)
     setToast({ message: 'Invoice updated', type: 'success' }); load()
   }

@@ -19,7 +19,7 @@ import { downloadTemplate, downloadCSV, detectDelimiter, parseCSVLine } from '..
 import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
-import { isOrderOpenForDocs } from '../../utils/orders'
+import { isOrderOpenForDocs, orderLabel } from '../../utils/orders'
 import { PAYMENT_TERMS_OPTIONS } from '../../utils/paymentTerms'
 import { printDocument } from '../../utils/documentTemplate'
 import { downloadDocumentExcel } from '../../utils/documentExcel'
@@ -124,8 +124,8 @@ function POList() {
         .eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('entities').select('id,name,short_name,gstin,state_code').eq('is_active', true).eq('is_deleted', false).order('name'),
       // `status` so the New PO modal can offer only still-open orders
-      supabase.from('orders').select('id,name,status').eq('is_deleted', false).order('name'),
-      supabase.from('proforma_invoices').select('id,pi_no,from_entity_id,to_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
+      supabase.from('orders').select('id,name,description,status').eq('is_deleted', false).order('name'),
+      supabase.from('proforma_invoices').select('id,pi_no,po_id,from_entity_id,to_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('hsn_master').select('*').eq('is_active', true),
       // CHANGED: for CSV product resolution below. Paginated — products can
       // exceed PostgREST's default 1000-row cap, which would otherwise
@@ -229,7 +229,10 @@ function POList() {
 
   // PI ids already consumed by a (non-deleted) PO — the Linked PI dropdown
   // hides these so it only offers PIs still awaiting conversion.
-  const usedPiIds = new Set(pos.filter(p => p.pi_id).map(p => p.pi_id))
+  // CHANGED: also any PI already linked to a PO via proforma_invoices.po_id
+  // (migration 056 — several PIs can now sit under one PO, linked from the
+  // PO or PI page after the PO exists).
+  const usedPiIds = new Set([...pos.filter(p => p.pi_id).map(p => p.pi_id), ...pis.filter(p => p.po_id).map(p => p.id)])
 
   async function loadLegs(orderId) {
     if (!orderId) { setLegs([]); return }
@@ -276,6 +279,11 @@ function POList() {
         return setToast({ message: `PO was created, but its line items failed to save: ${lErr.message}. Delete this PO and try again.`, type: 'error' })
       }
     }
+
+    // CHANGED: record the link on the PI side too (proforma_invoices.po_id) —
+    // that's the column the PO page's "Linked PIs" list reads, and where any
+    // further PIs get attached to this same PO.
+    if (payload.pi_id) await supabase.from('proforma_invoices').update({ po_id: po.id }).eq('id', payload.pi_id)
 
     setSaving(false)
     setToast({ message: 'PO created', type: 'success' })
@@ -486,6 +494,8 @@ function POList() {
   async function handleBulkDelete() {
     setBulkDeleting(true)
     const { error } = await supabase.from('purchase_orders').update({ is_deleted: true }).in('id', [...selected])
+    // CHANGED: free the PIs that were linked to these POs so they can be linked to another.
+    if (!error) await supabase.from('proforma_invoices').update({ po_id: null }).in('po_id', [...selected])
     setBulkDeleting(false)
     setConfirmBulkDelete(false)
     if (error) return setToast({ message: error.message, type: 'error' })
@@ -548,7 +558,7 @@ function POList() {
         <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
           <option value=''>All orders</option>
-          {orders.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+          {orders.map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
         </select>
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
@@ -631,7 +641,7 @@ function POList() {
             <FormRow label='Delivery Date'>
               <Input type='date' value={form.delivery_date} onChange={e => setF('delivery_date', e.target.value)} />
             </FormRow>
-            <FormRow label='Linked PI' hint='Only PIs not yet converted to a PO'>
+            <FormRow label='Linked PI' hint='Only PIs not yet linked to a PO. More PIs can be linked from the PO page after saving.'>
               <Select value={form.pi_id} onChange={e => handlePISelect(e.target.value)}>
                 <option value=''>No PI linked</option>
                 {/* CHANGED: hide PIs that already have a (non-deleted) PO —
@@ -662,7 +672,7 @@ function POList() {
               <Select value={form.order_id} onChange={e => { setF('order_id', e.target.value); loadLegs(e.target.value) }}>
                 <option value=''>No order</option>
                 {/* CHANGED: only orders still open for documents — completed/cancelled hidden (current selection stays visible) */}
-                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                {orders.filter(o => isOrderOpenForDocs(o) || o.id === form.order_id).map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Order Leg'>
@@ -749,6 +759,12 @@ function PODetail() {
   const [toast, setToast] = useState(null)
   const [confirmCancel, setConfirmCancel] = useState(false)
   const [docBusy, setDocBusy] = useState('') // 'pdf' | 'excel' | ''
+  // CHANGED: one PO can cover several PIs (proforma_invoices.po_id, migration
+  // 056). linkedPIs = PIs raised against this PO; linkablePIs = PIs between
+  // the same seller and buyer that aren't linked to any PO yet.
+  const [linkedPIs, setLinkedPIs]     = useState([])
+  const [linkablePIs, setLinkablePIs] = useState([])
+  const [linkBusy, setLinkBusy]       = useState(false)
   // CHANGED: post-save editing — same pattern as PI's edit flow. Available
   // to any role at any status; no stock/ledger side effects are tied to a
   // PO's own status or lines.
@@ -783,6 +799,16 @@ function PODetail() {
     setHsnMap(buildHSNMap(hsnRows || []))
     setProducts(prods || [])
     setLoading(false)
+    if (p) {
+      const piCols = 'id,pi_no,pi_date,status,total_qty,total_amount'
+      const [{ data: linked }, { data: linkable }] = await Promise.all([
+        supabase.from('proforma_invoices').select(piCols).eq('po_id', id).eq('is_deleted', false).order('pi_date'),
+        supabase.from('proforma_invoices').select(piCols).is('po_id', null).eq('is_deleted', false).neq('status', 'cancelled')
+          .eq('from_entity_id', p.seller_entity_id).eq('to_entity_id', p.buyer_entity_id).order('pi_date', { ascending: false }),
+      ])
+      setLinkedPIs(linked || [])
+      setLinkablePIs(linkable || [])
+    }
   }, [id])
 
   useEffect(() => { load() }, [load])
@@ -874,9 +900,24 @@ function PODetail() {
     setToast({ message: 'PO updated', type: 'success' }); load()
   }
 
+  // CHANGED: attach / detach a PI to this PO. poId = this PO's id to link,
+  // null to unlink. `.select()` so a write that RLS silently filtered out
+  // (no access to the PI's entity) is reported instead of looking like success.
+  async function setPILink(piId, poId) {
+    if (!piId) return
+    setLinkBusy(true)
+    const { data, error } = await supabase.from('proforma_invoices').update({ po_id: poId }).eq('id', piId).select('id')
+    setLinkBusy(false)
+    if (error || !data?.length) return setToast({ message: error?.message || 'Could not update that PI — you may not have access to it.', type: 'error' })
+    setToast({ message: poId ? 'PI linked to this PO' : 'PI unlinked', type: 'success' })
+    load()
+  }
+
   async function handleDelete() {
     setDeleting(true)
     const { error } = await supabase.from('purchase_orders').update({ is_deleted: true }).eq('id', id)
+    // CHANGED: free the PIs that were linked to this PO so they can be linked to another.
+    if (!error) await supabase.from('proforma_invoices').update({ po_id: null }).eq('po_id', id)
     setDeleting(false); setConfirmDelete(false)
     if (error) return setToast({ message: error.message, type: 'error' })
     navigate('/po')
@@ -987,6 +1028,50 @@ function PODetail() {
           onRoundOffOverrideChange={editing ? setEditRoundOffOverride : undefined}
         />
       </Card>
+
+      {/* CHANGED: every PI raised against this PO, with a running qty/value
+          total against the PO's own — one PO can cover several PIs. */}
+      {!editing && (
+        <div style={{ marginTop: '20px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap', marginBottom: '10px' }}>
+            <div style={{ fontWeight: 700, fontSize: '14px' }}>Linked PIs{linkedPIs.length > 0 ? ` (${linkedPIs.length})` : ''}</div>
+            {linkablePIs.length > 0 && (
+              <div style={{ width: '280px' }}>
+                <Select value='' onChange={e => setPILink(e.target.value, id)} disabled={linkBusy}>
+                  <option value=''>+ Link a PI to this PO…</option>
+                  {linkablePIs.map(p => <option key={p.id} value={p.id}>{p.pi_no || p.id.slice(0, 8)} · {fmtDate(p.pi_date)} · {formatINR(p.total_amount)}</option>)}
+                </Select>
+              </div>
+            )}
+          </div>
+          <Card>
+            <Table
+              columns={[
+                { label: 'PI No', render: p => <span style={{ fontFamily: 'monospace', color: C.accent, textDecoration: 'underline' }}>{p.pi_no || p.id.slice(0, 8)}</span> },
+                { label: 'Date', render: p => fmtDate(p.pi_date) },
+                { label: 'Qty', right: true, render: p => formatQty(p.total_qty) },
+                { label: 'Value', right: true, render: p => formatINR(p.total_amount) },
+                { label: 'Status', render: p => <Badge status={p.status} /> },
+                { label: '', right: true, render: p => <Btn size='sm' variant='ghost' disabled={linkBusy} onClick={e => { e.stopPropagation(); setPILink(p.id, null) }}>Unlink</Btn> },
+              ]}
+              rows={linkedPIs}
+              onRowClick={p => navigate(`/pi/${p.id}`)}
+              emptyState={<div style={{ padding: '16px', fontSize: '13px', color: C.textMuted }}>No PIs linked to this PO yet.{linkablePIs.length === 0 ? ` There are no unlinked PIs from ${po.seller?.short_name || po.seller?.name || 'the seller'} to ${po.buyer?.short_name || po.buyer?.name || 'the buyer'}.` : ''}</div>}
+            />
+            {linkedPIs.length > 0 && (() => {
+              const active = linkedPIs.filter(p => p.status !== 'cancelled')
+              const piQty = round2(active.reduce((s, p) => s + toNum(p.total_qty), 0))
+              const piVal = round2(active.reduce((s, p) => s + toNum(p.total_amount), 0))
+              return (
+                <div style={{ padding: '10px 12px', borderTop: `1px solid ${C.border}`, fontSize: '12px', color: C.textSoft, display: 'flex', gap: '24px', flexWrap: 'wrap' }}>
+                  <span>PI qty: <strong>{formatQty(piQty)}</strong> of PO {formatQty(po.total_qty)}</span>
+                  <span>PI value: <strong>{formatINR(piVal)}</strong> of PO {formatINR(po.total_amount)}</span>
+                </div>
+              )
+            })()}
+          </Card>
+        </div>
+      )}
 
       <div style={{ marginTop: '20px' }}>
         <div style={{ fontWeight: 700, fontSize: '14px', marginBottom: '10px' }}>Documents</div>

@@ -17,6 +17,13 @@ export function isOrderOpenForDocs(o) {
   return !!o && !['completed', 'cancelled'].includes(o.status)
 }
 
+// How an order reads in a dropdown: its name plus the short description of
+// what it is ("VR09 · Garments"), when one has been entered.
+export function orderLabel(o) {
+  if (!o) return ''
+  return o.description ? `${o.name} · ${o.description}` : o.name
+}
+
 const activeDocs = docs => (docs || []).filter(d => d.status !== 'cancelled')
 
 // An invoice counts as "stock moved" under exactly the same rule the stock
