@@ -1084,6 +1084,8 @@ function InvoiceDetail() {
   const navigate = useNavigate()
   const { profile } = useAuth()
   const canDelete = hasFullAccess(profile)
+  // CHANGED: seller is now editable — offer only entities this user can act as (same rule as the New Invoice form)
+  const { entities: accessEntities, isMaster } = useEntityAccess()
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [inv, setInv]     = useState(null)
@@ -1122,6 +1124,11 @@ function InvoiceDetail() {
   const [pis, setPIs]             = useState([])
   const [pos, setPOs]             = useState([])
   const [linkNames, setLinkNames] = useState({ pi_no: '', po_no: '' })
+  // CHANGED: Edit now turns the whole invoice editable IN PLACE (no separate
+  // "Edit Details" box) — seller, buyer, header, links, addresses, E-way
+  // Bill, IRN, notes and lines are all saved by the one "Save Changes".
+  const [entities, setEntities]             = useState([])
+  const [confirmParties, setConfirmParties] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -1164,14 +1171,28 @@ function InvoiceDetail() {
 
   // CHANGED: pick lists for the link fields in edit mode.
   async function loadLinkOptions() {
-    const [{ data: os }, { data: piData }, { data: poData }] = await Promise.all([
+    const [{ data: es }, { data: os }, { data: piData }, { data: poData }] = await Promise.all([
+      supabase.from('entities').select('id,name,short_name,gstin,city,state_code,type').eq('is_active', true).eq('is_deleted', false).order('name'),
       supabase.from('orders').select('id,name,description,status').eq('is_deleted', false).order('name'),
       supabase.from('proforma_invoices').select('id,pi_no,status,po_id,from_entity_id,to_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('pi_date', { ascending: false }),
       supabase.from('purchase_orders').select('id,po_no,status,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
     ])
+    setEntities(es || [])
     setOrders(os || [])
     setPIs(piData || [])
     setPOs(poData || [])
+  }
+
+  // CHANGED: changing seller / buyer re-derives Local vs Interstate from the
+  // two state codes (same as the New Invoice form); still overridable after.
+  function setEditParty(key, value) {
+    setEditForm(f => {
+      const nf = { ...f, [key]: value }
+      const se = entities.find(e => e.id === nf.seller_entity_id)
+      const be = entities.find(e => e.id === nf.buyer_entity_id)
+      if (se?.state_code && be?.state_code) nf.is_interstate = se.state_code !== be.state_code
+      return nf
+    })
   }
 
   async function loadLegs(orderId) {
@@ -1361,7 +1382,14 @@ function InvoiceDetail() {
       bill_from: inv.bill_from || '', bill_to: inv.bill_to || '', ship_from: inv.ship_from || '', ship_to: inv.ship_to || '',
       // CHANGED: link fields are editable too
       order_id: inv.order_id || '', order_leg_id: inv.order_leg_id || '', pi_id: inv.pi_id || '', po_id: inv.po_id || '',
+      // CHANGED: everything else on the invoice is editable in the same pass
+      seller_entity_id: inv.seller_entity_id || '', buyer_entity_id: inv.buyer_entity_id || '',
+      eway_bill_no: inv.eway_bill_no || '', eway_bill_date: inv.eway_bill_date || '', challan_no: inv.challan_no || '',
+      vehicle_no: inv.vehicle_no || '', transporter_name: inv.transporter_name || '',
+      einvoice_irn: inv.einvoice_irn || '', einvoice_ack_no: inv.einvoice_ack_no || '',
+      einvoice_ack_date: inv.einvoice_ack_date || '', einvoice_qr_code: inv.einvoice_qr_code || '',
     })
+    setEwbEdit(false); setIrnEdit(false)
     loadLinkOptions()
     loadLegs(inv.order_id)
     setEditLines(lines.map(l => ({ ...l, _id: l.id, _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '' })))
@@ -1414,13 +1442,24 @@ function InvoiceDetail() {
     setLinesCsvResult({ loaded: computed.length, errors })
   }
 
-  async function handleSaveEdit() {
+  async function handleSaveEdit(partiesConfirmed = false) {
     const invoiceNo = (editForm.invoice_no || '').trim()
     if (!invoiceNo) return setToast({ message: 'Invoice number cannot be blank', type: 'error' })
+    // CHANGED: seller / buyer / E-way Bill / IRN are part of the same save now.
+    const sellerId = editForm.seller_entity_id, buyerId = editForm.buyer_entity_id
+    if (!sellerId || !buyerId) return setToast({ message: 'Select both a seller and a buyer', type: 'error' })
+    if (sellerId === buyerId) return setToast({ message: 'Seller and buyer cannot be the same entity', type: 'error' })
+    const partiesChanged = sellerId !== inv.seller_entity_id || buyerId !== inv.buyer_entity_id
+    // Same lock the E-way Bill / IRN sections have always had (see isLocked below).
+    const transportLocked = !hasFullAccess(profile) && ['cancelled', 'paid'].includes(inv.status)
+    if (!transportLocked && editForm.eway_bill_no && !isValidEwayBill(editForm.eway_bill_no)) return setToast({ message: EWAY_BILL_ERROR, type: 'error' })
     // CHANGED: same rule the create flow enforces — a line with no
     // product_id is invisible to stock tracking.
     const missing = findLinesMissingProductName(editLines)
     if (missing.length > 0) return setToast({ message: `Line ${missing.map(l => l._lineNo).join(', ')}: select a product before saving — stock tracking needs it.`, type: 'error' })
+    // CHANGED: a seller / buyer change moves stock, the buyer's purchase entry
+    // and recorded payments with it — ask once before doing that.
+    if (partiesChanged && !partiesConfirmed) return setConfirmParties(true)
     setSaving(true)
     if (invoiceNo.toLowerCase() !== (inv.invoice_no || '').toLowerCase()) {
       const { data: dup } = await supabase.from('invoices').select('id').ilike('invoice_no', invoiceNo).eq('is_deleted', false).neq('id', id).limit(1)
@@ -1437,23 +1476,28 @@ function InvoiceDetail() {
       order_id: editForm.order_id || null, order_leg_id: editForm.order_leg_id || null,
     }
     const linksChanged = Object.keys(links).some(k => (links[k] || null) !== (inv[k] || null))
+    // CHANGED: E-way Bill / IRN fields come out of the header spread — they
+    // are written only when not locked, and '' must go in as null.
+    const { eway_bill_no: _a, eway_bill_date: _b, challan_no: _c, vehicle_no: _d, transporter_name: _e,
+      einvoice_irn: _f, einvoice_ack_no: _g, einvoice_ack_date: _h, einvoice_qr_code: _i, ...header } = editForm
+    const transport = transportLocked ? {} : {
+      eway_bill_no: editForm.eway_bill_no || null, eway_bill_date: editForm.eway_bill_date || null,
+      challan_no: editForm.challan_no || null, vehicle_no: editForm.vehicle_no || null,
+      transporter_name: editForm.transporter_name || null,
+      einvoice_irn: editForm.einvoice_irn || null, einvoice_ack_no: editForm.einvoice_ack_no || null,
+      einvoice_ack_date: editForm.einvoice_ack_date || null, einvoice_qr_code: editForm.einvoice_qr_code || null,
+    }
+    const newEwbNo  = transportLocked ? inv.eway_bill_no : transport.eway_bill_no
+    const firstEwb  = !inv.eway_bill_no && !!newEwbNo
     const { error: invErr } = await supabase.from('invoices').update({
-      ...editForm, invoice_no: invoiceNo, due_date: editForm.due_date || null,
+      ...header, invoice_no: invoiceNo, due_date: editForm.due_date || null,
       payment_terms: editForm.payment_terms || null,
       // CHANGED: uuid columns — '' must go in as null
-      ...links,
+      ...links, ...transport,
       ...totals, outstanding_amount: outstanding, updated_at: new Date(),
     }).eq('id', id)
     if (invErr) { setSaving(false); return setToast({ message: invErr.message, type: 'error' }) }
-    // CHANGED: the buyer-side purchase mirror (created when the E-way Bill was
-    // saved) carries its own copy of these links — keep it in step, otherwise
-    // it would go on pointing at the old PI / PO / order.
-    let mirrorWarn = ''
-    if (linksChanged) {
-      const { error: mirrorErr } = await supabase.from('invoices').update({ ...links, updated_at: new Date() })
-        .eq('source_invoice_id', id).eq('invoice_type', 'purchase')
-      if (mirrorErr) mirrorWarn = mirrorErr.message
-    }
+    const warns = []
     const { error: delErr } = await supabase.from('invoice_lines').delete().eq('invoice_id', id)
     if (delErr) { setSaving(false); return setToast({ message: `Could not clear old line items: ${delErr.message}. Invoice header was updated but lines were left unchanged to avoid duplicates.`, type: 'error' }) }
     const linesPayload = computedLines.map((l, i) => toInvoiceLinePayload(l, id, i + 1))
@@ -1468,9 +1512,62 @@ function InvoiceDetail() {
     // moved onto (may become partial / converted / completed).
     for (const piId of new Set([inv.pi_id, links.pi_id].filter(Boolean))) await syncLinkedDocStatus('pi', piId, { allowReopen: true })
     for (const poId of new Set([inv.po_id, links.po_id].filter(Boolean))) await syncLinkedDocStatus('po', poId, { allowReopen: true })
+
+    // CHANGED: everything that hangs off this invoice's parties / links / EWB.
+    // Stock itself needs nothing here — it is recomputed live from the
+    // invoice's own seller, buyer and E-way Bill.
+    const sellerEnt = entities.find(e => e.id === sellerId) || inv.seller
+    const buyerEnt  = entities.find(e => e.id === buyerId)  || inv.buyer
+    const cancelled = header.status === 'cancelled'
+    // 1. Payments recorded against this invoice carry their own copy of the
+    //    paying (buyer) and paid (seller) entity.
+    if (partiesChanged) {
+      const { error: payErr } = await supabase.from('invoice_payments')
+        .update({ entity_id: buyerId, party_entity_id: sellerId }).eq('invoice_id', id)
+      if (payErr) warns.push(`payments were not moved to the new parties (${payErr.message})`)
+    }
+    // 2. Buyer-side purchase entry (the auto mirror made on E-way Bill).
+    const { data: mirrors, error: mirSelErr } = await supabase.from('invoices').select('id,status')
+      .eq('source_invoice_id', id).eq('invoice_type', 'purchase').eq('is_deleted', false).limit(1)
+    const mirror = mirrors?.[0]
+    if (mirSelErr) warns.push(`buyer purchase entry could not be checked (${mirSelErr.message})`)
+    else if (mirror) {
+      const patch = {}
+      if (linksChanged) Object.assign(patch, links)
+      if (partiesChanged) {
+        patch.seller_entity_id = sellerId
+        patch.buyer_entity_id  = buyerId
+        if (buyerEnt?.type === 'external') patch.status = 'cancelled' // external buyers keep no purchase entry here
+        else {
+          if (mirror.status === 'cancelled' && !cancelled) patch.status = 'submitted'
+          // it sits in the BUYER's number series — a new buyer needs a number from their own
+          if (buyerId !== inv.buyer_entity_id) {
+            patch.invoice_no = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: buyerEnt?.short_name || buyerEnt?.name, fyCode: fyCodeForDate(newEwbNo ? (transportLocked ? inv.eway_bill_date : transport.eway_bill_date) || header.invoice_date : header.invoice_date) })
+          }
+        }
+      }
+      if (Object.keys(patch).length) {
+        const { error: mirrorErr } = await supabase.from('invoices').update({ ...patch, updated_at: new Date() }).eq('id', mirror.id)
+        if (mirrorErr) warns.push(`buyer purchase entry was not updated (${mirrorErr.message})`)
+      }
+    } else if (newEwbNo && !cancelled && (firstEwb || partiesChanged)) {
+      // No entry yet: the E-way Bill was entered in this save, or the buyer
+      // changed to an internal entity. No-ops for external buyers / purchase invoices.
+      const { error: mirrorErr } = await autoCompletePurchaseMirror({
+        ...inv, ...header, ...links, ...transport, ...totals, id, invoice_no: invoiceNo,
+        seller_entity_id: sellerId, buyer_entity_id: buyerId, seller: sellerEnt, buyer: buyerEnt,
+      }, computedLines)
+      if (mirrorErr) warns.push(`buyer purchase entry failed (${mirrorErr.message})`)
+    }
+    // 3. First E-way Bill = the physical movement — same leg sync the
+    //    E-way Bill section's own Save does.
+    if (firstEwb && links.order_leg_id) {
+      await supabase.from('order_legs').update({ movement_status: 'delivered', cargo_status: 'cargo_dispatched' }).eq('id', links.order_leg_id)
+    }
+
     setSaving(false); setEditing(false)
-    setToast(mirrorWarn
-      ? { message: `Invoice updated, but the buyer purchase entry could not be re-linked: ${mirrorWarn}`, type: 'error' }
+    setToast(warns.length
+      ? { message: `Invoice updated, but ${warns.join('; ')}`, type: 'error' }
       : { message: 'Invoice updated', type: 'success' })
     load()
   }
@@ -1497,7 +1594,7 @@ function InvoiceDetail() {
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             {!editing && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing && <Btn size='sm' variant='ghost' onClick={() => setEditing(false)}>Discard</Btn>}
-            {editing && <Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
+            {editing && <Btn size='sm' onClick={() => handleSaveEdit()} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
             {!editing && inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {!editing && inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
             {!editing && !['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
@@ -1514,47 +1611,40 @@ function InvoiceDetail() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '24px' }}>
         <Card style={{ padding: '16px' }}>
           <div style={{ fontSize: '11px', fontWeight: 700, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>Seller</div>
+          {editing ? (() => { const e = entities.find(x => x.id === editForm.seller_entity_id); return (<>
+            <Select value={editForm.seller_entity_id} onChange={ev => setEditParty('seller_entity_id', ev.target.value)}>
+              <option value=''>Select seller…</option>
+              {entities.filter(x => isMaster || x.id === inv.seller_entity_id || accessEntities.some(a => a.id === x.id)).map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+            </Select>
+            {e?.gstin && <div style={{ fontSize: '12px', color: C.textSoft, fontFamily: 'monospace', marginTop: '6px' }}>GSTIN: {e.gstin}</div>}
+            {e?.city  && <div style={{ fontSize: '12px', color: C.textSoft }}>{e.city}</div>}
+          </>) })() : (<>
           <div style={{ fontWeight: 700, fontSize: '14px' }}>{inv.seller?.name}</div>
           {inv.seller?.gstin && <div style={{ fontSize: '12px', color: C.textSoft, fontFamily: 'monospace' }}>GSTIN: {inv.seller.gstin}</div>}
           {inv.seller?.city  && <div style={{ fontSize: '12px', color: C.textSoft }}>{inv.seller.city}</div>}
+          </>)}
         </Card>
         <Card style={{ padding: '16px' }}>
           <div style={{ fontSize: '11px', fontWeight: 700, color: C.textMuted, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px' }}>Buyer</div>
+          {editing ? (() => { const e = entities.find(x => x.id === editForm.buyer_entity_id); return (<>
+            <Select value={editForm.buyer_entity_id} onChange={ev => setEditParty('buyer_entity_id', ev.target.value)}>
+              <option value=''>Select buyer…</option>
+              {entities.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+            </Select>
+            {e?.gstin && <div style={{ fontSize: '12px', color: C.textSoft, fontFamily: 'monospace', marginTop: '6px' }}>GSTIN: {e.gstin}</div>}
+            {e?.city  && <div style={{ fontSize: '12px', color: C.textSoft }}>{e.city}</div>}
+          </>) })() : (<>
           <div style={{ fontWeight: 700, fontSize: '14px' }}>{inv.buyer?.name}</div>
           {inv.buyer?.gstin && <div style={{ fontSize: '12px', color: C.textSoft, fontFamily: 'monospace' }}>GSTIN: {inv.buyer.gstin}</div>}
           {inv.buyer?.city  && <div style={{ fontSize: '12px', color: C.textSoft }}>{inv.buyer.city}</div>}
+          </>)}
         </Card>
       </div>
 
       {/* Details strip */}
-      <div style={{ display: 'flex', gap: '20px', marginBottom: '20px', flexWrap: 'wrap', fontSize: '13px' }}>
-        <div><span style={{ color: C.textMuted }}>Date:</span> <strong>{fmtDate(inv.invoice_date)}</strong></div>
-        {inv.due_date && <div>
-          <span style={{ color: C.textMuted }}>Due:</span>{' '}
-          <strong style={{ color: inv.due_date < new Date().toISOString().slice(0,10) && inv.status !== 'paid' ? C.danger : C.text }}>
-            {fmtDate(inv.due_date)}
-          </strong>
-        </div>}
-        {inv.payment_terms && <div><span style={{ color: C.textMuted }}>Terms:</span> <strong>{inv.payment_terms}</strong></div>}
-        <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={inv.is_interstate ? 'export' : 'domestic'} label={inv.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
-        {inv.einvoice_irn && <div><span style={{ color: C.textMuted }}>IRN:</span> <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{inv.einvoice_irn}</span></div>}
-        {inv.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{inv.orders.name}</strong></div>}
-        {/* CHANGED: show what this invoice is linked to */}
-        {inv.pi_id && <div><span style={{ color: C.textMuted }}>PI:</span> <strong style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }} onClick={() => navigate(`/pi/${inv.pi_id}`)}>{linkNames.pi_no || inv.pi_id.slice(0, 8)}</strong></div>}
-        {inv.po_id && <div><span style={{ color: C.textMuted }}>PO:</span> <strong style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }} onClick={() => navigate(`/po/${inv.po_id}`)}>{linkNames.po_no || inv.po_id.slice(0, 8)}</strong></div>}
-      </div>
-
-      {/* Outstanding */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
-        <StatCard label='Invoice Total' value={formatINR(inv.total_amount)} />
-        <StatCard label='Paid' value={formatINR(inv.paid_amount)} color={C.success} />
-        <StatCard label='Outstanding' value={formatINR(inv.outstanding_amount)} color={inv.outstanding_amount > 0 ? C.warning : C.success} />
-      </div>
-
+      {/* CHANGED: in edit mode the strip itself becomes the inputs — no separate "Edit Details" box. Only PIs / POs between the selected seller and buyer are offered; changing a link never changes the line items. */}
       {editing && (
-        <Card style={{ marginBottom: '16px', padding: '16px' }}>
-          <SectionDivider label='Edit Details' />
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px', marginTop: '12px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '12px', marginBottom: '20px' }}>
             <FormRow label='Invoice Date' required><Input type='date' value={editForm.invoice_date} onChange={e=>setEditForm(f=>{const nf={...f,invoice_date:e.target.value};const d=dueDateForTerms(nf.invoice_date,nf.payment_terms);return d?{...nf,due_date:d}:nf})}/></FormRow>
             <FormRow label='Invoice Number' required><Input value={editForm.invoice_no} onChange={e=>setEditForm(f=>({...f,invoice_no:e.target.value}))}/></FormRow>
             {/* CHANGED: payment terms drive due date, same as the create form */}
@@ -1565,7 +1655,6 @@ function InvoiceDetail() {
             <FormRow label='Due Date' hint={editForm.payment_terms?'Auto-set from payment terms — override if needed':undefined}><Input type='date' value={editForm.due_date} onChange={e=>setEditForm(f=>({...f,due_date:e.target.value}))}/></FormRow>
             <FormRow label='Status'><Select value={editForm.status} onChange={e=>setEditForm(f=>({...f,status:e.target.value}))}>{INV_STATUSES.map(s=><option key={s} value={s}>{s}</option>)}</Select></FormRow>
             <FormRow label='Tax Type'><Select value={editForm.is_interstate?'1':'0'} onChange={e=>setEditForm(f=>({...f,is_interstate:e.target.value==='1'}))}><option value='0'>Local — CGST+SGST</option><option value='1'>Interstate — IGST</option></Select></FormRow>
-            {/* CHANGED: link / relink / unlink — Order, Leg, PI, PO. Only PIs and POs between this invoice's own seller and buyer are offered. Changing a link never changes the line items. */}
             <FormRow label='Order'>
               <Select value={editForm.order_id} onChange={e=>{setEditForm(f=>({...f,order_id:e.target.value,order_leg_id:''}));loadLegs(e.target.value)}}>
                 <option value=''>No order</option>
@@ -1581,23 +1670,40 @@ function InvoiceDetail() {
             <FormRow label='Linked PI' hint='Line items are not changed'>
               <Select value={editForm.pi_id} onChange={e=>handleEditPISelect(e.target.value)}>
                 <option value=''>No PI linked</option>
-                {pis.filter(p=>p.id===editForm.pi_id||(p.status!=='cancelled'&&p.from_entity_id===inv.seller_entity_id&&p.to_entity_id===inv.buyer_entity_id&&(!editForm.order_id||!p.order_id||p.order_id===editForm.order_id))).map(p=><option key={p.id} value={p.id}>{p.pi_no||p.id.slice(0,8)}</option>)}
+                {pis.filter(p=>p.id===editForm.pi_id||(p.status!=='cancelled'&&p.from_entity_id===editForm.seller_entity_id&&p.to_entity_id===editForm.buyer_entity_id&&(!editForm.order_id||!p.order_id||p.order_id===editForm.order_id))).map(p=><option key={p.id} value={p.id}>{p.pi_no||p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Linked PO' hint='Line items are not changed'>
               <Select value={editForm.po_id} onChange={e=>handleEditPOSelect(e.target.value)}>
                 <option value=''>No PO linked</option>
-                {pos.filter(p=>p.id===editForm.po_id||(p.status!=='cancelled'&&p.seller_entity_id===inv.seller_entity_id&&p.buyer_entity_id===inv.buyer_entity_id&&(!editForm.order_id||!p.order_id||p.order_id===editForm.order_id))).map(p=><option key={p.id} value={p.id}>{p.po_no||p.id.slice(0,8)}</option>)}
+                {pos.filter(p=>p.id===editForm.po_id||(p.status!=='cancelled'&&p.seller_entity_id===editForm.seller_entity_id&&p.buyer_entity_id===editForm.buyer_entity_id&&(!editForm.order_id||!p.order_id||p.order_id===editForm.order_id))).map(p=><option key={p.id} value={p.id}>{p.po_no||p.id.slice(0,8)}</option>)}
               </Select>
             </FormRow>
-            <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>
-            <FormRow label='Bill To'><Input value={editForm.bill_to} onChange={e=>setEditForm(f=>({...f,bill_to:e.target.value}))}/></FormRow>
-            <FormRow label='Ship From'><Input value={editForm.ship_from} onChange={e=>setEditForm(f=>({...f,ship_from:e.target.value}))}/></FormRow>
-            <FormRow label='Ship To'><Input value={editForm.ship_to} onChange={e=>setEditForm(f=>({...f,ship_to:e.target.value}))}/></FormRow>
-          </div>
-          <div style={{marginTop:'8px'}}><FormRow label='Notes'><Textarea value={editForm.notes} onChange={e=>setEditForm(f=>({...f,notes:e.target.value}))} rows={2}/></FormRow></div>
-        </Card>
+        </div>
       )}
+      {!editing && <div style={{ display: 'flex', gap: '20px', marginBottom: '20px', flexWrap: 'wrap', fontSize: '13px' }}>
+        <div><span style={{ color: C.textMuted }}>Date:</span> <strong>{fmtDate(inv.invoice_date)}</strong></div>
+        {inv.due_date && <div>
+          <span style={{ color: C.textMuted }}>Due:</span>{' '}
+          <strong style={{ color: inv.due_date < new Date().toISOString().slice(0,10) && inv.status !== 'paid' ? C.danger : C.text }}>
+            {fmtDate(inv.due_date)}
+          </strong>
+        </div>}
+        {inv.payment_terms && <div><span style={{ color: C.textMuted }}>Terms:</span> <strong>{inv.payment_terms}</strong></div>}
+        <div><span style={{ color: C.textMuted }}>Tax:</span> <Badge status={inv.is_interstate ? 'export' : 'domestic'} label={inv.is_interstate ? 'Interstate (IGST)' : 'Local (CGST+SGST)'} /></div>
+        {inv.einvoice_irn && <div><span style={{ color: C.textMuted }}>IRN:</span> <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{inv.einvoice_irn}</span></div>}
+        {inv.orders?.name && <div><span style={{ color: C.textMuted }}>Order:</span> <strong>{inv.orders.name}</strong></div>}
+        {/* CHANGED: show what this invoice is linked to */}
+        {inv.pi_id && <div><span style={{ color: C.textMuted }}>PI:</span> <strong style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }} onClick={() => navigate(`/pi/${inv.pi_id}`)}>{linkNames.pi_no || inv.pi_id.slice(0, 8)}</strong></div>}
+        {inv.po_id && <div><span style={{ color: C.textMuted }}>PO:</span> <strong style={{ color: C.accent, textDecoration: 'underline', cursor: 'pointer' }} onClick={() => navigate(`/po/${inv.po_id}`)}>{linkNames.po_no || inv.po_id.slice(0, 8)}</strong></div>}
+      </div>}
+
+      {/* Outstanding */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px,1fr))', gap: '12px', marginBottom: '20px' }}>
+        <StatCard label='Invoice Total' value={formatINR(inv.total_amount)} />
+        <StatCard label='Paid' value={formatINR(inv.paid_amount)} color={C.success} />
+        <StatCard label='Outstanding' value={formatINR(inv.outstanding_amount)} color={inv.outstanding_amount > 0 ? C.warning : C.success} />
+      </div>
 
       <Card>
         {editing && (
@@ -1620,7 +1726,18 @@ function InvoiceDetail() {
         />
       </Card>
 
-      {(inv.bill_from || inv.bill_to || inv.ship_from || inv.ship_to || inv.eway_bill_no) && (
+      {editing && (
+        <div style={{ marginTop: '12px', padding: '12px 14px', background: '#f8f4ee', borderRadius: '6px', border: `1px solid ${C.border}`, fontSize: '13px' }}>
+          <div style={{ fontWeight: 700, marginBottom: '8px', color: C.textMid }}>Billing & Shipping</div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Bill From'><Input value={editForm.bill_from} onChange={e=>setEditForm(f=>({...f,bill_from:e.target.value}))}/></FormRow>
+            <FormRow label='Bill To'><Input value={editForm.bill_to} onChange={e=>setEditForm(f=>({...f,bill_to:e.target.value}))}/></FormRow>
+            <FormRow label='Ship From'><Input value={editForm.ship_from} onChange={e=>setEditForm(f=>({...f,ship_from:e.target.value}))}/></FormRow>
+            <FormRow label='Ship To'><Input value={editForm.ship_to} onChange={e=>setEditForm(f=>({...f,ship_to:e.target.value}))}/></FormRow>
+          </div>
+        </div>
+      )}
+      {!editing && (inv.bill_from || inv.bill_to || inv.ship_from || inv.ship_to || inv.eway_bill_no) && (
         <div style={{ marginTop: '12px', padding: '12px 14px', background: '#f8f4ee', borderRadius: '6px', border: `1px solid ${C.border}`, fontSize: '13px' }}>
           <div style={{ fontWeight: 700, marginBottom: '8px', color: C.textMid }}>Billing & Shipping</div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 20px' }}>
@@ -1641,13 +1758,30 @@ function InvoiceDetail() {
               <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
             )}
           </div>
-          {!ewbEdit && !isLocked && (
+          {!editing && !ewbEdit && !isLocked && (
             <Btn size='sm' variant='ghost' onClick={openEwbEdit}>
               {(inv.eway_bill_no || inv.challan_no) ? 'Edit' : '+ Add'}
             </Btn>
           )}
         </div>
-        {ewbEdit && !isLocked ? (
+        {editing && !isLocked ? (
+          <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            {!inv.eway_bill_no && inv.invoice_type === 'sales' && (
+              <div style={{background:'#fff3cc',border:'1px solid #e6c040',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#7a5000'}}>
+                📦 Entering an E-way Bill number moves stock from the seller to the buyer when you click "Save Changes".
+              </div>
+            )}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <FormRow label='EWB Number' error={editForm.eway_bill_no && !isValidEwayBill(editForm.eway_bill_no) ? EWAY_BILL_ERROR : undefined}>
+                <Input value={editForm.eway_bill_no} onChange={e => setEditForm(f => ({...f, eway_bill_no: e.target.value}))} placeholder='e.g. 421234567890' />
+              </FormRow>
+              <FormRow label='EWB Date'><Input type='date' value={editForm.eway_bill_date} onChange={e => setEditForm(f => ({...f, eway_bill_date: e.target.value}))} /></FormRow>
+              <FormRow label='Challan No'><Input value={editForm.challan_no} onChange={e => setEditForm(f => ({...f, challan_no: e.target.value}))} placeholder='Transporter challan number' /></FormRow>
+              <FormRow label='Vehicle No'><Input value={editForm.vehicle_no} onChange={e => setEditForm(f => ({...f, vehicle_no: e.target.value}))} placeholder='e.g. KA01AB1234' /></FormRow>
+              <FormRow label='Transporter Name' style={{ gridColumn: '1 / -1' }}><Input value={editForm.transporter_name} onChange={e => setEditForm(f => ({...f, transporter_name: e.target.value}))} /></FormRow>
+            </div>
+          </div>
+        ) : ewbEdit && !isLocked ? (
           <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
             {!inv.eway_bill_no && inv.invoice_type === 'sales' && (
               <div style={{background:'#fff3cc',border:'1px solid #e6c040',borderRadius:'6px',padding:'8px 12px',fontSize:'12px',color:'#7a5000'}}>
@@ -1713,13 +1847,26 @@ function InvoiceDetail() {
               <span style={{ marginLeft: 8, fontSize: '11px', fontWeight: 400, color: C.success }}>✓ Filled</span>
             )}
           </div>
-          {!irnEdit && !isLocked && (
+          {!editing && !irnEdit && !isLocked && (
             <Btn size='sm' variant='ghost' onClick={openIrnEdit}>
               {(inv.einvoice_irn || inv.einvoice_ack_no) ? 'Edit' : '+ Add'}
             </Btn>
           )}
         </div>
-        {irnEdit && !isLocked ? (
+        {editing && !isLocked ? (
+          <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+            <FormRow label='IRN (Invoice Reference Number)'>
+              <Input value={editForm.einvoice_irn} onChange={e => setEditForm(f => ({...f, einvoice_irn: e.target.value}))} placeholder='64-character hash from GST portal' style={{ fontFamily: 'monospace', fontSize: '12px' }} />
+            </FormRow>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+              <FormRow label='Acknowledgement No'><Input value={editForm.einvoice_ack_no} onChange={e => setEditForm(f => ({...f, einvoice_ack_no: e.target.value}))} placeholder='Ack number' style={{ fontFamily: 'monospace' }} /></FormRow>
+              <FormRow label='Acknowledgement Date'><Input type='date' value={editForm.einvoice_ack_date} onChange={e => setEditForm(f => ({...f, einvoice_ack_date: e.target.value}))} /></FormRow>
+            </div>
+            <FormRow label='QR Code Data'>
+              <Textarea value={editForm.einvoice_qr_code} onChange={e => setEditForm(f => ({...f, einvoice_qr_code: e.target.value}))} rows={3} placeholder='Paste QR code data from signed e-invoice PDF' style={{ fontFamily: 'monospace', fontSize: '11px' }} />
+            </FormRow>
+          </div>
+        ) : irnEdit && !isLocked ? (
           <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
             <FormRow label='IRN (Invoice Reference Number)'>
               <Input
@@ -1785,7 +1932,9 @@ function InvoiceDetail() {
           </div>
         )}
       </div>
-      {inv.notes && <div style={{ marginTop: '12px', fontSize: '13px', color: C.textSoft }}><strong>Notes:</strong> {inv.notes}</div>}
+      {editing
+        ? <div style={{ marginTop: '12px' }}><FormRow label='Notes'><Textarea value={editForm.notes} onChange={e=>setEditForm(f=>({...f,notes:e.target.value}))} rows={2}/></FormRow></div>
+        : inv.notes && <div style={{ marginTop: '12px', fontSize: '13px', color: C.textSoft }}><strong>Notes:</strong> {inv.notes}</div>}
 
       <div style={{marginTop:'12px',marginBottom:'16px'}}>
         <Btn size='sm' variant='ghost' onClick={()=>downloadCSV(`${inv.invoice_no||'invoice'}_lines_${today()}.csv`,['line_no','description','hsn_code','qty','unit','rate','gst_rate','taxable_amount','cgst_amount','sgst_amount','igst_amount','total_amount'],lines)}>↓ Export Lines CSV</Btn>
@@ -1832,6 +1981,10 @@ function InvoiceDetail() {
         message={inv.eway_bill_no
           ? `Cancel this invoice? Its E-way Bill (${inv.eway_bill_no}) was already generated — stock will reverse from ${inv.buyer?.name || 'the buyer'} back to ${inv.seller?.name || 'the seller'}, and the buyer's auto-created purchase entry will be cancelled too.`
           : 'Cancel this invoice? No E-way Bill has been generated yet, so no stock has moved — nothing to reverse.'}
+        danger />
+      <ConfirmModal open={confirmParties} onClose={() => setConfirmParties(false)} onConfirm={() => { setConfirmParties(false); handleSaveEdit(true) }}
+        title='Change seller / buyer'
+        message={`You are changing the seller or buyer on ${inv.invoice_no || 'this invoice'}.${inv.eway_bill_no ? ' Its E-way Bill is already entered, so stock moves to the new parties and the buyer purchase entry is re-pointed (or cancelled if the new buyer is external).' : ''}${Number(inv.paid_amount) > 0 ? ' Payments already recorded against it move to the new parties too.' : ''} The invoice number is not changed. Continue?`}
         danger />
       <ConfirmModal open={confirmDelete} onClose={() => setConfirmDelete(false)} onConfirm={handleDelete}
         title='Delete Invoice' message={`Delete ${inv.invoice_no || 'this invoice'}? This cannot be undone.`} danger />
