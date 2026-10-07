@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import {
   C, Btn, MultiSelectDropdown, Modal, ConfirmModal, Toast, EmptyState,
   Card, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
@@ -433,6 +434,7 @@ function InvoicePaymentTracker() {
           </FormRow>
         </div>
         <div style={{ flex: 1 }} />
+        <Btn variant='ghost' onClick={() => { if (!exportRows('invoice_payments', filtered)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
         <Btn onClick={() => openNew()}>+ Add Payment</Btn>
       </div>
 
@@ -814,6 +816,7 @@ function ExpensePaymentTracker() {
         <MultiSelectDropdown options={EXPENSE_STATUSES} selected={statusFilter} onChange={setStatusFilter} placeholder='All statuses' />
         <MultiSelectDropdown options={EXPENSE_CATEGORIES} selected={categoryFilter} onChange={setCategoryFilter} placeholder='All categories' capitalize={false} />
         <div style={{ flex: 1 }} />
+        <Btn variant='ghost' onClick={() => { if (!exportRows('expense_payments', filtered)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
         <Btn onClick={openNew}>+ Add Expense</Btn>
       </div>
 
@@ -1113,6 +1116,7 @@ function EntityPaymentLedger() {
         <div style={{ width: '130px' }}><FormRow label='From Date'><Input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} /></FormRow></div>
         <div style={{ width: '130px' }}><FormRow label='To Date'><Input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} /></FormRow></div>
         <div style={{ flex: 1 }} />
+        <Btn variant='ghost' onClick={() => { if (!exportRows('entity_ledger', filteredLedger)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
         <Btn onClick={() => openNew()} disabled={!selectedEntity}>+ Add Entry</Btn>
       </div>
 

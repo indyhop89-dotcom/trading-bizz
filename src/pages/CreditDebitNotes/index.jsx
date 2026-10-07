@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Route, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import KeepListMounted from '../../components/KeepListMounted' // CHANGED: list stays mounted under an open record
 import {
   C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
@@ -348,7 +349,7 @@ function NoteList({ refreshKey }) {
       <PageHeader
         title='Credit & Debit Notes'
         subtitle='Adjustments against issued invoices'
-        action={<Btn onClick={openNew}>+ New Note</Btn>}
+        action={<div style={{ display: 'flex', gap: '8px' }}><Btn variant='ghost' onClick={() => { if (!exportRows('credit_debit_notes', filtered)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn><Btn onClick={openNew}>+ New Note</Btn></div>}
       />
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>

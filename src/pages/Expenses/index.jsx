@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import {
   C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
@@ -517,6 +518,7 @@ export default function Expenses() {
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search description, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
         <MultiSelectDropdown options={categories} selected={typeFilter} onChange={setType} placeholder='All types' capitalize={false} />
+        <Btn variant='ghost' onClick={() => { if (!exportRows('expenses', filtered, e => ({ type: e.category || e.expense_type || '', challans: (challanLinks.byExpense[e.id] || []).join(', ') }))) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
       </div>
 
       {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
@@ -895,6 +897,7 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
         <StatCard label='Total Paid to Parties' value={formatINR(total)} />
+        <Btn variant='ghost' onClick={() => { if (!exportRows('party_payments', rows)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
         <Btn onClick={openNew}>+ Record Payment</Btn>
       </div>
       <Card>
@@ -1074,6 +1077,9 @@ function RcmRegister({ expenses, onChange }) {
         <StatCard label='Pending to Pay' value={formatINR(totalLiability - totalPaid)} color={totalLiability - totalPaid > 0 ? C.danger : C.success} />
         <StatCard label='ITC Claimed' value={formatINR(totalClaimed)} color={C.success} />
         <StatCard label='Pending to Claim' value={formatINR(totalPaid - totalClaimed)} color={totalPaid - totalClaimed > 0 ? C.warning : C.textMuted} />
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '12px' }}>
+        <Btn variant='ghost' onClick={() => { if (!exportRows('rcm_register', rows)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
       </div>
       <Card>
         <Table columns={columns} rows={rows}

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, CsvFileDrop,
@@ -547,6 +548,7 @@ function HsnMaster() {
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search HSN code or description…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, fontFamily: 'inherit' }} />
         <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
+        <Btn variant='ghost' onClick={() => { if (!exportRows('hsn_master', filtered)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
         <Btn onClick={openNew}>+ New HSN Entry</Btn>
       </div>
 
@@ -1332,6 +1334,7 @@ function Parties() {
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center' }}>
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search name, GSTIN, contact…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, fontFamily: 'inherit' }} />
+        <Btn variant='ghost' onClick={() => { if (!exportRows('parties', filtered)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
         {canManage && <Btn onClick={openNew}>+ New Party</Btn>}
       </div>
       {!canManage && (

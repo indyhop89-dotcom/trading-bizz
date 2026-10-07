@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import {
   C, Btn, Badge, Card, PageHeader, EmptyState, StatCard, Toast,
 } from '../../components/UI/index'
@@ -119,6 +120,12 @@ function IntercompanyTab() {
           </button>
         ))}
         <div style={{ flex: 1 }} />
+        <Btn variant='ghost' size='sm' onClick={() => {
+          // CHANGED: CSV export of the pairs on screen
+          const en = e => e?.short_name || e?.name || ''
+          const out = filtered.map(p => ({ sales_invoice_no: p.sales_invoice?.invoice_no || '', invoice_date: p.sales_invoice?.invoice_date || '', seller: en(p.sales_invoice?.seller), buyer: en(p.sales_invoice?.buyer), sales_amount: p.sales_invoice?.total_amount ?? '', purchase_invoice_no: p.purchase_invoice?.invoice_no || '', purchase_amount: p.purchase_invoice?.total_amount ?? '', variance_amount: p.variance_amount ?? '', status: p.status }))
+          if (!exportRows('intercompany_reconciliation', out)) setToast({ message: 'Nothing to export', type: 'error' })
+        }}>↓ Export CSV</Btn>
         <Btn variant='ghost' size='sm' onClick={load}>↻ Refresh</Btn>
       </div>
 
@@ -264,6 +271,8 @@ function InvoiceMatchTab() {
           <option value=''>All entities</option>
           {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
         </select>
+        <div style={{ flex: 1 }} />
+        <Btn variant='ghost' onClick={() => exportRows('outstanding_invoices', data)}>↓ Export CSV</Btn>
       </div>
 
       <Card>

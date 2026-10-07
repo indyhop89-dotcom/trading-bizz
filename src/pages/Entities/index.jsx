@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import {
   C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider,
@@ -260,6 +261,7 @@ export default function Entities() {
         subtitle={`${entities.length} entities across the group`}
         action={
           <div style={{ display: 'flex', gap: '8px' }}>
+            <Btn variant='ghost' onClick={() => { if (!exportRows('entities', filtered)) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
             <Btn variant='ghost' onClick={() => downloadTemplate('entities')}>↓ CSV Template</Btn>
             <Btn variant='secondary' onClick={() => csvRef.current?.click()}>↑ Import CSV</Btn>
             <input ref={csvRef} type='file' accept='.csv' style={{ display: 'none' }} onChange={handleCSV} />

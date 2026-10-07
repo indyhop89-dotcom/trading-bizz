@@ -10,6 +10,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { C, Btn, Card, PageHeader, StatCard, Toast, ConfirmModal, EmptyState, MultiSelectDropdown } from '../../components/UI/index'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import { InlineCell, newVehicleRow } from '../../components/InvoiceVehicles'
 import { fmtDate } from '../../utils/dates'
 import {
@@ -158,7 +159,17 @@ export default function Challans() {
   return (
     <div>
       <PageHeader title='Challans' subtitle='Transporter challan numbers for dispatched invoices — type straight into the row'
-        action={<Btn variant='ghost' onClick={load} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</Btn>} />
+        action={<div style={{ display: 'flex', gap: '8px' }}>
+          <Btn variant='ghost' onClick={() => {
+            // CHANGED: CSV export of the vehicle rows on screen (after filters and search)
+            const out = rows.map(({ inv, v }) => {
+              const key = challanKey(v.challan_no, v.transporter_name)
+              return { invoice_no: inv.invoice_no || '', invoice_date: inv.invoice_date || '', order: inv.orders?.name || '', leg_no: legs[inv.order_leg_id] ?? '', from: entName(inv.seller), to: entName(inv.buyer), eway_bill_no: inv.eway_bill_no || '', eway_bill_date: inv.eway_bill_date || '', vehicle_no: v.vehicle_no || '', transporter: v.transporter_name || '', challan_no: v.challan_no || '', freight_expense: key && expLinks[key] ? expLinks[key].join(', ') : '' }
+            })
+            if (!exportRows('challans', out)) setToast({ message: 'Nothing to export', type: 'error' })
+          }}>↓ Export CSV</Btn>
+          <Btn variant='ghost' onClick={load} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</Btn>
+        </div>} />
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px,1fr))', gap: '12px', marginBottom: '20px' }}>
         <StatCard label='Invoices with E-way Bill' value={invoices.length.toLocaleString('en-IN')} />

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom' // CHANGED: read ?order= for deep-linking from Orders
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import {
   C, Btn, MultiSelectDropdown, Badge, Toast,
   PageHeader, Input, Select,
@@ -144,6 +145,17 @@ export default function DocumentDatabase() {
       <PageHeader
         title='Document Database'
         subtitle='All shipments and their document status — upload, view, and track'
+        action={<Btn variant='ghost' onClick={() => {
+          // CHANGED: CSV export — one row per leg of every order on screen, with its document count.
+          const en = e => e?.short_name || e?.name || ''
+          const out = filtered.flatMap(o => {
+            const base = { order_no: o.order_no || '', order: o.name || '', movement_type: o.movement_type || '', order_status: o.status || '', financial_year: o.financial_years?.name || '', origin: en(o.origin), destination: en(o.destination) }
+            const legs = (o.order_legs || []).slice().sort((a, b) => (a.leg_no || 0) - (b.leg_no || 0))
+            if (legs.length === 0) return [base]
+            return legs.map(l => ({ ...base, leg_no: l.leg_no, leg_type: l.leg_type || '', from: en(l.from_entity), to: en(l.to_entity), tax: l.is_interstate ? 'Interstate' : 'Local', movement_status: l.movement_status || '', cargo_status: l.cargo_status || '', dispatch_date: l.dispatch_date || '', delivery_date: l.delivery_date || '', docs_uploaded: legDocCounts[l.id]?.uploaded ?? 0, docs_total: legDocCounts[l.id]?.total ?? 0 }))
+          })
+          if (!exportRows('document_database', out)) setToast({ message: 'Nothing to export', type: 'error' })
+        }}>↓ Export CSV</Btn>}
       />
 
       {/* ── Filters ── */}

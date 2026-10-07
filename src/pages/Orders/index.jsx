@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, Fragment } from 'react'
 import { Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import KeepListMounted from '../../components/KeepListMounted' // CHANGED: list stays mounted under an open record
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
@@ -432,7 +433,7 @@ function OrdersList({ refreshKey }) {
 
   return (
     <div>
-      <PageHeader title='Orders' subtitle='Track every movement of goods end-to-end' action={<Btn onClick={()=>{setForm({...EMPTY_ORDER,origin_entity_id:defaultEntityId});setModalOpen(true)}}>+ New Order</Btn>}/>
+      <PageHeader title='Orders' subtitle='Track every movement of goods end-to-end' action={<div style={{display:'flex',gap:'8px'}}><Btn variant='ghost' onClick={() => { if (!exportRows('orders', filtered, o => { const pr = progressMap[o.id]; return { progress: !pr ? 'No legs' : pr.legNo ? `Leg ${pr.legNo}/${pr.totalLegs} · ${pr.stage}` : `${pr.totalLegs} leg(s) · Not started` } })) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn><Btn onClick={()=>{setForm({...EMPTY_ORDER,origin_entity_id:defaultEntityId});setModalOpen(true)}}>+ New Order</Btn></div>}/>
       <div style={{display:'flex',gap:'10px',marginBottom:'16px',flexWrap:'wrap'}}>
         <input value={search} onChange={e=>setSearch(e.target.value)} placeholder='Search orders…' style={{padding:'8px 12px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',flex:1,minWidth:'180px',fontFamily:'inherit'}}/>
         <MultiSelectDropdown options={ORDER_STATUSES} selected={statusFilter} onChange={setStatusFilter} placeholder='All statuses'/>
