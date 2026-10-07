@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
+  C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider,
 } from '../../components/UI/index'
 import { GST_STATES } from '../../constants/states'
@@ -28,7 +28,7 @@ export default function Entities() {
   const [groups, setGroups]       = useState([])
   const [loading, setLoading]     = useState(true)
   const [search, setSearch]       = useState('')
-  const [typeFilter, setTypeFilter] = useState('all')
+  const [typeFilter, setTypeFilter] = useState([]) // CHANGED: multi-select — empty means all types
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing]     = useState(null)   // null = new
   const [form, setForm]           = useState(EMPTY_FORM)
@@ -177,7 +177,7 @@ export default function Entities() {
     const matchSearch = !search || e.name.toLowerCase().includes(search.toLowerCase()) ||
       (e.short_name || '').toLowerCase().includes(search.toLowerCase()) ||
       (e.gstin || '').toLowerCase().includes(search.toLowerCase())
-    const matchType = typeFilter === 'all' || e.type === typeFilter
+    const matchType = typeFilter.length === 0 || typeFilter.includes(e.type)
     return matchSearch && matchType
   })
 
@@ -279,17 +279,7 @@ export default function Entities() {
             outline: 'none', flex: '1', minWidth: '200px', fontFamily: 'inherit',
           }}
         />
-        <select
-          value={typeFilter} onChange={e => setTypeFilter(e.target.value)}
-          style={{
-            padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px',
-            background: C.surface, fontSize: '13px', color: C.text,
-            outline: 'none', cursor: 'pointer', fontFamily: 'inherit',
-          }}
-        >
-          <option value='all'>All types</option>
-          {ENTITY_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-        </select>
+        <MultiSelectDropdown options={ENTITY_TYPES} selected={typeFilter} onChange={setTypeFilter} placeholder='All types' />
       </div>
 
       <Card>

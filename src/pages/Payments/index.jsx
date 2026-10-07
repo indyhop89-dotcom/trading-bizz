@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Modal, ConfirmModal, Toast, EmptyState,
+  C, Btn, MultiSelectDropdown, Modal, ConfirmModal, Toast, EmptyState,
   Card, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import DocumentAttachments from '../../components/DocumentAttachments'
@@ -187,11 +187,12 @@ function InvoicePaymentTracker() {
   const [form, setForm]         = useState(EMPTY_INV)
   const [saving, setSaving]     = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(null) // tranche row to delete
-  const [statusFilter, setStatusFilter]   = useState('all')
+  // CHANGED: status / from / to filters are multi-select — an empty array means "all".
+  const [statusFilter, setStatusFilter]   = useState([])
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo]     = useState('')
-  const [fromEntityFilter, setFromEntityFilter] = useState('') // seller
-  const [toEntityFilter, setToEntityFilter]     = useState('') // buyer
+  const [fromEntityFilter, setFromEntityFilter] = useState([]) // seller
+  const [toEntityFilter, setToEntityFilter]     = useState([]) // buyer
   const [toast, setToast]       = useState(null)
 
   const isAdmin = hasFullAccess(profile)
@@ -222,7 +223,7 @@ function InvoicePaymentTracker() {
 
   // Default "To Entity" filter for non-admins: locked if they have exactly one entity, else a scoped dropdown.
   useEffect(() => {
-    if (defaultEntityId && !toEntityFilter) setToEntityFilter(defaultEntityId)
+    if (defaultEntityId && toEntityFilter.length === 0) setToEntityFilter([defaultEntityId])
   }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toEntityOptions = accessEntities
@@ -248,11 +249,11 @@ function InvoicePaymentTracker() {
 
   // ── Filters ──────────────────────────────────────────────────────────────────
   const filtered = computed.filter(inv => {
-    if (statusFilter !== 'all' && inv._status !== statusFilter) return false
+    if (statusFilter.length > 0 && !statusFilter.includes(inv._status)) return false
     if (dateFrom && inv.invoice_date < dateFrom) return false
     if (dateTo && inv.invoice_date > dateTo) return false
-    if (fromEntityFilter && inv.seller_entity_id !== fromEntityFilter) return false
-    if (toEntityFilter && inv.buyer_entity_id !== toEntityFilter) return false
+    if (fromEntityFilter.length > 0 && !fromEntityFilter.includes(inv.seller_entity_id)) return false
+    if (toEntityFilter.length > 0 && !toEntityFilter.includes(inv.buyer_entity_id)) return false
     // Hard restriction — non-admins never see invoices outside their entity access, filter or no filter.
     // accessEntities is the full active-entities list for master, so this is
     // a no-op restriction for them and a real one for everyone else. Skipped
@@ -418,31 +419,17 @@ function InvoicePaymentTracker() {
         <div style={{ width: '130px' }}><FormRow label='To Date'><Input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} /></FormRow></div>
         <div style={{ width: '160px' }}>
           <FormRow label='From Entity (seller)'>
-            <Select value={fromEntityFilter} onChange={e => setFromEntityFilter(e.target.value)}>
-              <option value=''>All</option>
-              {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-            </Select>
+            <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={fromEntityFilter} onChange={setFromEntityFilter} placeholder='All' capitalize={false} style={{ width: '100%', justifyContent: 'space-between' }} />
           </FormRow>
         </div>
         <div style={{ width: '160px' }}>
           <FormRow label='To Entity (buyer)'>
-            <Select value={toEntityFilter} onChange={e => setToEntityFilter(e.target.value)} disabled={toEntityLocked}>
-              {!isAdmin && !toEntityLocked && <option value=''>All accessible</option>}
-              {isAdmin && <option value=''>All</option>}
-              {toEntityOptions.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-            </Select>
+            <MultiSelectDropdown options={toEntityOptions.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={toEntityFilter} onChange={setToEntityFilter} placeholder={isAdmin ? 'All' : 'All accessible'} capitalize={false} disabled={toEntityLocked} style={{ width: '100%', justifyContent: 'space-between' }} />
           </FormRow>
         </div>
         <div style={{ width: '140px' }}>
           <FormRow label='Status'>
-            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
-              style={{ padding: '7px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit', width: '100%' }}>
-              <option value='all'>All</option>
-              <option value='pending'>Pending</option>
-              <option value='due_soon'>Due Soon</option>
-              <option value='overdue'>Overdue</option>
-              <option value='paid'>Paid</option>
-            </select>
+            <MultiSelectDropdown options={[{ value: 'pending', label: 'Pending' }, { value: 'due_soon', label: 'Due Soon' }, { value: 'overdue', label: 'Overdue' }, { value: 'paid', label: 'Paid' }]} selected={statusFilter} onChange={setStatusFilter} placeholder='All' style={{ width: '100%', justifyContent: 'space-between' }} />
           </FormRow>
         </div>
         <div style={{ flex: 1 }} />
@@ -704,8 +691,9 @@ function ExpensePaymentTracker() {
   const [saving, setSaving]     = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [confirmPaid, setConfirmPaid]     = useState(null)
-  const [statusFilter, setStatusFilter]   = useState('all')
-  const [categoryFilter, setCategoryFilter] = useState('all')
+  // CHANGED: multi-select filters — an empty array means "all".
+  const [statusFilter, setStatusFilter]   = useState([])
+  const [categoryFilter, setCategoryFilter] = useState([])
   const [toast, setToast]       = useState(null)
 
   const load = useCallback(async () => {
@@ -802,8 +790,8 @@ function ExpensePaymentTracker() {
   })
 
   const filtered = computed.filter(r => {
-    const ms = statusFilter === 'all'   || r._status === statusFilter
-    const mc = categoryFilter === 'all' || r.expense_category === categoryFilter
+    const ms = statusFilter.length === 0 || statusFilter.includes(r._status)
+    const mc = categoryFilter.length === 0 || categoryFilter.includes(r.expense_category)
     return ms && mc
   })
 
@@ -823,16 +811,8 @@ function ExpensePaymentTracker() {
       </div>
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '14px', alignItems: 'center', flexWrap: 'wrap' }}>
-        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All statuses</option>
-          {EXPENSE_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All categories</option>
-          {EXPENSE_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
+        <MultiSelectDropdown options={EXPENSE_STATUSES} selected={statusFilter} onChange={setStatusFilter} placeholder='All statuses' />
+        <MultiSelectDropdown options={EXPENSE_CATEGORIES} selected={categoryFilter} onChange={setCategoryFilter} placeholder='All categories' capitalize={false} />
         <div style={{ flex: 1 }} />
         <Btn onClick={openNew}>+ Add Expense</Btn>
       </div>

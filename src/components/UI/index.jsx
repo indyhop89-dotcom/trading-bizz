@@ -376,9 +376,26 @@ export function Select({ value, onChange, children, disabled, style: extra }) {
 // status) needs to be selected at once — a plain <select> can only ever hold
 // one. `options` is an array of strings or {value,label} objects; `selected`
 // is an array of the chosen values.
-export function MultiSelectDropdown({ options, selected, onChange, placeholder = 'All', style: extra }) {
+// CHANGED: three additive, optional props — `capitalize` (default true, the
+// original behaviour; pass false for names that must show exactly as stored,
+// e.g. entities and orders), `disabled`, and `title` (tooltip).
+export function MultiSelectDropdown({ options, selected, onChange, placeholder = 'All', style: extra, capitalize = true, disabled = false, title, floating = false }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
+  // CHANGED: `floating` (optional) — pins the option list to the viewport
+  // instead of the parent, so it is not cut off when the dropdown sits inside
+  // a scrolling/clipped container such as a table's filter row. It closes on
+  // scroll so it can never drift away from its button.
+  const [pos, setPos] = useState(null)
+  useEffect(() => {
+    if (!open || !floating) return
+    const r = ref.current?.getBoundingClientRect()
+    if (r) setPos({ top: r.bottom + 4, left: r.left })
+    const close = e => { if (!ref.current?.contains(e.target)) setOpen(false) }
+    window.addEventListener('scroll', close, true)
+    window.addEventListener('resize', close)
+    return () => { window.removeEventListener('scroll', close, true); window.removeEventListener('resize', close) }
+  }, [open, floating])
 
   useEffect(() => {
     if (!open) return
@@ -400,18 +417,18 @@ export function MultiSelectDropdown({ options, selected, onChange, placeholder =
 
   return (
     <div ref={ref} style={{ position: 'relative' }}>
-      <button type='button' onClick={() => setOpen(o => !o)} style={{
+      <button type='button' title={title} disabled={disabled} onClick={() => setOpen(o => !o)} style={{
         padding: '7px 12px', border: `1.5px solid var(--border)`, borderRadius: 'var(--radius)',
-        background: 'var(--surface)', fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit',
+        background: disabled ? 'var(--bg)' : 'var(--surface)', fontSize: '13px', outline: 'none', cursor: disabled ? 'not-allowed' : 'pointer', fontFamily: 'inherit',
         display: 'flex', alignItems: 'center', gap: '8px', color: selected.length ? 'var(--text)' : 'var(--text-muted)',
-        textTransform: 'capitalize', whiteSpace: 'nowrap', ...extra,
+        textTransform: capitalize ? 'capitalize' : 'none', whiteSpace: 'nowrap', ...extra,
       }}>
         {label}
         <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>▾</span>
       </button>
-      {open && (
+      {open && (!floating || pos) && (
         <div style={{
-          position: 'absolute', top: 'calc(100% + 4px)', left: 0, zIndex: 20,
+          ...(floating ? { position: 'fixed', top: pos.top, left: pos.left, zIndex: 1200 } : { position: 'absolute', top: 'calc(100% + 4px)', left: 0, zIndex: 20 }),
           background: 'var(--surface)', border: `1.5px solid var(--border)`, borderRadius: 'var(--radius)',
           boxShadow: '0 4px 16px rgba(0,0,0,0.14)', minWidth: '180px', padding: '6px', maxHeight: '280px', overflowY: 'auto',
         }}>
@@ -424,7 +441,7 @@ export function MultiSelectDropdown({ options, selected, onChange, placeholder =
           {options.map(opt => {
             const { value, label } = norm(opt)
             return (
-              <label key={value} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px', fontSize: '13px', cursor: 'pointer', borderRadius: '4px', textTransform: 'capitalize' }}>
+              <label key={value} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px', fontSize: '13px', cursor: 'pointer', borderRadius: '4px', textTransform: capitalize ? 'capitalize' : 'none', whiteSpace: 'nowrap' }}>
                 <input type='checkbox' checked={selected.includes(value)} onChange={() => toggle(value)} />
                 {label}
               </label>

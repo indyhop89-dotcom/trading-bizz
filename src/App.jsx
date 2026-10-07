@@ -22,6 +22,7 @@ const Orders           = lazy(() => import('./pages/Orders/index'))
 const PI               = lazy(() => import('./pages/PI/index'))
 const PO               = lazy(() => import('./pages/PO/index'))
 const Invoices         = lazy(() => import('./pages/Invoices/index'))
+const Challans         = lazy(() => import('./pages/Challans/index'))
 const CreditDebitNotes = lazy(() => import('./pages/CreditDebitNotes/index'))
 const Payments         = lazy(() => import('./pages/Payments/index'))
 const Expenses         = lazy(() => import('./pages/Expenses/index'))
@@ -68,6 +69,7 @@ function AppRoutes() {
                 <Route path='/pi/*'                 element={<PI />} />
                 <Route path='/po/*'                 element={<PO />} />
                 <Route path='/invoices/*'           element={<Invoices />} />
+                <Route path='/challans/*'           element={<Challans />} />
                 <Route path='/credit-debit-notes/*' element={<CreditDebitNotes />} />
                 <Route path='/payments/*'           element={<Payments />} />
                 <Route path='/expenses/*'           element={<Expenses />} />

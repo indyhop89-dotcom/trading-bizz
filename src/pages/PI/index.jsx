@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
+import { Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import KeepListMounted from '../../components/KeepListMounted' // CHANGED: list stays mounted under an open record
 import { fetchAllPages } from '../../utils/query'
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
@@ -83,7 +84,7 @@ async function writeStockMovementsForPI(pi, lines) {
 }
 
 // ─── PI List ──────────────────────────────────────────────────────────────────
-function PIList() {
+function PIList({ refreshKey }) {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // Bulk delete — restricted to 'master'/'admin', the full-access roles
@@ -107,9 +108,10 @@ function PIList() {
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
   const [statusFilter, setStatus] = useState([])
-  const [fromEntityFilter, setFromEntityF] = useState('')
-  const [toEntityFilter, setToEntityF] = useState('')
-  const [orderFilter, setOrderF] = useState('')
+  // CHANGED: every list filter is multi-select — an empty array means "all".
+  const [fromEntityFilter, setFromEntityF] = useState([])
+  const [toEntityFilter, setToEntityF] = useState([])
+  const [orderFilter, setOrderF] = useState([])
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]         = useState(EMPTY_FORM)
   const [legs, setLegs]         = useState([])
@@ -132,8 +134,8 @@ function PIList() {
   // Orders/index.jsx and migration 038_pi_copy_provenance.
   const [copiedFromPiId, setCopiedFromPiId] = useState('')
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (silent) => {
+    if (silent !== true) setLoading(true)
     const [{ data: poData }, { data: ps }, { data: es }, { data: os }, { data: hsnRows }, { data: prods }] = await Promise.all([
       supabase.from('purchase_orders').select('id,po_no,status,buyer_entity_id,seller_entity_id,order_id,order_leg_id').eq('is_deleted', false).order('po_date', { ascending: false }),
       supabase.from('proforma_invoices')
@@ -154,6 +156,10 @@ function PIList() {
   }, [])
 
   useEffect(() => { load() }, [load])
+  // CHANGED: the list stays mounted while a record is open (KeepListMounted);
+  // on coming back it re-fetches quietly so saved changes show, without
+  // touching filters, search or scroll.
+  useEffect(() => { if (refreshKey) load(true) }, [refreshKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // CHANGED: stockMap must reflect what the *from* entity actually has on
   // hand right now (opening + invoiced-in − invoiced-out, E-way-Bill gated),
@@ -314,9 +320,9 @@ function PIList() {
       p.from_entity?.name?.toLowerCase().includes(search.toLowerCase()) ||
       p.to_entity?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter.length === 0 || statusFilter.includes(p.status)
-    const mfe = !fromEntityFilter || p.from_entity_id === fromEntityFilter
-    const mte = !toEntityFilter   || p.to_entity_id === toEntityFilter
-    const mo  = !orderFilter || p.order_id === orderFilter
+    const mfe = fromEntityFilter.length === 0 || fromEntityFilter.includes(p.from_entity_id)
+    const mte = toEntityFilter.length === 0 || toEntityFilter.includes(p.to_entity_id)
+    const mo  = orderFilter.length === 0 || orderFilter.includes(p.order_id)
     return ms && mst && mfe && mte && mdf && mdt && mo
   })
 
@@ -553,21 +559,9 @@ function PIList() {
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search PI no, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
         <MultiSelectDropdown options={PI_STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
-        <select value={fromEntityFilter} onChange={e => setFromEntityF(e.target.value)} title='From Entity'
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All From Entities</option>
-          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-        </select>
-        <select value={toEntityFilter} onChange={e => setToEntityF(e.target.value)} title='To Entity'
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All To Entities</option>
-          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-        </select>
-        <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All orders</option>
-          {orders.map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
-        </select>
+        <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={fromEntityFilter} onChange={setFromEntityF} placeholder='All From Entities' capitalize={false} title='From Entity' />
+        <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={toEntityFilter} onChange={setToEntityF} placeholder='All To Entities' capitalize={false} title='To Entity' />
+        <MultiSelectDropdown options={orders.map(o => ({ value: o.id, label: orderLabel(o) }))} selected={orderFilter} onChange={setOrderF} placeholder='All orders' capitalize={false} />
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
@@ -1158,9 +1152,8 @@ function PIDetail() {
 
 export default function PI() {
   return (
-    <Routes>
-      <Route index       element={<PIList />} />
+    <KeepListMounted List={PIList}>
       <Route path=':id'  element={<PIDetail />} />
-    </Routes>
+    </KeepListMounted>
   )
 }

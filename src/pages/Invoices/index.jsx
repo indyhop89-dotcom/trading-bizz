@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Routes, Route, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Route, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
 import { fetchAllPages } from '../../utils/query'
 import {
@@ -30,6 +30,9 @@ import { isValidEwayBill, EWAY_BILL_ERROR } from '../../utils/validation'
 import { buildInvoiceDoc } from '../../utils/documentBuilders'
 // CHANGED: one PI/PO can now be billed across several invoices — see utils/docLinks.js.
 import { fetchRemainingLines, syncLinkedDocStatus } from '../../utils/docLinks'
+// CHANGED: vehicle / transporter / challan are now one row per vehicle (invoice_vehicles) — see utils/challans.js.
+import InvoiceVehicles from '../../components/InvoiceVehicles'
+import KeepListMounted from '../../components/KeepListMounted'
 
 const INV_STATUSES = ['draft', 'submitted', 'partial', 'paid', 'cancelled']
 
@@ -128,7 +131,7 @@ async function autoCompletePurchaseMirror(inv, lines) {
 }
 
 // ─── Invoice List ─────────────────────────────────────────────────────────────
-function InvoiceList() {
+function InvoiceList({ refreshKey }) {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role (see PI page for rationale)
@@ -145,10 +148,11 @@ function InvoiceList() {
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
   const [statusFilter, setStatus] = useState([])
-  const [typeFilter, setType]   = useState('all')
-  const [sellerEntityFilter, setSellerEntityF] = useState('')
-  const [buyerEntityFilter, setBuyerEntityF] = useState('')
-  const [orderFilter, setOrderF] = useState('')
+  // CHANGED: every list filter is multi-select — an empty array means "all".
+  const [typeFilter, setType]   = useState([])
+  const [sellerEntityFilter, setSellerEntityF] = useState([])
+  const [buyerEntityFilter, setBuyerEntityF] = useState([])
+  const [orderFilter, setOrderF] = useState([])
   const [orders, setOrders]     = useState([])
   const [toast, setToast]       = useState(null)
   const [csvModal, setCsvModal]   = useState(false)
@@ -163,8 +167,8 @@ function InvoiceList() {
   // ignored HSN effective-dated rate changes.
   const [hsnMap, setHsnMap]     = useState(new Map())
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (silent) => {
+    if (silent !== true) setLoading(true)
     const [{ data: invs }, { data: es }, { data: ps }, { data: hsnRows }, { data: ords }] = await Promise.all([
       // CHANGED: hides the auto-generated buyer-side "purchase" mirror that
       // autoCompletePurchaseMirror() creates the moment a sales invoice gets
@@ -196,6 +200,10 @@ function InvoiceList() {
   }, [])
 
   useEffect(() => { load() }, [load])
+  // CHANGED: the list stays mounted while an invoice is open (KeepListMounted);
+  // on coming back it re-fetches quietly so saved changes show, without
+  // touching filters, search or scroll.
+  useEffect(() => { if (refreshKey) load(true) }, [refreshKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Format: invoice_date,invoice_type,seller_entity,buyer_entity,is_interstate,product,description,hsn_code,qty,unit,rate,gst_rate,due_date,notes,invoice_no
   // CHANGED: invoice_no was previously never set on CSV-created invoices at
@@ -344,10 +352,10 @@ function InvoiceList() {
       i.seller?.name?.toLowerCase().includes(search.toLowerCase()) ||
       i.buyer?.name?.toLowerCase().includes(search.toLowerCase())
     const mst = statusFilter.length === 0 || statusFilter.includes(i.status)
-    const mt  = typeFilter === 'all' || i.invoice_type === typeFilter
-    const mse = !sellerEntityFilter || i.seller_entity_id === sellerEntityFilter
-    const mbe = !buyerEntityFilter  || i.buyer_entity_id === buyerEntityFilter
-    const mo  = !orderFilter || i.order_id === orderFilter
+    const mt  = typeFilter.length === 0 || typeFilter.includes(i.invoice_type)
+    const mse = sellerEntityFilter.length === 0 || sellerEntityFilter.includes(i.seller_entity_id)
+    const mbe = buyerEntityFilter.length === 0 || buyerEntityFilter.includes(i.buyer_entity_id)
+    const mo  = orderFilter.length === 0 || orderFilter.includes(i.order_id)
     // CHANGED: dateFrom/dateTo inputs were rendered but never actually
     // applied — every invoice matched regardless of the date range picked.
     const mdf = !dateFrom || i.invoice_date >= dateFrom
@@ -441,28 +449,11 @@ function InvoiceList() {
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search invoice no, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
-        <select value={typeFilter} onChange={e => setType(e.target.value)}
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All types</option>
-          <option value='sales'>Sales</option>
-          <option value='purchase'>Purchase</option>
-        </select>
+        <MultiSelectDropdown options={[{ value: 'sales', label: 'Sales' }, { value: 'purchase', label: 'Purchase' }]} selected={typeFilter} onChange={setType} placeholder='All types' />
         <MultiSelectDropdown options={INV_STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
-        <select value={sellerEntityFilter} onChange={e => setSellerEntityF(e.target.value)} title='Seller Entity'
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All Seller Entities</option>
-          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-        </select>
-        <select value={buyerEntityFilter} onChange={e => setBuyerEntityF(e.target.value)} title='Buyer Entity'
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All Buyer Entities</option>
-          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-        </select>
-        <select value={orderFilter} onChange={e => setOrderF(e.target.value)}
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All orders</option>
-          {orders.map(o => <option key={o.id} value={o.id}>{orderLabel(o)}</option>)}
-        </select>
+        <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={sellerEntityFilter} onChange={setSellerEntityF} placeholder='All Seller Entities' capitalize={false} title='Seller Entity' />
+        <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={buyerEntityFilter} onChange={setBuyerEntityF} placeholder='All Buyer Entities' capitalize={false} title='Buyer Entity' />
+        <MultiSelectDropdown options={orders.map(o => ({ value: o.id, label: orderLabel(o) }))} selected={orderFilter} onChange={setOrderF} placeholder='All orders' capitalize={false} />
         <input type='date' value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='From date'/>
         <input type='date' value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{padding:'8px 10px',border:`1.5px solid ${C.border}`,borderRadius:'6px',background:C.surface,fontSize:'13px',outline:'none',fontFamily:'inherit'}} title='To date'/>
         {(dateFrom||dateTo)&&<Btn size='sm' variant='ghost' onClick={()=>{setDateFrom('');setDateTo('')}}>Clear</Btn>}
@@ -1302,9 +1293,6 @@ function InvoiceDetail() {
     setEwbForm({
       eway_bill_no:     inv.eway_bill_no     || '',
       eway_bill_date:   inv.eway_bill_date   || '',
-      challan_no:       inv.challan_no       || '',
-      vehicle_no:       inv.vehicle_no       || '',
-      transporter_name: inv.transporter_name || '',
     })
     setEwbEdit(true)
   }
@@ -1315,9 +1303,9 @@ function InvoiceDetail() {
     const { error } = await supabase.from('invoices').update({
       eway_bill_no:     ewbForm.eway_bill_no     || null,
       eway_bill_date:   ewbForm.eway_bill_date   || null,
-      challan_no:       ewbForm.challan_no       || null,
-      vehicle_no:       ewbForm.vehicle_no       || null,
-      transporter_name: ewbForm.transporter_name || null,
+      // CHANGED: challan_no / vehicle_no / transporter_name are no longer
+      // written here — they are a combined copy of the invoice_vehicles rows,
+      // kept in step by <InvoiceVehicles> (utils/challans.js).
       updated_at:       new Date(),
     }).eq('id', id)
     if (error) { setSectSaving(false); return setToast({ message: error.message, type: 'error' }) }
@@ -1344,7 +1332,7 @@ function InvoiceDetail() {
 
     setSectSaving(false)
     setEwbEdit(false)
-    setToast({ message: 'E-way Bill & Challan saved', type: 'success' })
+    setToast({ message: 'E-way Bill saved', type: 'success' })
     load()
   }
 
@@ -1482,8 +1470,9 @@ function InvoiceDetail() {
       einvoice_irn: _f, einvoice_ack_no: _g, einvoice_ack_date: _h, einvoice_qr_code: _i, ...header } = editForm
     const transport = transportLocked ? {} : {
       eway_bill_no: editForm.eway_bill_no || null, eway_bill_date: editForm.eway_bill_date || null,
-      challan_no: editForm.challan_no || null, vehicle_no: editForm.vehicle_no || null,
-      transporter_name: editForm.transporter_name || null,
+      // CHANGED: challan_no / vehicle_no / transporter_name are not written
+      // here any more (still stripped from `header` above) — <InvoiceVehicles>
+      // owns them, so a full-invoice save can never overwrite them with stale values.
       einvoice_irn: editForm.einvoice_irn || null, einvoice_ack_no: editForm.einvoice_ack_no || null,
       einvoice_ack_date: editForm.einvoice_ack_date || null, einvoice_qr_code: editForm.einvoice_qr_code || null,
     }
@@ -1760,7 +1749,7 @@ function InvoiceDetail() {
           </div>
           {!editing && !ewbEdit && !isLocked && (
             <Btn size='sm' variant='ghost' onClick={openEwbEdit}>
-              {(inv.eway_bill_no || inv.challan_no) ? 'Edit' : '+ Add'}
+              {inv.eway_bill_no ? 'Edit' : '+ Add'}
             </Btn>
           )}
         </div>
@@ -1776,9 +1765,6 @@ function InvoiceDetail() {
                 <Input value={editForm.eway_bill_no} onChange={e => setEditForm(f => ({...f, eway_bill_no: e.target.value}))} placeholder='e.g. 421234567890' />
               </FormRow>
               <FormRow label='EWB Date'><Input type='date' value={editForm.eway_bill_date} onChange={e => setEditForm(f => ({...f, eway_bill_date: e.target.value}))} /></FormRow>
-              <FormRow label='Challan No'><Input value={editForm.challan_no} onChange={e => setEditForm(f => ({...f, challan_no: e.target.value}))} placeholder='Transporter challan number' /></FormRow>
-              <FormRow label='Vehicle No'><Input value={editForm.vehicle_no} onChange={e => setEditForm(f => ({...f, vehicle_no: e.target.value}))} placeholder='e.g. KA01AB1234' /></FormRow>
-              <FormRow label='Transporter Name' style={{ gridColumn: '1 / -1' }}><Input value={editForm.transporter_name} onChange={e => setEditForm(f => ({...f, transporter_name: e.target.value}))} /></FormRow>
             </div>
           </div>
         ) : ewbEdit && !isLocked ? (
@@ -1799,29 +1785,17 @@ function InvoiceDetail() {
               <FormRow label='EWB Date'>
                 <Input type='date' value={ewbForm.eway_bill_date} onChange={e => setEwbForm(f => ({...f, eway_bill_date: e.target.value}))} />
               </FormRow>
-              <FormRow label='Challan No'>
-                <Input value={ewbForm.challan_no} onChange={e => setEwbForm(f => ({...f, challan_no: e.target.value}))} placeholder='Transporter challan number' />
-              </FormRow>
-              <FormRow label='Vehicle No'>
-                <Input value={ewbForm.vehicle_no} onChange={e => setEwbForm(f => ({...f, vehicle_no: e.target.value}))} placeholder='e.g. KA01AB1234' />
-              </FormRow>
-              <FormRow label='Transporter Name' style={{ gridColumn: '1 / -1' }}>
-                <Input value={ewbForm.transporter_name} onChange={e => setEwbForm(f => ({...f, transporter_name: e.target.value}))} />
-              </FormRow>
             </div>
             <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
               <Btn variant='ghost' onClick={() => setEwbEdit(false)}>Cancel</Btn>
               <Btn onClick={saveEwbForm} disabled={sectSaving}>{sectSaving ? 'Saving…' : 'Save'}</Btn>
             </div>
           </div>
-        ) : (inv.eway_bill_no || inv.challan_no || inv.vehicle_no || inv.transporter_name) ? (
+        ) : inv.eway_bill_no ? (
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0', fontSize: '13px' }}>
             {[
               ['EWB No',       inv.eway_bill_no],
               ['EWB Date',     fmtDate(inv.eway_bill_date)],
-              ['Challan No',   inv.challan_no],
-              ['Vehicle No',   inv.vehicle_no],
-              ['Transporter',  inv.transporter_name],
             ].filter(([, v]) => v).map(([label, val]) => (
               <div key={label} style={{ padding: '8px 14px', borderTop: `1px solid ${C.border}` }}>
                 <span style={{ color: C.textMuted }}>{label}: </span>
@@ -1832,10 +1806,16 @@ function InvoiceDetail() {
         ) : (
           <div style={{ padding: '12px 14px', fontSize: '12px', color: C.textMuted }}>
             {isLocked
-              ? `No E-way Bill or Challan details entered. Invoice is ${inv.status} — locked from further edits.`
-              : <>No E-way Bill or Challan details entered. Click <strong>+ Add</strong> to fill in.</>}
+              ? `No E-way Bill entered. Invoice is ${inv.status} — locked from further edits.`
+              : <>No E-way Bill entered. Click <strong>+ Add</strong> to fill in.</>}
           </div>
         )}
+        {/* CHANGED: one row per vehicle, each with its own transporter challan.
+            Saves field-by-field on its own, independent of the E-way Bill form
+            and of "Save Changes". onMirror keeps `inv` (and so the printed
+            invoice) in step without reloading the page. */}
+        <InvoiceVehicles invoiceId={id} locked={isLocked} onToast={setToast}
+          onMirror={mirror => setInv(i => i ? { ...i, ...mirror } : i)} />
       </div>
 
       {/* CHANGED: E-Invoice IRN section */}
@@ -2021,10 +2001,10 @@ function InvoiceDetail() {
 
 export default function Invoices() {
   return (
-    <Routes>
-      <Route index         element={<InvoiceList />} />
+    // CHANGED: the list stays mounted underneath an open invoice — see components/KeepListMounted.jsx
+    <KeepListMounted List={InvoiceList}>
       <Route path='new'    element={<NewInvoice />} />
       <Route path=':id'    element={<InvoiceDetail />} />
-    </Routes>
+    </KeepListMounted>
   )
 }

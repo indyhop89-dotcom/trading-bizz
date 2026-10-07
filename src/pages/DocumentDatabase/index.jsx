@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useSearchParams } from 'react-router-dom' // CHANGED: read ?order= for deep-linking from Orders
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Toast,
+  C, Btn, MultiSelectDropdown, Badge, Toast,
   PageHeader, Input, Select,
 } from '../../components/UI/index'
 import DocumentChecklist from '../../components/DocumentChecklist'
@@ -43,7 +43,7 @@ export default function DocumentDatabase() {
   const { entities } = useEntityAccess()
   const [loading, setLoading]         = useState(true)
   const [search, setSearch]           = useState('')
-  const [entityFilter, setEntityFilter] = useState('all')
+  const [entityFilter, setEntityFilter] = useState([]) // CHANGED: multi-select — empty means all entities
   const [taxFilter, setTaxFilter]     = useState('all')
   const [expandedLeg, setExpandedLeg] = useState(null)   // leg.id with checklist open
   // CHANGED: orders now collapse to a summary row by default (previously
@@ -121,9 +121,9 @@ export default function DocumentDatabase() {
         || (o.name || '').toLowerCase().includes(q)
       if (!match) return false
     }
-    if (entityFilter !== 'all') {
+    if (entityFilter.length > 0) {
       const legEntities = (o.order_legs || []).flatMap(l => [l.from_entity?.id, l.to_entity?.id])
-      if (!legEntities.includes(entityFilter)) return false
+      if (!entityFilter.some(id => legEntities.includes(id))) return false
     }
     // CHANGED: taxFilter existed as state but was never actually applied —
     // this is the "filter is not working" bug. An order matches if any of
@@ -157,16 +157,7 @@ export default function DocumentDatabase() {
           onChange={e => setSearch(e.target.value)}
           style={{ width: '240px' }}
         />
-        <Select
-          value={entityFilter}
-          onChange={e => setEntityFilter(e.target.value)}
-          style={{ width: '180px' }}
-        >
-          <option value='all'>All Entities</option>
-          {entities.map(e => (
-            <option key={e.id} value={e.id}>{e.short_name || e.name}</option>
-          ))}
-        </Select>
+        <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={entityFilter} onChange={setEntityFilter} placeholder='All Entities' capitalize={false} />
         {/* CHANGED: this control never existed even though taxFilter state
             did — that mismatch is exactly what made "the filter" seem broken. */}
         <Select
@@ -178,8 +169,8 @@ export default function DocumentDatabase() {
           <option value='local'>Local (CGST+SGST)</option>
           <option value='interstate'>Interstate (IGST)</option>
         </Select>
-        {(search || entityFilter !== 'all' || taxFilter !== 'all') && (
-          <Btn size='sm' variant='ghost' onClick={() => { setSearch(''); setEntityFilter('all'); setTaxFilter('all') }}>Clear</Btn>
+        {(search || entityFilter.length > 0 || taxFilter !== 'all') && (
+          <Btn size='sm' variant='ghost' onClick={() => { setSearch(''); setEntityFilter([]); setTaxFilter('all') }}>Clear</Btn>
         )}
         <div style={{
           marginLeft: 'auto', fontSize: '12px', color: C.textMuted,

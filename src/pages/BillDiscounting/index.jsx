@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
+import { Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import KeepListMounted from '../../components/KeepListMounted' // CHANGED: list stays mounted under an open record
 import {
-  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
+  C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import { formatINR, toNum, roundRupees } from '../../utils/money'
@@ -385,8 +386,9 @@ function BDDashboard({ events, banks, onNewEvent }) {
 
 function BDReports({ events, banks }) {
   const [reportType, setReportType] = useState('bank')   // 'bank' | 'entity' | 'repayments'
-  const [bankFilter, setBankFilter] = useState('all')
-  const [statusFilter, setStatusFilter] = useState('all')
+  // CHANGED: multi-select filters — an empty array means "all".
+  const [bankFilter, setBankFilter] = useState([])
+  const [statusFilter, setStatusFilter] = useState([])
 
   // ── Per-bank report ──
   function bankReport() {
@@ -420,8 +422,8 @@ function BDReports({ events, banks }) {
 
   // ── Filtered events for list ──
   const filteredEvents = events.filter(e => {
-    const mb = bankFilter === 'all' || e.bank_id === bankFilter || e.bank_name === bankFilter
-    const ms = statusFilter === 'all' || e.status === statusFilter
+    const mb = bankFilter.length === 0 || bankFilter.includes(e.bank_id) || bankFilter.includes(e.bank_name)
+    const ms = statusFilter.length === 0 || statusFilter.includes(e.status)
     return mb && ms
   })
 
@@ -531,14 +533,8 @@ function BDReports({ events, banks }) {
       {reportType === 'events' && (
         <>
           <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
-            <select value={bankFilter} onChange={e => setBankFilter(e.target.value)} style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', fontFamily: 'inherit', outline: 'none' }}>
-              <option value='all'>All banks</option>
-              {banks.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
-            </select>
-            <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', fontFamily: 'inherit', outline: 'none' }}>
-              <option value='all'>All statuses</option>
-              {['active','partially_repaid','repaid','overdue','recourse'].map(s => <option key={s} value={s}>{s}</option>)}
-            </select>
+            <MultiSelectDropdown options={banks.map(b => ({ value: b.id, label: b.name }))} selected={bankFilter} onChange={setBankFilter} placeholder='All banks' capitalize={false} />
+            <MultiSelectDropdown options={['active','partially_repaid','repaid','overdue','recourse'].map(v => ({ value: v, label: v.replace(/_/g, ' ') }))} selected={statusFilter} onChange={setStatusFilter} placeholder='All statuses' />
             <button onClick={exportEvents} style={{ padding: '7px 16px', borderRadius: '6px', border: `1px solid ${C.border}`, background: C.surface, fontSize: '13px', fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', color: C.textMid }}>↓ Export CSV</button>
           </div>
           <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: '8px', overflow: 'hidden' }}>
@@ -573,7 +569,7 @@ function BDReports({ events, banks }) {
 
 // ─── Bill Discounting List ────────────────────────────────────────────────────
 
-function BDList() {
+function BDList({ refreshKey }) {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
@@ -679,8 +675,8 @@ function BDList() {
     if (added) load()
   }
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (silent) => {
+    if (silent !== true) setLoading(true)
     const [{ data:evts },{ data:bs },{ data:es },{ data:invs }] = await Promise.all([
       supabase.from('bill_discounting_events').select('*, entity:entity_id(name,short_name), bank:bank_id(name,short_name,grace_period_days,recourse_type,account_no)').eq('is_deleted',false).order('discounting_date',{ascending:false}),
       supabase.from('banks').select('*').eq('is_active',true).order('name'),
@@ -695,6 +691,10 @@ function BDList() {
   }, [])
 
   useEffect(() => { load() }, [load])
+  // CHANGED: the list stays mounted while a record is open (KeepListMounted);
+  // on coming back it re-fetches quietly so saved changes show, without
+  // touching filters, search or scroll.
+  useEffect(() => { if (refreshKey) load(true) }, [refreshKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   function setF(k,v) {
     setForm(f => {
@@ -965,6 +965,14 @@ function BDDetail() {
   const [rf,setRF_]          = useState({repayment_date:today(),amount:'',interest_amount:'0',payment_mode:'bank_transfer',reference_no:'',notes:''})
   const [saving,setSaving]   = useState(false)
   const [toast,setToast]     = useState(null)
+  // CHANGED: the event's terms, its invoices and each repayment can now be
+  // edited at any status.
+  const [editM,setEditM]         = useState(false)
+  const [ef,setEF_]              = useState({})
+  const [editInvs,setEditInvs]   = useState([])   // [{invoice_id,invoice_no,amount}]
+  const [editBanks,setEditBanks] = useState([])
+  const [eligible,setEligible]   = useState([])   // other invoices of this entity that can be added
+  const [editRepay,setEditRepay] = useState(null) // repayment row being edited (null = new)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -981,7 +989,123 @@ function BDDetail() {
 
   function srf(k,v) { setRF_(f=>({...f,[k]:v})) }
 
+  const EMPTY_RF = {repayment_date:today(),amount:'',interest_amount:'0',payment_mode:'bank_transfer',reference_no:'',notes:''}
+  function openNewRepay() { setEditRepay(null); setRF_(EMPTY_RF); setRepayM(true) }
+  function openEditRepay(r) {
+    setEditRepay(r)
+    setRF_({repayment_date:r.repayment_date||today(),amount:r.amount??'',interest_amount:r.interest_amount??'0',payment_mode:r.payment_mode||'bank_transfer',reference_no:r.reference_no||'',notes:r.notes||''})
+    setRepayM(true)
+  }
+  // Status that follows from the numbers. A status someone set by hand
+  // (overdue / recourse) is never overridden.
+  function statusFor(current,out,repaid) {
+    if (['overdue','recourse'].includes(current)) return current
+    return out===0&&repaid>0?'repaid':repaid>0?'partially_repaid':'active'
+  }
+
+  // CHANGED: editing a repayment corrects the row, then re-works the event's
+  // repaid / outstanding from the difference in principal.
+  async function handleRepaymentEdit() {
+    const principal=roundRupees(toNum(rf.amount))
+    if (!principal) return setToast({message:'Amount required',type:'error'})
+    setSaving(true)
+    const interest=roundRupees(toNum(rf.interest_amount))
+    const { error } = await supabase.from('bill_discounting_repayments').update({
+      repayment_date:rf.repayment_date, amount:principal,
+      interest_amount:interest, total_payment:principal+interest,
+      payment_mode:rf.payment_mode, reference_no:rf.reference_no||null, notes:rf.notes||null,
+    }).eq('id',editRepay.id)
+    if (error) { setSaving(false); return setToast({message:error.message,type:'error'}) }
+    const repaid=Math.max(0,(event.repaid_amount||0)-(editRepay.amount||0)+principal)
+    const newOut=Math.max(0,(event.net_proceeds||0)-repaid)
+    const { error:evErr } = await supabase.from('bill_discounting_events').update({outstanding_amount:newOut,repaid_amount:repaid,status:statusFor(event.status,newOut,repaid),updated_at:new Date()}).eq('id',id)
+    setSaving(false); setRepayM(false); setEditRepay(null); setRF_(EMPTY_RF)
+    setToast(evErr?{message:`Repayment updated, but the event totals were not: ${evErr.message}`,type:'error'}:{message:'Repayment updated',type:'success'})
+    load()
+  }
+
+  // ── Edit event ──
+  function sef(k,v) {
+    setEF_(f => {
+      const u={...f,[k]:v}
+      if (k==='discounting_date'||k==='tenure_days') u.maturity_date=addDays(k==='discounting_date'?v:u.discounting_date, k==='tenure_days'?v:u.tenure_days)
+      if (k==='bank_id'&&v) { const b=editBanks.find(x=>x.id===v); if(b){ u.discount_rate=((b.base_rate||0)+(b.spread||0)).toFixed(2); u.processing_fee=b.processing_fee_flat?String(b.processing_fee_flat):'' } }
+      return u
+    })
+  }
+  async function openEditEvent() {
+    setEF_({
+      bank_id:event.bank_id||'', discounting_date:event.discounting_date||today(),
+      tenure_days:event.tenure_days?String(event.tenure_days):'90', maturity_date:event.maturity_date||'',
+      discount_rate:event.applied_rate??event.discount_rate??'', processing_fee:event.processing_fee??'',
+      reserve_amount:event.reserve_amount??'0', financier_ref_no:event.financier_ref_no||'', notes:event.notes||'',
+    })
+    setEditInvs(bdInvs.map(r=>({invoice_id:r.invoice_id,invoice_no:r.invoice?.invoice_no,amount:r.invoice_amount||0})))
+    setEditM(true)
+    const [{ data:bs },{ data:invs }] = await Promise.all([
+      supabase.from('banks').select('*').eq('is_active',true).order('name'),
+      excludeAutoPurchaseMirrors(supabase.from('invoices').select('id,invoice_no,outstanding_amount').eq('is_deleted',false).eq('seller_entity_id',event.entity_id).in('status',['submitted','partial']).order('invoice_date',{ascending:false})),
+    ])
+    setEditBanks(bs||[]); setEligible(invs||[])
+  }
+  function toggleEditInv(row) {
+    setEditInvs(p => p.find(r=>r.invoice_id===row.invoice_id) ? p.filter(r=>r.invoice_id!==row.invoice_id) : [...p,row])
+  }
+  const efTotal=editInvs.reduce((s,r)=>s+(r.amount||0),0)
+  const efFee=roundRupees(toNum(ef.processing_fee))
+  const efRes=roundRupees(toNum(ef.reserve_amount))
+  const efNet=Math.max(0,efTotal-efFee-efRes)
+
+  async function handleSaveEvent() {
+    if (!ef.bank_id)        return setToast({message:'Bank required',type:'error'})
+    if (!editInvs.length)   return setToast({message:'Keep at least one invoice',type:'error'})
+    if (!ef.maturity_date)  return setToast({message:'Maturity date required',type:'error'})
+    const bank=editBanks.find(b=>b.id===ef.bank_id)
+    const added=editInvs.filter(r=>!bdInvs.some(b=>b.invoice_id===r.invoice_id))
+    const removed=bdInvs.filter(b=>!editInvs.some(r=>r.invoice_id===b.invoice_id))
+    setSaving(true)
+    // Same two guards as creating an event, leaving this event itself out.
+    if (bank?.sanctioned_limit>0) {
+      const { data:active } = await supabase.from('bill_discounting_events').select('net_proceeds').eq('bank_id',ef.bank_id).eq('is_deleted',false).neq('id',id).in('status',['active','partially_repaid','overdue'])
+      const used=(active||[]).reduce((s,e)=>s+(e.net_proceeds||0),0)
+      if (efNet+used>bank.sanctioned_limit) { setSaving(false); return setToast({message:`Credit limit breach: would exceed ${formatINR(bank.sanctioned_limit)} sanctioned limit with ${bank.name}`,type:'error'}) }
+    }
+    for (const row of added) {
+      const { data:linked } = await supabase.from('bill_discounting_invoices').select('event_id').eq('invoice_id',row.invoice_id).neq('event_id',id)
+      if (linked?.length) {
+        const { data:active } = await supabase.from('bill_discounting_events').select('id').in('id',linked.map(l=>l.event_id)).eq('is_deleted',false).not('status','in','(repaid,recourse)')
+        if (active?.length) { setSaving(false); return setToast({message:`Invoice ${row.invoice_no} is already in an active bill discounting event`,type:'error'}) }
+      }
+    }
+    // Outstanding follows the new net proceeds less what is already repaid.
+    // Status is re-worked only when the net proceeds actually changed.
+    const repaid=event.repaid_amount||0
+    const newOut=Math.max(0,efNet-repaid)
+    const netChanged=efNet!==(event.net_proceeds||0)
+    const { error } = await supabase.from('bill_discounting_events').update({
+      bank_id:ef.bank_id, bank_name:bank?.name||event.bank_name||'',
+      invoice_id:editInvs.length===1?editInvs[0].invoice_id:null,
+      invoice_amount:efTotal, discount_amount:efFee+efRes,
+      discount_rate:toNum(ef.discount_rate)||null, applied_rate:toNum(ef.discount_rate)||null,
+      net_proceeds:efNet, outstanding_amount:newOut,
+      processing_fee:efFee, reserve_amount:efRes,
+      discounting_date:ef.discounting_date, maturity_date:ef.maturity_date,
+      tenure_days:parseInt(ef.tenure_days)||null,
+      financier_ref_no:ef.financier_ref_no||null, notes:ef.notes||null,
+      status:netChanged?statusFor(event.status,newOut,repaid):event.status,
+      updated_at:new Date(),
+    }).eq('id',id).select('id').single()
+    if (error) { setSaving(false); return setToast({message:error.code==='PGRST116'?'Not saved — you do not have edit access to this event.':error.message,type:'error'}) }
+    let linkErr=null
+    if (removed.length) ({ error:linkErr } = await supabase.from('bill_discounting_invoices').delete().eq('event_id',id).in('invoice_id',removed.map(r=>r.invoice_id)))
+    if (!linkErr&&added.length) ({ error:linkErr } = await supabase.from('bill_discounting_invoices').insert(added.map(r=>({event_id:id,invoice_id:r.invoice_id,invoice_amount:r.amount}))))
+    setSaving(false); setEditM(false)
+    setToast(linkErr?{message:`Event updated, but the invoice list was not: ${linkErr.message}`,type:'error'}:{message:'Event updated',type:'success'})
+    load()
+  }
+
   async function handleRepayment() {
+    if (editRepay) return handleRepaymentEdit()
     const principal=roundRupees(toNum(rf.amount))
     if (!principal) return setToast({message:'Amount required',type:'error'})
     setSaving(true)
@@ -1028,7 +1152,9 @@ function BDDetail() {
         title={`${event.entity?.short_name||event.entity?.name} — ${event.bank?.name||event.bank_name}`}
         subtitle={`Discounted ${fmtDate(event.discounting_date)} · Matures ${fmtDate(event.maturity_date)}`}
         action={<div style={{display:'flex',gap:'8px',alignItems:'center'}}>
-          {!['repaid','recourse'].includes(event.status)&&<Btn onClick={()=>{setRF_({repayment_date:today(),amount:'',interest_amount:'0',payment_mode:'bank_transfer',reference_no:'',notes:''});setRepayM(true)}}>+ Repayment</Btn>}
+          {!['repaid','recourse'].includes(event.status)&&<Btn onClick={openNewRepay}>+ Repayment</Btn>}
+          {/* CHANGED: edit the event at any status */}
+          <Btn variant='ghost' onClick={openEditEvent}>Edit</Btn>
           {event.status!=='repaid'&&<Btn variant='ghost' onClick={()=>setStatM(true)}>Change Status</Btn>}
           {/* CHANGED: master-only event delete */}
           {canDelete&&<Btn variant='danger' onClick={()=>setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}
@@ -1111,7 +1237,7 @@ function BDDetail() {
         <div style={{fontWeight:700,fontSize:'14px',marginBottom:'10px'}}>Repayments ({repays.length})</div>
         <Card>
           {repays.length===0
-            ? <EmptyState icon='💰' title='No repayments yet' action={!['repaid','recourse'].includes(event.status)?<Btn onClick={()=>setRepayM(true)}>+ Repayment</Btn>:undefined}/>
+            ? <EmptyState icon='💰' title='No repayments yet' action={!['repaid','recourse'].includes(event.status)?<Btn onClick={openNewRepay}>+ Repayment</Btn>:undefined}/>
             : <Table columns={[
                 {label:'S.No.',     render:(row,idx)=><span style={{color:C.textMuted}}>{idx+1}</span>},
                 {label:'Date',      render:r=><span style={{fontSize:'12px'}}>{fmtDate(r.repayment_date)}</span>},
@@ -1120,6 +1246,8 @@ function BDDetail() {
                 {label:'Total',     right:true,render:r=><strong>{formatINR(r.total_payment||r.amount)}</strong>},
                 {label:'Mode',      render:r=><span style={{fontSize:'12px',textTransform:'capitalize'}}>{(r.payment_mode||'').replace(/_/g,' ')}</span>},
                 {label:'Ref No',    render:r=><span style={{fontSize:'11px',fontFamily:'monospace',color:C.textSoft}}>{r.reference_no||'—'}</span>},
+                // CHANGED: per-repayment edit
+                {label:'',          render:r=><Btn size='sm' variant='ghost' onClick={()=>openEditRepay(r)}>Edit</Btn>},
               ]} rows={repays}/>
           }
         </Card>
@@ -1130,7 +1258,7 @@ function BDDetail() {
         <DocumentAttachments sourceType='bill_discounting_events' sourceId={event.id} entityId={event.entity_id} entityName={event.entity?.name||'General'}/>
       </div>
 
-      <Modal open={repayM} onClose={()=>setRepayM(false)} title='Record Repayment' width={500}>
+      <Modal open={repayM} onClose={()=>setRepayM(false)} title={editRepay?'Edit Repayment':'Record Repayment'} width={500}>
         <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
           <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:'6px',padding:'10px 14px',fontSize:'13px',display:'flex',gap:'24px'}}>
             <span><span style={{color:C.textMuted}}>Outstanding: </span><strong>{formatINR(event.outstanding_amount)}</strong></span>
@@ -1156,7 +1284,78 @@ function BDDetail() {
           <FormRow label='Notes'><Textarea value={rf.notes} onChange={e=>srf('notes',e.target.value)} rows={2}/></FormRow>
           <div style={{display:'flex',justifyContent:'flex-end',gap:'10px',paddingTop:'8px',borderTop:`1px solid ${C.border}`}}>
             <Btn variant='ghost' onClick={()=>setRepayM(false)}>Cancel</Btn>
-            <Btn onClick={handleRepayment} disabled={saving}>{saving?'Saving…':'Record Repayment'}</Btn>
+            <Btn onClick={handleRepayment} disabled={saving}>{saving?'Saving…':editRepay?'Save Changes':'Record Repayment'}</Btn>
+          </div>
+        </div>
+      </Modal>
+
+      {/* CHANGED: edit event — terms and the invoices behind it. Entity is fixed. */}
+      <Modal open={editM} onClose={()=>setEditM(false)} title='Edit Bill Discounting Event' width={700}>
+        <div style={{display:'flex',flexDirection:'column',gap:'14px'}}>
+          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
+            <FormRow label='Entity' hint='Cannot be changed — the invoices belong to it'>
+              <Input value={event.entity?.short_name||event.entity?.name||''} disabled/>
+            </FormRow>
+            <FormRow label='Bank / Financier' required>
+              <Select value={ef.bank_id||''} onChange={e=>sef('bank_id',e.target.value)}>
+                <option value=''>Select bank…</option>
+                {editBanks.map(b=><option key={b.id} value={b.id}>{b.name} — {((b.base_rate||0)+(b.spread||0)).toFixed(2)}% p.a.</option>)}
+                {ef.bank_id&&!editBanks.some(b=>b.id===ef.bank_id)&&<option value={ef.bank_id}>{event.bank?.name||event.bank_name||'Current bank'}</option>}
+              </Select>
+            </FormRow>
+            <FormRow label='Discounting Date' required>
+              <Input type='date' value={ef.discounting_date||''} onChange={e=>sef('discounting_date',e.target.value)}/>
+            </FormRow>
+            <FormRow label='Tenure'>
+              <Select value={ef.tenure_days||'90'} onChange={e=>sef('tenure_days',e.target.value)}>
+                {[...new Set(['30','45','60','75','90','120','180',ef.tenure_days||'90'])].sort((a,b)=>a-b).map(d=><option key={d} value={d}>{d} days</option>)}
+              </Select>
+            </FormRow>
+            <FormRow label='Maturity Date'>
+              <Input type='date' value={ef.maturity_date||''} onChange={e=>sef('maturity_date',e.target.value)}/>
+            </FormRow>
+            <FormRow label='Rate % p.a.'>
+              <Input type='number' step='0.01' value={ef.discount_rate??''} onChange={e=>sef('discount_rate',e.target.value)}/>
+            </FormRow>
+            <FormRow label='Processing Fee (₹)'>
+              <Input type='number' value={ef.processing_fee??''} onChange={e=>sef('processing_fee',e.target.value)} placeholder='0'/>
+            </FormRow>
+            <FormRow label='Reserve Withheld (₹)'>
+              <Input type='number' value={ef.reserve_amount??''} onChange={e=>sef('reserve_amount',e.target.value)} placeholder='0'/>
+            </FormRow>
+            <FormRow label='Financier Reference No'>
+              <Input value={ef.financier_ref_no||''} onChange={e=>sef('financier_ref_no',e.target.value)} placeholder="Bank's reference / transaction number"/>
+            </FormRow>
+          </div>
+
+          <SectionDivider label='Invoices in this event'/>
+          <div style={{maxHeight:200,overflowY:'auto',border:`1px solid ${C.border}`,borderRadius:'6px'}}>
+            {[
+              ...bdInvs.map(r=>({invoice_id:r.invoice_id,invoice_no:r.invoice?.invoice_no,amount:r.invoice_amount||0,tag:'In this event'})),
+              ...eligible.filter(i=>!bdInvs.some(b=>b.invoice_id===i.id)).map(i=>({invoice_id:i.id,invoice_no:i.invoice_no,amount:i.outstanding_amount||0,tag:''})),
+            ].map(row=>{
+              const checked=!!editInvs.find(r=>r.invoice_id===row.invoice_id)
+              return (
+                <div key={row.invoice_id} onClick={()=>toggleEditInv({invoice_id:row.invoice_id,invoice_no:row.invoice_no,amount:row.amount})} style={{display:'flex',alignItems:'center',gap:'12px',padding:'9px 14px',borderBottom:`1px solid ${C.border}`,cursor:'pointer',background:checked?'#e8f3fd':'transparent'}}>
+                  <input type='checkbox' checked={checked} readOnly style={{flexShrink:0}}/>
+                  <span style={{fontFamily:'monospace',fontSize:'12px',fontWeight:600,flex:1}}>{row.invoice_no||'—'}</span>
+                  <span style={{fontSize:'11px',color:C.textMuted}}>{row.tag}</span>
+                  <span style={{fontSize:'12px',fontWeight:600}}>{formatINR(row.amount)}</span>
+                </div>
+              )
+            })}
+          </div>
+
+          <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:'10px',background:C.bg,border:`1px solid ${C.border}`,borderRadius:'6px',padding:'12px 14px'}}>
+            {[['Invoice Total',formatINR(efTotal),C.text],['− Processing Fee',formatINR(efFee),C.warning],['− Reserve',formatINR(efRes),C.warning],['Net Proceeds',formatINR(efNet),C.success],['Outstanding after save',formatINR(Math.max(0,efNet-(event.repaid_amount||0))),C.danger]].map(([l,v,c])=>(
+              <div key={l}><div style={{fontSize:'10px',color:C.textMuted,fontWeight:700,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:'3px'}}>{l}</div><div style={{fontSize:'13px',fontWeight:700,color:c}}>{v}</div></div>
+            ))}
+          </div>
+
+          <FormRow label='Notes'><Textarea value={ef.notes||''} onChange={e=>sef('notes',e.target.value)} rows={2}/></FormRow>
+          <div style={{display:'flex',justifyContent:'flex-end',gap:'10px',paddingTop:'8px',borderTop:`1px solid ${C.border}`}}>
+            <Btn variant='ghost' onClick={()=>setEditM(false)}>Cancel</Btn>
+            <Btn onClick={handleSaveEvent} disabled={saving||!editInvs.length}>{saving?'Saving…':'Save Changes'}</Btn>
           </div>
         </div>
       </Modal>
@@ -1183,9 +1382,8 @@ function BDDetail() {
 // ─── Router ───────────────────────────────────────────────────────────────────
 export default function BillDiscounting() {
   return (
-    <Routes>
-      <Route index      element={<BDList/>}/>
+    <KeepListMounted List={BDList}>
       <Route path=':id' element={<BDDetail/>}/>
-    </Routes>
+    </KeepListMounted>
   )
 }

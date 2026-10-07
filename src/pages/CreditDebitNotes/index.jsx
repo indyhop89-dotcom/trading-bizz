@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
+import { Route, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import KeepListMounted from '../../components/KeepListMounted' // CHANGED: list stays mounted under an open record
 import {
-  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
+  C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider,
 } from '../../components/UI/index'
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
@@ -38,7 +39,7 @@ function toNoteLinePayload(computedLine, noteId, lineNo) {
 }
 
 // ─── List ──────────────────────────────────────────────────────────────────────
-function NoteList() {
+function NoteList({ refreshKey }) {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk + single delete, master-only, same convention as PI/PO/Invoices
@@ -51,8 +52,9 @@ function NoteList() {
   const [invoices, setInvoices] = useState([])
   const [hsnMap, setHsnMap]     = useState(new Map())
   const [loading, setLoading]   = useState(true)
-  const [typeFilter, setType]   = useState('all')
-  const [statusFilter, setStatus] = useState('all')
+  // CHANGED: multi-select filters — an empty array means "all".
+  const [typeFilter, setType]   = useState([])
+  const [statusFilter, setStatus] = useState([])
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]         = useState({
     note_type: 'credit_note', against_invoice_id: '',
@@ -75,9 +77,13 @@ function NoteList() {
   // payment history (see handleSave) — this just previews that rate to the
   // user before they save, read-only, no manual entry.
   const [linkedRates, setLinkedRates] = useState({ tds: 0, tcs: 0 })
+  // CHANGED: notes can now be edited at any status. editingNote = the note
+  // being edited (null = creating). The same modal and form serve both.
+  const [editingNote, setEditingNote] = useState(null)
+  const [searchParams, setSearchParams] = useSearchParams()
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (silent) => {
+    if (silent !== true) setLoading(true)
     const [{ data: ns }, { data: es }, { data: invs }, { data: hsnRows }] = await Promise.all([
       supabase.from('credit_debit_notes')
         .select('*, issuer:issuer_entity_id(name,short_name), receiver:receiver_entity_id(name,short_name), invoice:against_invoice_id(invoice_no)')
@@ -97,6 +103,44 @@ function NoteList() {
   }, [])
 
   useEffect(() => { load() }, [load])
+  // CHANGED: the list stays mounted while a record is open (KeepListMounted);
+  // on coming back it re-fetches quietly so saved changes show, without
+  // touching filters, search or scroll.
+  useEffect(() => { if (refreshKey) load(true) }, [refreshKey]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const BLANK_FORM = { note_type: 'credit_note', against_invoice_id: '', issuer_entity_id: '', receiver_entity_id: '', note_date: today(), reason: 'return', reason_notes: '', is_interstate: false, notes: '', note_no: '' }
+  function openNew() {
+    setEditingNote(null)
+    setForm(BLANK_FORM); setNoteLines([]); setSimpleMode(false); setSimpleRows([{ amount: '', gst_rate: '18' }])
+    setModalOpen(true)
+  }
+  // CHANGED: load an existing note and its line items into the form. Always
+  // opens in full line-item mode — a note made in Simple mode shows its
+  // adjustment rows as ordinary lines, which stay editable.
+  async function openEdit(n) {
+    const { data: ls, error } = await supabase.from('credit_debit_note_lines').select('*').eq('note_id', n.id).order('line_no')
+    if (error) return setToast({ message: `Could not load the note's line items: ${error.message}`, type: 'error' })
+    setEditingNote(n)
+    setForm({
+      ...BLANK_FORM,
+      note_type: n.note_type || 'credit_note', against_invoice_id: n.against_invoice_id || '',
+      issuer_entity_id: n.issuer_entity_id || '', receiver_entity_id: n.receiver_entity_id || '',
+      note_date: n.note_date || today(), reason: n.reason || 'return', reason_notes: n.reason_notes || '',
+      is_interstate: !!n.is_interstate, note_no: n.note_no || '',
+    })
+    setSimpleMode(false); setSimpleRows([{ amount: '', gst_rate: '18' }])
+    setNoteLines((ls || []).map(l => ({ ...l, _id: l.id, _hsn_resolved_rate: null, _hsn_override: false, _hsn_manually_set: false, _cost_rate: null, _margin_pct: '' })))
+    setModalOpen(true)
+  }
+  // The note's own page links here as ?edit=<id> — open that note for editing once the list has loaded.
+  useEffect(() => {
+    const editId = searchParams.get('edit')
+    if (!editId || loading) return
+    const n = notes.find(x => x.id === editId)
+    setSearchParams({}, { replace: true })
+    if (n) openEdit(n)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, loading, notes])
 
   function setF(k, v) {
     setForm(f => {
@@ -173,8 +217,11 @@ function NoteList() {
     // note's own date, same as the other modules — no DB round-trip needed.
     const fyCode = fyCodeForDate(form.note_date)
     let noteNo = (form.note_no || '').trim()
+    // CHANGED: on an edit a blank number keeps the note's existing number, and
+    // the duplicate check ignores the note itself.
+    if (!noteNo && editingNote?.note_no) noteNo = editingNote.note_no
     if (noteNo) {
-      const dup = notes.find(n => n.note_no?.toLowerCase() === noteNo.toLowerCase())
+      const dup = notes.find(n => n.id !== editingNote?.id && n.note_no?.toLowerCase() === noteNo.toLowerCase())
       if (dup) { setSaving(false); return setToast({ message: `Note number "${noteNo}" is already in use`, type: 'error' }) }
     } else {
       const issuerEntity = entities.find(e => e.id === form.issuer_entity_id)
@@ -220,22 +267,37 @@ function NoteList() {
     // schema DOES have and require the column, this insert will fail with a
     // clear "null value in column financial_year_id" error rather than
     // silently succeeding wrong, and it's a one-line fix to add it back.
-    const { data: note, error } = await supabase.from('credit_debit_notes').insert(payload).select().single()
-    if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
+    // CHANGED: an edit updates the note in place and keeps its current status
+    // (a submitted note stays submitted); its line items are replaced with
+    // what is in the form — same delete-then-insert the invoice edit uses.
+    let note, error
+    if (editingNote) {
+      const { status: _keep, ...editPayload } = payload
+      ;({ data: note, error } = await supabase.from('credit_debit_notes').update(editPayload).eq('id', editingNote.id).select().single())
+      if (error) {
+        setSaving(false)
+        return setToast({ message: error.code === 'PGRST116' ? 'Not saved — you do not have edit access to this note.' : error.message, type: 'error' })
+      }
+      const { error: delErr } = await supabase.from('credit_debit_note_lines').delete().eq('note_id', note.id)
+      if (delErr) { setSaving(false); return setToast({ message: `Note details were updated, but the old line items could not be cleared: ${delErr.message}. Lines were left unchanged.`, type: 'error' }) }
+    } else {
+      ;({ data: note, error } = await supabase.from('credit_debit_notes').insert(payload).select().single())
+      if (error) { setSaving(false); return setToast({ message: error.message, type: 'error' }) }
+    }
     if (sourceLines.length > 0) {
       const linesPayload = computed.map((l, i) => toNoteLinePayload(l, note.id, i + 1))
       const { error: linesError } = await supabase.from('credit_debit_note_lines').insert(linesPayload)
       if (linesError) { setSaving(false); return setToast({ message: `Note saved, but line items failed: ${linesError.message}`, type: 'error' }) }
     }
     setSaving(false)
-    setToast({ message: 'Note created', type: 'success' })
+    setToast({ message: editingNote ? 'Note updated' : 'Note created', type: 'success' })
     setModalOpen(false)
     navigate(`/credit-debit-notes/${note.id}`)
   }
 
   const filtered = notes.filter(n => {
-    const mt = typeFilter   === 'all' || n.note_type === typeFilter
-    const ms = statusFilter === 'all' || n.status    === statusFilter
+    const mt = typeFilter.length === 0 || typeFilter.includes(n.note_type)
+    const ms = statusFilter.length === 0 || statusFilter.includes(n.status)
     return mt && ms
   })
 
@@ -277,6 +339,8 @@ function NoteList() {
         ? <span style={{ fontSize: '12px', color: C.textSoft }}>{n.tds_amount ? `TDS ${formatINR(n.tds_amount)}` : ''}{n.tds_amount && n.tcs_amount ? ' / ' : ''}{n.tcs_amount ? `TCS ${formatINR(n.tcs_amount)}` : ''}</span>
         : <span style={{ color: C.textMuted }}>—</span> },
     { label: 'Status',   render: n => <Badge status={n.status} /> },
+    // CHANGED: per-row edit, available at any status
+    { label: '', render: n => <Btn size='sm' variant='ghost' onClick={ev => { ev.stopPropagation(); openEdit(n) }}>Edit</Btn> },
   ]
 
   return (
@@ -284,21 +348,12 @@ function NoteList() {
       <PageHeader
         title='Credit & Debit Notes'
         subtitle='Adjustments against issued invoices'
-        action={<Btn onClick={() => { setForm({ note_type: 'credit_note', against_invoice_id: '', issuer_entity_id: '', receiver_entity_id: '', note_date: today(), reason: 'return', reason_notes: '', is_interstate: false, notes: '', note_no: '' }); setNoteLines([]); setSimpleMode(false); setSimpleRows([{ amount: '', gst_rate: '18' }]); setModalOpen(true) }}>+ New Note</Btn>}
+        action={<Btn onClick={openNew}>+ New Note</Btn>}
       />
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
-        <select value={typeFilter} onChange={e => setType(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All types</option>
-          <option value='credit_note'>Credit Notes</option>
-          <option value='debit_note'>Debit Notes</option>
-        </select>
-        <select value={statusFilter} onChange={e => setStatus(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All statuses</option>
-          {STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <MultiSelectDropdown options={[{ value: 'credit_note', label: 'Credit Notes' }, { value: 'debit_note', label: 'Debit Notes' }]} selected={typeFilter} onChange={setType} placeholder='All types' />
+        <MultiSelectDropdown options={STATUSES} selected={statusFilter} onChange={setStatus} placeholder='All statuses' />
       </div>
 
       {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
@@ -316,13 +371,13 @@ function NoteList() {
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={filtered} onRowClick={n => navigate(`/credit-debit-notes/${n.id}`)}
-              emptyState={<EmptyState icon='📋' title='No credit/debit notes' action={<Btn onClick={() => setModalOpen(true)}>+ New Note</Btn>} />}
+              emptyState={<EmptyState icon='📋' title='No credit/debit notes' action={<Btn onClick={openNew}>+ New Note</Btn>} />}
             />
         }
       </Card>
 
       {/* New Note Modal */}
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title='New Credit / Debit Note' width={900}>
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingNote ? `Edit Note${editingNote.note_no ? ` — ${editingNote.note_no}` : ''}` : 'New Credit / Debit Note'} width={900}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
           <SectionDivider label='Note Details' />
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px' }}>
@@ -334,7 +389,7 @@ function NoteList() {
             <FormRow label='Note Date' required>
               <Input type='date' value={form.note_date} onChange={e => setF('note_date', e.target.value)} />
             </FormRow>
-            <FormRow label='Note Number' hint='Leave blank to auto-generate'>
+            <FormRow label='Note Number' hint={editingNote ? 'Leave blank to keep the current number' : 'Leave blank to auto-generate'}>
               <Input value={form.note_no} onChange={e => setF('note_no', e.target.value)} placeholder='Auto-generated if blank' />
             </FormRow>
             <FormRow label='Reason' required>
@@ -404,7 +459,7 @@ function NoteList() {
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Create Note'}</Btn>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editingNote ? 'Save Changes' : 'Create Note'}</Btn>
           </div>
         </div>
       </Modal>
@@ -475,6 +530,8 @@ function NoteDetail() {
         subtitle={`${note.issuer?.name} → ${note.receiver?.name} · Against ${note.invoice?.invoice_no || '—'}`}
         action={
           <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            {/* CHANGED: edit at any status — opens the note in the list page's form */}
+            <Btn size='sm' variant='ghost' onClick={() => navigate(`/credit-debit-notes?edit=${note.id}`)}>Edit</Btn>
             {note.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {note.status !== 'cancelled' && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
             {/* CHANGED: master-only note delete */}
@@ -528,9 +585,8 @@ function NoteDetail() {
 
 export default function CreditDebitNotes() {
   return (
-    <Routes>
-      <Route index       element={<NoteList />} />
+    <KeepListMounted List={NoteList}>
       <Route path=':id'  element={<NoteDetail />} />
-    </Routes>
+    </KeepListMounted>
   )
 }

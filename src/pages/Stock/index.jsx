@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, Fragment } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
+  C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, StatCard, CsvFileDrop,
 } from '../../components/UI/index'
 import { formatINR, toNum, round2 } from '../../utils/money'
@@ -71,7 +71,7 @@ function OpeningStock() {
   const [form, setForm]         = useState(EMPTY_OPENING)
   const [saving, setSaving]     = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(null)
-  const [entityFilter, setEntityFilter]   = useState('')
+  const [entityFilter, setEntityFilter]   = useState([]) // CHANGED: multi-select — empty means all entities
   const [toast, setToast]       = useState(null)
   // CHANGED: once a product's actual stock (opening + invoices + adjustments,
   // same computation Stock Position uses) has been fully offloaded/sold to
@@ -327,7 +327,7 @@ function OpeningStock() {
   }
 
   const filtered = rows
-    .filter(r => !entityFilter || r.entity_id === entityFilter)
+    .filter(r => entityFilter.length === 0 || entityFilter.includes(r.entity_id))
     .filter(r => !asOfDate || !r.as_of_date || r.as_of_date <= asOfDate)
     // CHANGED: checks net_of_offloaded (actual_qty + offloaded_qty), not
     // actual_qty alone — actual_qty no longer counts offloaded adjustments
@@ -396,11 +396,7 @@ function OpeningStock() {
         <StatCard label='Rows'        value={filtered.length} />
       </div>
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center', flexWrap: 'wrap' }}>
-        <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All entities</option>
-          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-        </select>
+        <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={entityFilter} onChange={setEntityFilter} placeholder='All entities' capitalize={false} />
         <div style={{ flex: 1 }} />
         {/* CHANGED: fully offloaded/sold-out rows (actual stock === 0) hidden
             by default to keep totals honest — toggle back on for an audit view. */}
@@ -591,13 +587,13 @@ function StockAdjustments() {
   const [rows, setRows]         = useState([])
   const [entities, setEntities] = useState([])
   const [products, setProducts] = useState([])
-  const [entityFilter, setEntityFilter] = useState('')
+  const [entityFilter, setEntityFilter] = useState([]) // CHANGED: multi-select — empty means all entities
   // CHANGED: offloaded stock (out of the system for good) reads as just
   // another row among shortfall/damage/found/recount corrections otherwise —
   // a reason filter plus its own StatCard makes it visible as its own thing
   // without changing what it does to actual_qty (unchanged: it still reduces
   // it, same as it always has).
-  const [reasonFilter, setReasonFilter] = useState('')
+  const [reasonFilter, setReasonFilter] = useState([]) // CHANGED: multi-select — empty means all reasons
   const [loading, setLoading]   = useState(true)
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing]   = useState(null)
@@ -782,8 +778,8 @@ function StockAdjustments() {
   }
 
   const filtered = rows
-    .filter(r => !entityFilter || r.entity_id === entityFilter)
-    .filter(r => !reasonFilter || r.reason === reasonFilter)
+    .filter(r => entityFilter.length === 0 || entityFilter.includes(r.entity_id))
+    .filter(r => reasonFilter.length === 0 || reasonFilter.includes(r.reason))
 
   // CHANGED: offloaded broken out from every other reason — sums qty per
   // unit (Nos/Mts/etc. can't be added together meaningfully), scoped to the
@@ -798,7 +794,7 @@ function StockAdjustments() {
     }
     return Object.entries(m).map(([u, q]) => `${q.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ${u}`).join(' • ') || '0'
   }
-  const entityOnly = rows.filter(r => !entityFilter || r.entity_id === entityFilter)
+  const entityOnly = rows.filter(r => entityFilter.length === 0 || entityFilter.includes(r.entity_id))
   const offloadedRows = entityOnly.filter(r => r.reason === 'offloaded')
   const otherRows = entityOnly.filter(r => r.reason !== 'offloaded')
 
@@ -855,16 +851,8 @@ function StockAdjustments() {
       </div>
 
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', alignItems: 'center' }}>
-        <select value={entityFilter} onChange={e => setEntityFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All entities</option>
-          {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-        </select>
-        <select value={reasonFilter} onChange={e => setReasonFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All reasons</option>
-          {ADJUSTMENT_REASONS.map(r => <option key={r.value} value={r.value}>{r.label.split(' (')[0]}</option>)}
-        </select>
+        <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={entityFilter} onChange={setEntityFilter} placeholder='All entities' capitalize={false} />
+        <MultiSelectDropdown options={ADJUSTMENT_REASONS.map(r => ({ value: r.value, label: r.label.split(' (')[0] }))} selected={reasonFilter} onChange={setReasonFilter} placeholder='All reasons' capitalize={false} />
         <div style={{ flex: 1 }} />
         <Btn variant='ghost' onClick={handleExportAdjustmentsCSV}>↓ Export CSV</Btn>
         <Btn variant='ghost' onClick={() => { setCsvText(''); setCsvResult(null); setCsvModal(true) }}>↑ CSV Upload</Btn>
@@ -1003,7 +991,7 @@ function StockPosition() {
   // — a report-style subtotal view (qty + value per group, expandable to the
   // underlying line items, plus a grand total) so a multi-entity "All
   // entities" list isn't just one long undifferentiated table.
-  const [categoryFilter, setCategoryFilter] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState([]) // CHANGED: multi-select — empty means all categories
   // CHANGED: free-text filter on product name/HSN — the entity/category/FY
   // dropdowns above narrow by a known dimension, but there was no way to jump
   // straight to a specific product in a list that can run to hundreds of rows.
@@ -1012,7 +1000,7 @@ function StockPosition() {
   // style) — unitFilter is new here; Entity/Category reuse the existing
   // entityFilter/categoryFilter state so the row and the controls above it
   // never disagree.
-  const [unitFilter, setUnitFilter] = useState('')
+  const [unitFilter, setUnitFilter] = useState([]) // CHANGED: multi-select — empty means all units
   const [groupBy, setGroupBy] = useState('none')
   // CHANGED: sold-out products (actual stock exactly 0 — everything on hand
   // has moved out, nothing wrong) clutter the table once a business has been
@@ -1286,8 +1274,8 @@ function StockPosition() {
   const units = [...new Set(position.map(r => r.product?.unit).filter(Boolean))].sort()
   const searchTerm = search.trim().toLowerCase()
   const categoryOnlyFiltered = position
-    .filter(r => !categoryFilter || r.product?.category === categoryFilter)
-    .filter(r => !unitFilter || r.product?.unit === unitFilter)
+    .filter(r => categoryFilter.length === 0 || categoryFilter.includes(r.product?.category))
+    .filter(r => unitFilter.length === 0 || unitFilter.includes(r.product?.unit))
     // CHANGED: checks net_of_offloaded, not actual_qty — see its definition
     // above for why (offloaded no longer moves actual_qty since migration 052).
     // CHANGED: epsilon instead of exact !== 0 — net_of_offloaded is a sum of
@@ -1433,17 +1421,11 @@ function StockPosition() {
         </select>
       </td>
       <td style={filterCellStyle}>
-        <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)} style={filterSelectStyle}>
-          <option value=''>All</option>
-          {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
-        </select>
+        <MultiSelectDropdown options={categories} selected={categoryFilter} onChange={setCategoryFilter} placeholder='All' capitalize={false} floating style={{ width: '100%', padding: '4px 6px', fontSize: '11px', borderWidth: '1px', borderRadius: '4px', justifyContent: 'space-between' }} />
       </td>
       <td style={filterCellStyle} />
       <td style={filterCellStyle}>
-        <select value={unitFilter} onChange={e => setUnitFilter(e.target.value)} style={filterSelectStyle}>
-          <option value=''>All</option>
-          {units.map(u => <option key={u} value={u}>{u}</option>)}
-        </select>
+        <MultiSelectDropdown options={units} selected={unitFilter} onChange={setUnitFilter} placeholder='All' capitalize={false} floating style={{ width: '100%', padding: '4px 6px', fontSize: '11px', borderWidth: '1px', borderRadius: '4px', justifyContent: 'space-between' }} />
       </td>
       <td style={filterCellStyle} />
       <td style={filterCellStyle} />
@@ -1525,11 +1507,7 @@ function StockPosition() {
           <span style={{ fontSize: '11px', color: C.textMuted }}>🔒 Locked to your assigned entity</span>
         )}
         {/* CHANGED: category filter */}
-        <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
-          style={{ padding: '7px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value=''>All categories</option>
-          {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
-        </select>
+        <MultiSelectDropdown options={categories} selected={categoryFilter} onChange={setCategoryFilter} placeholder='All categories' capitalize={false} />
         {/* CHANGED: free-text product search — filters by name or HSN code */}
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search product or HSN…'
           style={{ padding: '7px 12px', border: `1.5px solid ${search ? C.accent : C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit', width: '200px' }} />

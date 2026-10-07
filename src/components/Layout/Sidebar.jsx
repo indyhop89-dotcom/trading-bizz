@@ -12,6 +12,7 @@ export const NAV = [
   { path: '/pi',                 label: 'Proforma Invoices',  icon: FileTextIcon,section: 'Operations' },
   { path: '/po',                 label: 'Purchase Orders',    icon: ClipboardIcon,section:'Operations' },
   { path: '/invoices',           label: 'Invoices',           icon: ReceiptIcon, section: 'Operations' },
+  { path: '/challans',           label: 'Challans',           icon: TruckIcon,   section: 'Operations' },
   { path: '/credit-debit-notes', label: 'Credit/Debit Notes', icon: EditIcon,    section: 'Operations' },
   { divider: 'Finance' },
   { path: '/payments',           label: 'Payments',           icon: CreditCardIcon, section: 'Finance' },
@@ -40,6 +41,7 @@ function BoxIcon()          { return <Icon d={['M21 16V8a2 2 0 0 0-1-1.73l-7-4a2
 function FileTextIcon()     { return <Icon d={['M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z','M14 2v6h6','M16 13H8','M16 17H8','M10 9H8']} /> }
 function ClipboardIcon()    { return <Icon d={['M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2','M15 2H9a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1z']} /> }
 function ReceiptIcon()      { return <Icon d='M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1zm3 5h10M7 10h10M7 15h6' /> }
+function TruckIcon()        { return <Icon d={['M1 3h15v13H1z','M16 8h4l3 3v5h-7z','M5.5 21a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z','M18.5 21a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z']} /> }
 function EditIcon()         { return <Icon d={['M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7','M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z']} /> }
 function CreditCardIcon()   { return <Icon d={['M1 4h22v16H1z','M1 10h22']} /> }
 function TrendingDownIcon() { return <Icon d='M23 18l-9.5-9.5-5 5L1 6 M17 18h6v-6' /> }

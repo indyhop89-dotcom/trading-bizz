@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, Fragment } from 'react'
-import { Routes, Route, useNavigate, useParams } from 'react-router-dom'
+import { Route, useNavigate, useParams } from 'react-router-dom'
 import { supabase } from '../../supabaseClient'
+import KeepListMounted from '../../components/KeepListMounted' // CHANGED: list stays mounted under an open record
 import {
   C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, FormRow, Input, Select, Textarea, StatCard, MultiSelectDropdown,
@@ -301,7 +302,7 @@ function OrderSummaryTable({ legs, piMap, poMap, invMap, invAggMap, docMap, cost
   )
 }
 
-function OrdersList() {
+function OrdersList({ refreshKey }) {
   const navigate = useNavigate()
   const { profile } = useAuth()
   // CHANGED: bulk delete — restricted to 'master' role, same convention as PI/PO/Invoices
@@ -327,8 +328,8 @@ function OrdersList() {
   // document activity — replaces the old expand-row UI.
   const [progressMap, setProgressMap] = useState({})
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (silent) => {
+    if (silent !== true) setLoading(true)
     const [{ data: os }, { data: es }, { data: legRows }] = await Promise.all([
       supabase.from('orders').select('*, origin:origin_entity_id(name,short_name), destination:destination_entity_id(name,short_name), financial_years(name)').eq('is_deleted',false).order('created_at',{ascending:false}),
       supabase.from('entities').select('id,name,short_name,state_code').eq('is_active',true).eq('is_deleted',false).order('name'),
@@ -373,6 +374,10 @@ function OrdersList() {
   }, [])
 
   useEffect(() => { load() }, [load])
+  // CHANGED: the list stays mounted while a record is open (KeepListMounted);
+  // on coming back it re-fetches quietly so saved changes show, without
+  // touching filters, search or scroll.
+  useEffect(() => { if (refreshKey) load(true) }, [refreshKey]) // eslint-disable-line react-hooks/exhaustive-deps
   function setF(k,v) { setForm(f=>({...f,[k]:v})) }
 
   async function handleSave() {
@@ -457,11 +462,12 @@ function OrdersList() {
                   <input type='checkbox' checked={filtered.length>0 && selected.size===filtered.length}
                     onChange={toggleSelectAll} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
                 </th>}
-                {['Order','Type','From','To','FY','Status','Progress','Date'].map((h,i)=>(
+                {/* CHANGED: Description is its own column (was a sub-line under the order name) */}
+                {['Order','Description','Type','From','To','FY','Status','Progress','Date'].map((h,i)=>(
                 <th key={i} style={{padding:'8px 12px',textAlign:'left',fontSize:'11px',fontWeight:700,color:C.textSoft,textTransform:'uppercase',letterSpacing:'0.05em',background:C.bg,borderBottom:`1px solid ${C.border}`,borderTop:`1px solid ${C.border}`,whiteSpace:'nowrap'}}>{h}</th>
               ))}</tr></thead>
               <tbody>
-                {filtered.length===0&&<tr><td colSpan={canDelete?9:8} style={{padding:'48px',textAlign:'center',color:C.textMuted}}>No orders found.</td></tr>}
+                {filtered.length===0&&<tr><td colSpan={canDelete?10:9} style={{padding:'48px',textAlign:'center',color:C.textMuted}}>No orders found.</td></tr>}
                 {/* CHANGED: the whole row opens the order (no more ▼/"Open →" buttons at the end) */}
                 {filtered.map((o,ri)=>{
                   const pr = progressMap[o.id]
@@ -470,7 +476,8 @@ function OrdersList() {
                       {canDelete && <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}} onClick={e=>e.stopPropagation()}>
                         <input type='checkbox' checked={selected.has(o.id)} onChange={()=>toggleSelect(o.id)} style={{width:'14px',height:'14px',cursor:'pointer'}}/>
                       </td>}
-                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.description&&<div style={{fontSize:'12px',color:C.textSoft}}>{o.description}</div>}{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><div style={{fontWeight:600}}>{o.name}</div>{o.order_no&&<div style={{fontSize:'11px',color:C.textMuted,fontFamily:'monospace'}}>{o.order_no}</div>}</td>
+                      <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px',color:o.description?C.text:C.textMuted,maxWidth:'260px'}}>{o.description||'—'}</td>
                       <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`}}><Badge status={o.movement_type}/></td>
                       <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.origin)}</td>
                       <td style={{padding:'9px 12px',borderBottom:`1px solid ${C.border}`,fontSize:'12px'}}>{en(o.destination)}</td>
@@ -1036,9 +1043,8 @@ function OrderDetail() {
 
 export default function Orders() {
   return (
-    <Routes>
-      <Route index      element={<OrdersList/>}/>
+    <KeepListMounted List={OrdersList}>
       <Route path=':id' element={<OrderDetail/>}/>
-    </Routes>
+    </KeepListMounted>
   )
 }

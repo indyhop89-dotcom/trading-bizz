@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../../supabaseClient'
 import {
-  C, Btn, Badge, Modal, ConfirmModal, Toast, EmptyState,
+  C, Btn, MultiSelectDropdown, Badge, Modal, ConfirmModal, Toast, EmptyState,
   PageHeader, Card, Table, FormRow, Input, Select, Textarea, SectionDivider, StatCard,
 } from '../../components/UI/index'
 import { formatINR, toNum, roundRupees, round2 } from '../../utils/money'
@@ -13,6 +13,9 @@ import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { suggestNextNo } from '../../utils/numbering' // CHANGED: replaces the unconfirmed next_exp_no RPC
 import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
 import { excludeAutoPurchaseMirrors } from '../../utils/query'
+// CHANGED: freight expenses can be tagged to transporter challans — see utils/challans.js.
+import ChallanPicker from '../../components/ChallanPicker'
+import { isFreightCategory, fetchChallanBoard, groupChallans, linksForChallans, fetchExpenseChallanLinks } from '../../utils/challans'
 
 const GST_RATES = [0, 5, 12, 18, 28]
 
@@ -92,14 +95,29 @@ export default function Expenses() {
   const [loading, setLoading]   = useState(true)
   const [tab, setTab]           = useState('Expenses') // CHANGED: Expenses / Party Payments / Summary
   const [search, setSearch]     = useState('')
-  const [typeFilter, setType]   = useState('all')
+  const [typeFilter, setType]   = useState([]) // CHANGED: multi-select — empty means all types
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]         = useState(EMPTY)
   const [saving, setSaving]     = useState(false)
   const [toast, setToast]       = useState(null)
+  // CHANGED: challans tagged on a freight expense. challanGroups = one entry
+  // per challan (with its invoices + orders), selChallans = picked challan
+  // keys for the expense being created, challanLinks = which expenses each
+  // challan is already on / which challans each expense carries.
+  const [challanGroups, setChallanGroups]   = useState([])
+  const [challanLoading, setChallanLoading] = useState(false)
+  const [challanError, setChallanError]     = useState('')
+  const [selChallans, setSelChallans]       = useState([])
+  const [challanLinks, setChallanLinks]     = useState({ byKey: {}, byExpense: {}, rowsByExpense: {} })
+  // CHANGED: expenses can now be edited. editingExpense = the row being edited
+  // (null = creating a new one). The same form and modal serve both.
+  const [editingExpense, setEditingExpense] = useState(null)
+  const showChallans = isFreightCategory(form.expense_type)
 
   const load = useCallback(async () => {
     setLoading(true)
+    // Decorative only — never blocks the expense list (returns empty maps on error).
+    fetchExpenseChallanLinks().then(l => setChallanLinks({ byKey: l.byKey, byExpense: l.byExpense, rowsByExpense: l.rowsByExpense }))
     const [{ data: exps }, { data: es }, { data: os }, { data: cats }, { data: pts }] = await Promise.all([
       supabase.from('expenses')
         .select('*, entity:entity_id(name,short_name), vendor:vendor_entity_id(name,short_name), orders(name)')
@@ -136,6 +154,80 @@ export default function Expenses() {
       .then(({ data }) => { if (!cancelled) { setOrderInvoices(data || []); setLoadingInvoices(false) } })
     return () => { cancelled = true }
   }, [form.order_id])
+
+  // CHANGED: challans already tagged on the expense being edited. Kept even
+  // if a challan has since been removed from its invoice, so an edit never
+  // drops a link silently.
+  const editChallanRows = editingExpense ? (challanLinks.rowsByExpense[editingExpense.id] || []) : []
+  // What the picker lists: every challan on an invoice, plus any tagged on
+  // this expense that no longer sits on an invoice.
+  const pickerGroups = [
+    ...challanGroups,
+    ...editChallanRows.filter(r => !challanGroups.some(g => g.key === r.key))
+      .map(r => ({ ...r, vehicles: [], invoices: [], orders: [] })),
+  ]
+
+  // "Already on another expense" warnings — leave out the expense being edited itself.
+  const ownNo = editingExpense ? (editingExpense.expense_no || 'expense') : null
+  const linkedElsewhere = !editingExpense ? challanLinks.byKey : Object.fromEntries(
+    Object.entries(challanLinks.byKey).map(([k, nos]) => [k, nos.filter(n => n !== ownNo)]).filter(([, nos]) => nos.length))
+
+  function openNew() {
+    setEditingExpense(null)
+    setSelChallans([])
+    setForm({ ...EMPTY, entity_id: defaultEntityId })
+    setModalOpen(true)
+  }
+  // CHANGED: load an existing expense into the form. `category` is the column
+  // the save writes; expense_type is read as a fallback for older rows.
+  function openEdit(e) {
+    setEditingExpense(e)
+    setSelChallans((challanLinks.rowsByExpense[e.id] || []).map(r => r.key))
+    setForm({
+      ...EMPTY,
+      expense_date: e.expense_date || today(), entity_id: e.entity_id || '',
+      expense_type: e.category || e.expense_type || '',
+      description: e.description || '', amount: e.amount ?? '',
+      gst_rate: e.gst_rate ?? 0, is_rcm: !!e.is_rcm, rcm_gst_rate: e.rcm_gst_rate ?? '',
+      vendor_entity_id: e.vendor_entity_id || '', vendor_name: e.vendor_name || '', vendor_gstin: e.vendor_gstin || '',
+      party_id: e.party_id || '', due_date: e.due_date || '',
+      order_id: e.order_id || '', invoice_id: e.invoice_id || '',
+      status: e.status || 'unpaid', notes: e.notes || '',
+    })
+    setModalOpen(true)
+  }
+  // CHANGED: load the challan list when a freight-type expense is being
+  // entered (fresh each time the form opens).
+  useEffect(() => {
+    if (!modalOpen || !showChallans) return
+    let cancelled = false
+    setChallanLoading(true)
+    fetchChallanBoard().then(({ data, error }) => {
+      if (cancelled) return
+      setChallanError(error ? error.message : '')
+      setChallanGroups(error ? [] : groupChallans(data))
+      setChallanLoading(false)
+    })
+    return () => { cancelled = true }
+  }, [modalOpen, showChallans])
+
+  // CHANGED: picking challans links the expense to the invoices and orders
+  // behind them. The single Order / Invoice fields are filled only when the
+  // picked challans all point at ONE order (and one invoice); if they span
+  // several, those fields are cleared and the full list is shown instead.
+  // The amount is never split.
+  function changeChallans(keys) {
+    setSelChallans(keys)
+    if (keys.length === 0) return
+    const { invoices: invs, orders: ords } = linksForChallans(pickerGroups, keys)
+    const oneOrder = ords.length === 1 && invs.every(i => i.order_id === ords[0].id)
+    setForm(f => ({
+      ...f,
+      order_id:   oneOrder ? ords[0].id : '',
+      invoice_id: oneOrder && invs.length === 1 ? invs[0].id : '',
+    }))
+  }
+  const challanLinked = showChallans ? linksForChallans(pickerGroups, selChallans) : { invoices: [], orders: [] }
 
   function setF(k, v) { setForm(f => ({ ...f, [k]: v })) }
   // CHANGED: switching orders invalidates any invoice tagged from the previous
@@ -246,8 +338,11 @@ export default function Expenses() {
     if (!isValidGSTIN(form.vendor_gstin)) return setToast({ message: GSTIN_ERROR, type: 'error' })
     if (form.is_rcm && !Number(form.rcm_gst_rate)) return setToast({ message: 'RCM GST rate is required', type: 'error' })
     setSaving(true)
-    const fy = await resolveFY()
-    if (!fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
+    // CHANGED: an edit keeps the expense's own number and financial year —
+    // both are only worked out when a NEW expense is created.
+    const isEdit = !!editingExpense
+    const fy = isEdit ? null : await resolveFY()
+    if (!isEdit && !fy) { setSaving(false); return setToast({ message: 'No financial year found', type: 'error' }) }
     // CHANGED: next_exp_no was calling an RPC of unconfirmed reliability —
     // same shape as the next_pi_no/next_po_no/next_inv_no functions already
     // confirmed missing on the live DB. Switched to suggestNextNo(), the
@@ -255,13 +350,12 @@ export default function Expenses() {
     // expense numbering can't silently fail the same way. Stays fully
     // auto-generated — no manual override field, as requested.
     const entity = entities.find(e => e.id === form.entity_id)
-    const expNo = await suggestNextNo({ table: 'expenses', noCol: 'expense_no', entityShort: entity?.short_name || entity?.name, fyCode: fy.code })
+    const expNo = isEdit ? null : await suggestNextNo({ table: 'expenses', noCol: 'expense_no', entityShort: entity?.short_name || entity?.name, fyCode: fy.code })
     const gst_amount     = form.is_rcm ? 0 : roundRupees(round2(amount * Number(form.gst_rate) / 100))
     const total_amount   = amount + gst_amount   // vendor payable — RCM GST never added here
     const rcm_gst_amount = form.is_rcm ? roundRupees(round2(amount * Number(form.rcm_gst_rate) / 100)) : 0
     const payload = {
-      expense_no:      expNo,
-      financial_year_id: fy.id,
+      ...(isEdit ? {} : { expense_no: expNo, financial_year_id: fy.id }),
       expense_date:    form.expense_date,
       entity_id:       form.entity_id,
       category:        form.expense_type || form.category || 'other',
@@ -286,10 +380,34 @@ export default function Expenses() {
       status:          form.status,
       notes:           form.notes || null,
     }
-    const { error } = await supabase.from('expenses').insert(payload)
+    // CHANGED: .select('id') — the new expense's id is needed to tag its challans.
+    const { data: saved, error } = isEdit
+      ? await supabase.from('expenses').update(payload).eq('id', editingExpense.id).select('id').single()
+      : await supabase.from('expenses').insert(payload).select('id').single()
+    if (error) {
+      setSaving(false)
+      // An update the user has no rights to comes back as "no rows", not a refusal.
+      return setToast({ message: error.code === 'PGRST116' ? 'Not saved — you do not have edit access to this expense.' : error.message, type: 'error' })
+    }
+    // CHANGED: challan links. On an edit the expense's links are replaced with
+    // exactly what is ticked now (none if the type is no longer freight); the
+    // old ones are only removed when something actually changed.
+    let challanErr = null
+    const wanted = showChallans ? pickerGroups.filter(g => selChallans.includes(g.key)) : []
+    const had = isEdit ? editChallanRows.map(r => r.key) : []
+    const changed = wanted.length !== had.length || wanted.some(g => !had.includes(g.key))
+    if (changed) {
+      if (had.length) ({ error: challanErr } = await supabase.from('expense_challans').delete().eq('expense_id', saved.id))
+      if (!challanErr && wanted.length) {
+        ({ error: challanErr } = await supabase.from('expense_challans').insert(
+          wanted.map(g => ({ expense_id: saved.id, challan_no: g.challan_no, transporter_name: g.transporter_name || null }))))
+      }
+    }
     setSaving(false)
-    if (error) return setToast({ message: error.message, type: 'error' })
-    setToast({ message: 'Expense recorded', type: 'success' })
+    const done = isEdit ? 'Expense updated' : 'Expense recorded'
+    setToast(challanErr
+      ? { message: `${done}, but the challans were not saved: ${challanErr.message}`, type: 'error' }
+      : { message: done, type: 'success' })
     setModalOpen(false)
     load()
   }
@@ -299,7 +417,8 @@ export default function Expenses() {
 
   const filtered = expenses.filter(e => {
     const ms = !search || e.description.toLowerCase().includes(search.toLowerCase()) || e.entity?.name?.toLowerCase().includes(search.toLowerCase())
-    const mt = typeFilter === 'all' || e.expense_type === typeFilter // CHANGED: now included in return
+    // CHANGED: the save writes the type to `category`; expense_type is only a fallback for older rows
+    const mt = typeFilter.length === 0 || typeFilter.includes(e.category || e.expense_type)
     return ms && mt // CHANGED: removed dateFrom/dateTo (undeclared state; date filter not in UI)
   })
 
@@ -342,12 +461,17 @@ export default function Expenses() {
     { label: 'No',       render: e => <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{e.expense_no || '—'}</span> },
     { label: 'Date',     render: e => <span style={{ fontSize: '12px' }}>{fmtDate(e.expense_date)}</span> },
     { label: 'Entity',   render: e => <span style={{ fontSize: '12px' }}>{e.entity?.short_name || e.entity?.name}</span> },
-    { label: 'Type',     render: e => <Badge status={e.expense_type} label={e.expense_type} /> },
-    { label: 'Desc',     render: e => <span style={{ fontSize: '12px' }}>{e.description}</span> },
+    { label: 'Type',     render: e => <Badge status={e.category || e.expense_type} label={e.category || e.expense_type} /> },
+    // CHANGED: challans tagged on the expense show under the description
+    { label: 'Desc',     render: e => <span style={{ fontSize: '12px' }}>{e.description}
+        {challanLinks.byExpense[e.id]?.length > 0 && <span style={{ display: 'block', fontSize: '11px', color: C.textMuted }}>Challan: {challanLinks.byExpense[e.id].join(', ')}</span>}
+      </span> },
     { label: 'Vendor',   render: e => <span style={{ fontSize: '12px', color: C.textSoft }}>{e.vendor?.short_name || e.vendor?.name || e.vendor_name || '—'}{e.is_rcm && <span style={{ marginLeft: '6px' }}><Badge status='rcm' label='RCM' /></span>}</span> },
     { label: 'Total',    right: true, render: e => <span style={{ fontWeight: 600 }}>{formatINR(e.total_amount)}</span> },
     { label: 'Status',   render: e => <Badge status={e.status} /> },
     { label: 'Docs',     render: e => <DocumentAttachments sourceType='expenses' sourceId={e.id} entityId={e.entity_id} entityName={e.entity?.name || 'General'} compact /> }, // CHANGED: entityId added
+    // CHANGED: per-row edit — anyone who can see the expense; the database still decides who may save
+    { label: '', render: e => <Btn size='sm' variant='ghost' onClick={ev => { ev.stopPropagation(); openEdit(e) }}>Edit</Btn> },
     // CHANGED: per-row delete, master-only
     ...(canDelete ? [{
       label: '', render: e => <Btn size='sm' variant='ghost' onClick={ev => { ev.stopPropagation(); setConfirmDelete(e) }} style={{ color: C.danger }}>Delete</Btn>,
@@ -357,7 +481,7 @@ export default function Expenses() {
   return (
     <div>
       <PageHeader title='Expenses' subtitle='All costs associated with orders and entities'
-        action={tab === 'Expenses' ? <Btn onClick={() => { setForm({ ...EMPTY, entity_id: defaultEntityId }); setModalOpen(true) }}>+ New Expense</Btn> : undefined}
+        action={tab === 'Expenses' ? <Btn onClick={openNew}>+ New Expense</Btn> : undefined}
       />
 
       {/* CHANGED: tab shell — expense list, party settlements, and entity-wise summary */}
@@ -392,11 +516,7 @@ export default function Expenses() {
       <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search description, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
-        <select value={typeFilter} onChange={e => setType(e.target.value)}
-          style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', cursor: 'pointer', fontFamily: 'inherit' }}>
-          <option value='all'>All types</option>
-          {categories.map(t => <option key={t} value={t}>{t}</option>)}
-        </select>
+        <MultiSelectDropdown options={categories} selected={typeFilter} onChange={setType} placeholder='All types' capitalize={false} />
       </div>
 
       {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
@@ -414,12 +534,12 @@ export default function Expenses() {
         {loading
           ? <div style={{ padding: '48px', textAlign: 'center', color: C.textMuted }}>Loading…</div>
           : <Table columns={columns} rows={filtered}
-              emptyState={<EmptyState icon='📊' title='No expenses' action={<Btn onClick={() => setModalOpen(true)}>+ New Expense</Btn>} />} />
+              emptyState={<EmptyState icon='📊' title='No expenses' action={<Btn onClick={openNew}>+ New Expense</Btn>} />} />
         }
       </Card>
       </>)}
 
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title='New Expense' width={600}>
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingExpense ? `Edit Expense${editingExpense.expense_no ? ` — ${editingExpense.expense_no}` : ''}` : 'New Expense'} width={600}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='Date' required>
@@ -450,6 +570,19 @@ export default function Expenses() {
               </Select>
             </FormRow>
           </div>
+          {/* CHANGED: freight-type expenses pick the transporter challan(s) they pay for */}
+          {showChallans && (
+            <FormRow label='Challans' hint='Optional — select every challan this freight bill covers. Invoices and orders are linked from them.'>
+              <ChallanPicker groups={pickerGroups} selected={selChallans} onChange={changeChallans}
+                linkedByKey={linkedElsewhere} loading={challanLoading} error={challanError} />
+              {selChallans.length > 0 && (
+                <div style={{ fontSize: '12px', color: C.textSoft, lineHeight: 1.5, marginTop: '2px' }}>
+                  <div><strong>Invoices:</strong> {challanLinked.invoices.map(i => i.invoice_no || '(no number)').join(', ') || '—'}</div>
+                  <div><strong>Orders:</strong> {challanLinked.orders.map(o => o.name).join(', ') || '—'}</div>
+                </div>
+              )}
+            </FormRow>
+          )}
           <FormRow label='Description' required>
             <Input value={form.description} onChange={e => setF('description', e.target.value)} placeholder='What is this expense for?' />
           </FormRow>
@@ -556,7 +689,7 @@ export default function Expenses() {
           <FormRow label='Notes'><Textarea value={form.notes} onChange={e => setF('notes', e.target.value)} rows={2} /></FormRow>
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', paddingTop: '8px', borderTop: `1px solid ${C.border}` }}>
             <Btn variant='ghost' onClick={() => setModalOpen(false)}>Cancel</Btn>
-            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Save Expense'}</Btn>
+            <Btn onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : editingExpense ? 'Save Changes' : 'Save Expense'}</Btn>
           </div>
         </div>
       </Modal>
