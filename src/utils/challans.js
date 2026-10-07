@@ -89,7 +89,7 @@ export async function deleteVehicleRow(id) {
 // the auto-created purchase mirrors (see utils/query.js), so nothing shows twice.
 export async function fetchChallanBoard() {
   const { data, error } = await fetchAllPages(() => supabase.from('invoices')
-    .select('id,invoice_no,invoice_date,status,eway_bill_no,eway_bill_date,order_id,seller_entity_id,buyer_entity_id,' +
+    .select('id,invoice_no,invoice_date,status,eway_bill_no,eway_bill_date,order_id,order_leg_id,seller_entity_id,buyer_entity_id,' +
       'seller:seller_entity_id(name,short_name),buyer:buyer_entity_id(name,short_name),orders(name,description),' +
       'vehicles:invoice_vehicles(id,invoice_id,vehicle_no,challan_no,transporter_name,created_at)')
     .eq('invoice_type', 'sales').eq('is_deleted', false).neq('status', 'cancelled')

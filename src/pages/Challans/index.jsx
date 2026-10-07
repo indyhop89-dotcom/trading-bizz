@@ -8,7 +8,8 @@
 // utils/challans.js and 057_invoice_vehicles_and_expense_challans.sql.
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Link } from 'react-router-dom'
-import { C, Btn, Card, PageHeader, StatCard, Toast, ConfirmModal, EmptyState } from '../../components/UI/index'
+import { C, Btn, Card, PageHeader, StatCard, Toast, ConfirmModal, EmptyState, MultiSelectDropdown } from '../../components/UI/index'
+import { supabase } from '../../supabaseClient'
 import { InlineCell, newVehicleRow } from '../../components/InvoiceVehicles'
 import { fmtDate } from '../../utils/dates'
 import {
@@ -25,6 +26,15 @@ export default function Challans() {
   const [loadError, setLoadError] = useState('')
   const [search, setSearch]     = useState('')
   const [missingOnly, setMissingOnly] = useState(false)
+  // CHANGED: From / To entity, Order and Leg filters (multi-select — an empty
+  // array means "all") plus an invoice-date range, same as the Invoices list.
+  const [fromFilter, setFromFilter]   = useState([])
+  const [toFilter, setToFilter]       = useState([])
+  const [orderFilter, setOrderFilter] = useState([])
+  const [legFilter, setLegFilter]     = useState([])
+  const [dateFrom, setDateFrom]       = useState('')
+  const [dateTo, setDateTo]           = useState('')
+  const [legs, setLegs]               = useState({})   // order_leg_id → leg_no
   const [toast, setToast]       = useState(null)
   const [confirmRemove, setConfirmRemove] = useState(null) // { invId, key, label }
   // Saves run one at a time against the latest data, so tabbing quickly across
@@ -47,6 +57,16 @@ export default function Challans() {
     })))
     setExpLinks(links.byKey)
     setLoading(false)
+    // Leg numbers for the Leg filter and the label under each invoice. Loaded
+    // separately and after the page shows, so a problem here can never stop
+    // the challan list itself from loading.
+    const legIds = [...new Set(data.map(i => i.order_leg_id).filter(Boolean))]
+    const map = {}
+    for (let i = 0; i < legIds.length; i += 200) {
+      const { data: rows } = await supabase.from('order_legs').select('id,leg_no').in('id', legIds.slice(i, i + 200))
+      for (const r of rows || []) map[r.id] = r.leg_no
+    }
+    setLegs(map)
   }, [])
   useEffect(() => { load() }, [load])
 
@@ -101,9 +121,26 @@ export default function Challans() {
   const allRows = useMemo(() => invoices.flatMap(inv =>
     inv.vehicles.map((v, i) => ({ inv, v, first: i === 0 }))), [invoices])
 
+  // Filter options come from what is actually on the page, so no option ever leads to an empty list.
+  const uniq = (pairs) => { const m = new Map(); for (const [value, label] of pairs) if (value && !m.has(value)) m.set(value, label); return [...m].map(([value, label]) => ({ value, label })).sort((a, b) => String(a.label).localeCompare(String(b.label), undefined, { numeric: true })) }
+  const legLabel = inv => `${inv.orders?.name || 'No order'} · Leg ${legs[inv.order_leg_id] ?? '?'}`
+  const fromOptions  = uniq(invoices.map(i => [i.seller_entity_id, entName(i.seller)]))
+  const toOptions    = uniq(invoices.map(i => [i.buyer_entity_id, entName(i.buyer)]))
+  const orderOptions = uniq(invoices.map(i => [i.order_id, i.orders?.description ? `${i.orders.name} · ${i.orders.description}` : i.orders?.name]))
+  // Picking orders narrows the Leg list to those orders' legs.
+  const legOptions   = uniq(invoices.filter(i => i.order_leg_id && (orderFilter.length === 0 || orderFilter.includes(i.order_id))).map(i => [i.order_leg_id, legLabel(i)]))
+  const anyFilter = fromFilter.length || toFilter.length || orderFilter.length || legFilter.length || dateFrom || dateTo
+  function clearFilters() { setFromFilter([]); setToFilter([]); setOrderFilter([]); setLegFilter([]); setDateFrom(''); setDateTo('') }
+
   const q = search.trim().toLowerCase()
   const rows = allRows.filter(({ inv, v }) => {
     if (missingOnly && clean(v.challan_no)) return false
+    if (fromFilter.length  && !fromFilter.includes(inv.seller_entity_id)) return false
+    if (toFilter.length    && !toFilter.includes(inv.buyer_entity_id)) return false
+    if (orderFilter.length && !orderFilter.includes(inv.order_id)) return false
+    if (legFilter.length   && !legFilter.includes(inv.order_leg_id)) return false
+    if (dateFrom && (inv.invoice_date || '') < dateFrom) return false
+    if (dateTo   && (inv.invoice_date || '') > dateTo) return false
     if (!q) return true
     return [inv.invoice_no, inv.eway_bill_no, inv.seller?.name, inv.seller?.short_name, inv.buyer?.name, inv.buyer?.short_name,
       inv.orders?.name, v.vehicle_no, v.challan_no, v.transporter_name]
@@ -134,6 +171,15 @@ export default function Challans() {
       <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search invoice, E-way Bill, entity, vehicle, challan…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '220px', fontFamily: 'inherit' }} />
+        <MultiSelectDropdown options={fromOptions} selected={fromFilter} onChange={setFromFilter} placeholder='All From Entities' capitalize={false} title='From (seller)' />
+        <MultiSelectDropdown options={toOptions} selected={toFilter} onChange={setToFilter} placeholder='All To Entities' capitalize={false} title='To (buyer)' />
+        <MultiSelectDropdown options={orderOptions} selected={orderFilter} onChange={setOrderFilter} placeholder='All orders' capitalize={false} />
+        <MultiSelectDropdown options={legOptions} selected={legFilter} onChange={setLegFilter} placeholder='All legs' capitalize={false} />
+        <input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} title='Invoice date from'
+          style={{ padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+        <input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} title='Invoice date to'
+          style={{ padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+        {!!anyFilter && <Btn size='sm' variant='ghost' onClick={clearFilters}>Clear filters</Btn>}
         <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
           <input type='checkbox' checked={missingOnly} onChange={e => setMissingOnly(e.target.checked)} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />
           Challan missing only
@@ -147,7 +193,7 @@ export default function Challans() {
           <div style={{ padding: '32px', textAlign: 'center', color: C.danger, fontSize: '13px' }}>Could not load challans: {loadError}</div>
         ) : rows.length === 0 ? (
           <EmptyState icon='🚛' title={allRows.length ? 'Nothing matches' : 'No dispatched invoices yet'}
-            message={allRows.length ? 'Clear the search or the "Challan missing only" filter.' : 'Invoices appear here once their E-way Bill is entered.'} />
+            message={allRows.length ? 'Clear the search or the filters above.' : 'Invoices appear here once their E-way Bill is entered.'} />
         ) : (
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -174,7 +220,7 @@ export default function Challans() {
                     <tr key={v._key} style={{ background: C.surfaceRaised }}>
                       <td style={{ ...td, whiteSpace: 'nowrap', opacity: first ? 1 : 0.55 }}>
                         <Link to={`/invoices/${inv.id}`} style={{ color: C.accent, fontWeight: 600, textDecoration: 'none' }}>{inv.invoice_no || '(no number)'}</Link>
-                        {inv.orders?.name && <div style={{ fontSize: '11px', color: C.textMuted }}>{inv.orders.name}</div>}
+                        {inv.orders?.name && <div style={{ fontSize: '11px', color: C.textMuted }}>{inv.orders.name}{legs[inv.order_leg_id] != null ? ` · Leg ${legs[inv.order_leg_id]}` : ''}</div>}
                       </td>
                       <td style={{ ...td, whiteSpace: 'nowrap', fontSize: '12px', opacity: first ? 1 : 0.55 }}>{fmtDate(inv.invoice_date)}</td>
                       <td style={{ ...td, fontSize: '12px', opacity: first ? 1 : 0.55 }}>{entName(inv.seller)}</td>
