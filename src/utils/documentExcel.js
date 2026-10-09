@@ -102,7 +102,8 @@ function buildVananamExcelXML(doc, theme) {
 export function buildDocumentExcelXML(doc) {
   const theme = resolveThemeOrThrow(doc.sellerEntity)
   if (theme.family === 'srpl') return buildSRPLDocumentExcelXML(doc)
-  if (theme.family === 'tally') return buildKirtiDocumentExcelXML(doc)
+  // CHANGED: the SAP style has no Excel layout of its own — it uses the plain black-on-white Tally one
+  if (theme.family === 'tally' || theme.family === 'sap' || theme.family === 'sap_material') return buildKirtiDocumentExcelXML(doc)
   if (theme.family === 'kamakhya') return buildKamakhyaDocumentExcelXML(doc, theme)
   return buildVananamExcelXML(doc, theme)
 }

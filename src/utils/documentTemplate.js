@@ -44,10 +44,11 @@ import { resolveThemeForEntity } from './entityDocumentThemes'
 import { buildSRPLDocumentHTML, getSRPLDocumentStyles } from './srplDocumentTemplate'
 import { buildKirtiDocumentHTML, getKirtiDocumentStyles } from './kirtiDocumentTemplate'
 import { buildKamakhyaDocumentHTML, getKamakhyaDocumentStyles } from './kamakhyaDocumentTemplate'
+import { buildSAPDocumentHTML, getSAPDocumentStyles } from './sapDocumentTemplate' // CHANGED: SAP style format
 
 // Columns needed from `entities` to render a document header/address block —
 // shared by every page that builds a doc for printDocument/downloadDocumentExcel.
-export const ENTITY_DOC_COLUMNS = 'name,short_name,gstin,pan,city,address,pincode,state_name,bank_name,bank_account_no,bank_ifsc,bank_branch,logo_url,logo_file_id,terms_and_conditions,document_format' // CHANGED: document_format — the print format chosen in Entity Settings
+export const ENTITY_DOC_COLUMNS = 'name,short_name,gstin,pan,city,address,pincode,state_name,bank_name,bank_account_no,bank_ifsc,bank_branch,logo_url,logo_file_id,terms_and_conditions,document_format,email,phone' // CHANGED: document_format — the print format chosen in Entity Settings
 
 export const DOC_META = {
   PI: { title: 'Proforma Invoice', short: 'PI', dateLabel: 'Valid Until' },
@@ -424,6 +425,8 @@ export function buildDocumentHTML(doc) {
   if (theme.family === 'srpl') return buildSRPLDocumentHTML(doc)
   if (theme.family === 'tally') return buildKirtiDocumentHTML(doc)
   if (theme.family === 'kamakhya') return buildKamakhyaDocumentHTML(doc)
+  if (theme.family === 'sap') return buildSAPDocumentHTML(doc)
+  if (theme.family === 'sap_material') return buildSAPDocumentHTML(doc, { material: true })
   return buildVananamHTML(doc, theme)
 }
 
@@ -431,6 +434,7 @@ export function getDocumentStyles(theme) {
   if (theme.family === 'srpl') return getSRPLDocumentStyles(theme)
   if (theme.family === 'tally') return getKirtiDocumentStyles(theme)
   if (theme.family === 'kamakhya') return getKamakhyaDocumentStyles(theme)
+  if (theme.family === 'sap' || theme.family === 'sap_material') return getSAPDocumentStyles()
   return getVananamStyles(theme)
 }
 

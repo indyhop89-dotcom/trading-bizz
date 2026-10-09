@@ -104,6 +104,9 @@ export const DOCUMENT_FORMATS = [
   { value: 'vananam',  label: 'VRVPL style',                      builtFor: 'Vananam Retail Ventures (VRVPL)' },
   { value: 'srpl',     label: 'SRPL style',                       builtFor: 'Siddhidhatri Retail (SRPL)' },
   { value: 'kamakhya', label: 'Kamakhya style',                   builtFor: 'Kamakhya Loyalties' },
+  // CHANGED: SAP style — replicated from the shared SAP-style generator tools (see sapDocumentTemplate.js)
+  { value: 'sap',          label: 'SAP style',                      builtFor: 'Any entity (shared format)' },
+  { value: 'sap_material', label: 'SAP style with Material column', builtFor: 'Any entity (shared format)' },
 ]
 export const DEFAULT_DOCUMENT_FORMAT = 'tally'
 
@@ -120,7 +123,8 @@ export function resolveThemeForEntity(entity) {
   const chosen = (entity?.document_format || '').trim().toLowerCase()
   const family = DOCUMENT_FORMATS.some(f => f.value === chosen) ? chosen : (own?.family || DEFAULT_DOCUMENT_FORMAT)
   if (own && own.family === family) return own
-  const base = Object.values(ENTITY_THEMES).find(t => t.family === family)
+  // A shared format with no entity of its own (e.g. SAP style) has no base theme — it is plain black-on-white.
+  const base = Object.values(ENTITY_THEMES).find(t => t.family === family) || { navy: '#000000', orange: '#000000' }
   return { ...base, family, label: entity?.short_name || entity?.name || 'Entity' }
 }
 
