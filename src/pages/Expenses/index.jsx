@@ -38,11 +38,16 @@ function suggestTds(category) {
   return CATEGORY_TDS[(category || '').trim().toLowerCase()] || null
 }
 
+// CHANGED: the vendor's invoice number is the main identifier for an expense;
+// the system number (expense_no) is the fallback when no vendor invoice is entered.
+const expenseLabel = e => e?.vendor_invoice_no || e?.expense_no || ''
+
 const EMPTY = {
   expense_date: today(), entity_id: '', expense_type: '',
   description: '', amount: '', gst_rate: 0,
   is_rcm: false, rcm_gst_rate: '',
   vendor_entity_id: '', vendor_name: '', vendor_gstin: '',
+  vendor_invoice_no: '', vendor_invoice_date: '', // CHANGED: the vendor's own bill number + date
   party_id: '', due_date: '',
   order_id: '', order_leg_id: '', invoice_id: '', status: 'unpaid', notes: '',
 }
@@ -169,7 +174,7 @@ export default function Expenses() {
   ]
 
   // "Already on another expense" warnings — leave out the expense being edited itself.
-  const ownNo = editingExpense ? (editingExpense.expense_no || 'expense') : null
+  const ownNo = editingExpense ? (expenseLabel(editingExpense) || 'expense') : null
   const linkedElsewhere = !editingExpense ? challanLinks.byKey : Object.fromEntries(
     Object.entries(challanLinks.byKey).map(([k, nos]) => [k, nos.filter(n => n !== ownNo)]).filter(([, nos]) => nos.length))
 
@@ -191,6 +196,7 @@ export default function Expenses() {
       description: e.description || '', amount: e.amount ?? '',
       gst_rate: e.gst_rate ?? 0, is_rcm: !!e.is_rcm, rcm_gst_rate: e.rcm_gst_rate ?? '',
       vendor_entity_id: e.vendor_entity_id || '', vendor_name: e.vendor_name || '', vendor_gstin: e.vendor_gstin || '',
+      vendor_invoice_no: e.vendor_invoice_no || '', vendor_invoice_date: e.vendor_invoice_date || '',
       party_id: e.party_id || '', due_date: e.due_date || '',
       order_id: e.order_id || '', invoice_id: e.invoice_id || '',
       status: e.status || 'unpaid', notes: e.notes || '',
@@ -374,6 +380,8 @@ export default function Expenses() {
       vendor_entity_id: form.vendor_entity_id || null,
       vendor_name:     form.vendor_name || null,
       vendor_gstin:    form.vendor_gstin || null,
+      vendor_invoice_no:   form.vendor_invoice_no.trim() || null, // CHANGED: vendor's own bill number — the main identifier
+      vendor_invoice_date: form.vendor_invoice_date || null,
       order_id:        form.order_id || null,
       invoice_id:      form.invoice_id || null, // CHANGED: optional invoice tag under the linked order
       party_id:        form.party_id || null,   // CHANGED: tagged party from the global master
@@ -420,7 +428,10 @@ export default function Expenses() {
   const totalPaid   = expenses.filter(e => e.status === 'paid').reduce((s, e) => s + e.total_amount, 0)
 
   const filtered = expenses.filter(e => {
-    const ms = !search || e.description.toLowerCase().includes(search.toLowerCase()) || e.entity?.name?.toLowerCase().includes(search.toLowerCase())
+    // CHANGED: search also matches the vendor invoice number and the system number
+    const q = search.toLowerCase()
+    const ms = !search || e.description.toLowerCase().includes(q) || e.entity?.name?.toLowerCase().includes(q)
+      || (e.vendor_invoice_no || '').toLowerCase().includes(q) || (e.expense_no || '').toLowerCase().includes(q)
     // CHANGED: the type lives in expense_type on the live table
     const mt = typeFilter.length === 0 || typeFilter.includes(e.expense_type || e.category)
     return ms && mt // CHANGED: removed dateFrom/dateTo (undeclared state; date filter not in UI)
@@ -462,7 +473,12 @@ export default function Expenses() {
         onChange={() => toggleSelect(e.id)} onClick={ev => ev.stopPropagation()} style={{ width: '14px', height: '14px', cursor: 'pointer' }} />,
     }] : []),
     { label: 'S.No.',    render: (row, idx) => <span style={{ color: C.textMuted }}>{idx + 1}</span> },
-    { label: 'No',       render: e => <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{e.expense_no || '—'}</span> },
+    // CHANGED: vendor invoice number leads as the main identifier; the system number sits under it as the secondary reference
+    { label: 'Vendor Inv No', render: e => <span style={{ fontSize: '12px' }}>
+        <span style={{ fontWeight: 600 }}>{e.vendor_invoice_no || '—'}</span>
+        {e.vendor_invoice_date && <span style={{ color: C.textMuted }}> · {fmtDate(e.vendor_invoice_date)}</span>}
+        <span style={{ display: 'block', fontFamily: 'monospace', fontSize: '10px', color: C.textMuted }}>{e.expense_no || ''}</span>
+      </span> },
     { label: 'Date',     render: e => <span style={{ fontSize: '12px' }}>{fmtDate(e.expense_date)}</span> },
     { label: 'Entity',   render: e => <span style={{ fontSize: '12px' }}>{e.entity?.short_name || e.entity?.name}</span> },
     { label: 'Type',     render: e => <Badge status={e.expense_type || e.category} label={e.expense_type || e.category} /> },
@@ -544,7 +560,7 @@ export default function Expenses() {
       </Card>
       </>)}
 
-      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingExpense ? `Edit Expense${editingExpense.expense_no ? ` — ${editingExpense.expense_no}` : ''}` : 'New Expense'} width={600}>
+      <Modal open={modalOpen} onClose={() => setModalOpen(false)} title={editingExpense ? `Edit Expense${expenseLabel(editingExpense) ? ` — ${expenseLabel(editingExpense)}` : ''}` : 'New Expense'} width={600}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='Date' required>
@@ -652,6 +668,15 @@ export default function Expenses() {
                 return diff >= 0 ? `${diff} day${diff === 1 ? '' : 's'} left` : `${-diff} day${diff === -1 ? '' : 's'} overdue`
               })() : undefined}>
               <Input type='date' value={form.due_date} onChange={e => setF('due_date', e.target.value)} />
+            </FormRow>
+          </div>
+          {/* CHANGED: the vendor's own bill number + date — the main identifier for the expense */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+            <FormRow label='Vendor Invoice No' hint={editingExpense?.expense_no ? `Main reference — system no ${editingExpense.expense_no}` : 'Main reference — the number on the vendor\'s bill'}>
+              <Input value={form.vendor_invoice_no} onChange={e => setF('vendor_invoice_no', e.target.value)} />
+            </FormRow>
+            <FormRow label='Vendor Invoice Date'>
+              <Input type='date' value={form.vendor_invoice_date} onChange={e => setF('vendor_invoice_date', e.target.value)} />
             </FormRow>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -949,7 +974,7 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
               <Select value={form.expense_id} onChange={e => selectExpense(e.target.value)} disabled={linkableExpenses.length === 0}>
                 <option value=''>General / on account</option>
                 {linkableExpenses.map(ex => (
-                  <option key={ex.id} value={ex.id}>{ex.expense_no || ex.description} · {formatINR(ex.total_amount)}</option>
+                  <option key={ex.id} value={ex.id}>{expenseLabel(ex) || ex.description} · {formatINR(ex.total_amount)}</option>
                 ))}
               </Select>
             </FormRow>

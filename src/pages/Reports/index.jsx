@@ -481,7 +481,7 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
       // CHANGED: expense-side TDS/TCS now lives on party_payments — recognized
       // at payment time, same as invoices, not when the expense was booked.
       supabase.from('party_payments')
-        .select('id,payment_date,entity_id,tds_section,tds_amount,tcs_section,tcs_amount,expense:expense_id(expense_no)')
+        .select('id,payment_date,entity_id,tds_section,tds_amount,tcs_section,tcs_amount,expense:expense_id(expense_no,vendor_invoice_no)')
         .eq('entity_id', entityId).eq('is_deleted', false),
     ])
 
@@ -519,7 +519,7 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
 
     for (const p of (exps || [])) {
       if (!inRange(p.payment_date)) continue
-      const doc = p.expense?.expense_no || '—' // general/on-account payments have no linked expense
+      const doc = p.expense?.vendor_invoice_no || p.expense?.expense_no || '—' // general/on-account payments have no linked expense
       if (toNum(p.tds_amount) > 0) {
         tdsDeducted += p.tds_amount
         rows.push({ source: 'Party Payment', doc, date: p.payment_date, section: p.tds_section, kind: 'TDS', direction: 'Liability', amount: p.tds_amount })
@@ -1655,7 +1655,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
     setLoading(true)
     const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
     let expQ = supabase.from('expenses')
-      .select('id,expense_no,expense_date,description,total_amount') // CHANGED: net_payable is not a column on the live expenses table
+      .select('id,expense_no,vendor_invoice_no,expense_date,description,total_amount') // CHANGED: net_payable is not a column on the live expenses table
       .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
     let payQ = supabase.from('party_payments')
       .select('id,payment_date,amount,tds_amount,reference,mode')
@@ -1665,7 +1665,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
     const [{ data: exps }, { data: pays }] = await Promise.all([expQ, payQ])
 
     const ledger = [
-      ...(exps || []).map(e => ({ date: e.expense_date, doc: e.expense_no, type: 'Expense', desc: e.description, bill: e.total_amount || 0, paid: 0 })),
+      ...(exps || []).map(e => ({ date: e.expense_date, doc: e.vendor_invoice_no || e.expense_no, type: 'Expense', desc: e.description, bill: e.total_amount || 0, paid: 0 })),
       // CHANGED: "paid" (what settles the bill) = cash actually paid + TDS withheld —
       // the TDS portion still settles the expense (paid to govt on the party's
       // behalf), same convention as computeInvoiceOutstanding in utils/payments.js.

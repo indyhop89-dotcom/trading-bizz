@@ -146,14 +146,15 @@ export function linksForChallans(groups, selectedKeys) {
 export async function fetchExpenseChallanLinks() {
   const byKey = {}, byExpense = {}, rowsByExpense = {}
   const { data, error } = await fetchAllPages(() => supabase.from('expense_challans')
-    .select('id,expense_id,challan_no,transporter_name,expense:expense_id(expense_no,is_deleted)')
+    .select('id,expense_id,challan_no,transporter_name,expense:expense_id(expense_no,vendor_invoice_no,is_deleted)')
     .order('created_at').order('id'))
   if (error) return { byKey, byExpense, rowsByExpense, error }
   for (const r of data) {
     if (!r.expense || r.expense.is_deleted) continue
     const key = challanKey(r.challan_no, r.transporter_name)
     if (!key) continue
-    const label = r.expense.expense_no || 'expense'
+    // CHANGED: the vendor invoice number is the main identifier; the system number is the fallback
+    const label = r.expense.vendor_invoice_no || r.expense.expense_no || 'expense'
     if (!byKey[key]) byKey[key] = []
     if (!byKey[key].includes(label)) byKey[key].push(label)
     if (!byExpense[r.expense_id]) byExpense[r.expense_id] = []
