@@ -9,6 +9,7 @@ import { GST_STATES } from '../../constants/states'
 import { downloadTemplate } from '../../utils/csvTemplate'
 import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl } from '../../utils/drive'
 import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
+import { DOCUMENT_FORMATS, automaticFormatLabel } from '../../utils/entityDocumentThemes' // CHANGED: invoice format picker
 
 const ENTITY_TYPES = ['group', 'associate', 'external']
 
@@ -19,6 +20,7 @@ const EMPTY_FORM = {
   bank_name: '', bank_account_no: '', bank_ifsc: '', bank_branch: '',
   logo_url: '', logo_file_id: '',
   terms_and_conditions: '',
+  document_format: '', // CHANGED: print format for PI / PO / Tax Invoice — blank = automatic
   reliance_vendor_id: '', reliance_sales_id: '',
   reliance_onboarded: false, reliance_notes: '',
   is_active: true,
@@ -89,6 +91,7 @@ export default function Entities() {
       logo_url:           entity.logo_url || '',
       logo_file_id:       entity.logo_file_id || '',
       terms_and_conditions: entity.terms_and_conditions || '',
+      document_format: entity.document_format || '',
       reliance_vendor_id: entity.reliance_vendor_id || '',
       reliance_sales_id:  entity.reliance_sales_id || '',
       reliance_onboarded: entity.reliance_onboarded || false,
@@ -147,6 +150,7 @@ export default function Entities() {
     setSaving(true)
     const payload = { ...form }
     if (!payload.group_id) delete payload.group_id
+    payload.document_format = payload.document_format || null // CHANGED: blank = automatic
 
     let error
     if (editing) {
@@ -390,6 +394,13 @@ export default function Entities() {
           </div>
 
           <SectionDivider label='Documents' />
+          {/* CHANGED: print format for this entity's PI / PO / Tax Invoice */}
+          <FormRow label='Invoice Format' hint='The layout used when this entity prints or downloads a Proforma Invoice, Purchase Order or Tax Invoice. Its own name, address, GSTIN, bank details and logo are filled in automatically.'>
+            <Select value={form.document_format} onChange={e => setF('document_format', e.target.value)}>
+              <option value=''>Automatic — {automaticFormatLabel(form.gstin)}</option>
+              {DOCUMENT_FORMATS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+            </Select>
+          </FormRow>
           <FormRow label='Terms & Conditions' hint='Printed on every PI/PO/Tax Invoice this entity issues — leave blank to omit it from the document'>
             <Textarea value={form.terms_and_conditions} onChange={e => setF('terms_and_conditions', e.target.value)} rows={3} />
           </FormRow>

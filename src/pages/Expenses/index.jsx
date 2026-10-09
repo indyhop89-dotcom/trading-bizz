@@ -7,7 +7,6 @@ import {
 } from '../../components/UI/index'
 import { formatINR, toNum, roundRupees, round2 } from '../../utils/money'
 import { fmtDate, today, currentFYLabel } from '../../utils/dates'
-import DocumentAttachments from '../../components/DocumentAttachments'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
 import { hasFullAccess } from '../../utils/roles'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
@@ -16,6 +15,7 @@ import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/va
 import { excludeAutoPurchaseMirrors } from '../../utils/query'
 // CHANGED: freight expenses can be tagged to transporter challans — see utils/challans.js.
 import ChallanPicker from '../../components/ChallanPicker'
+import InvoiceChallansModal from '../../components/InvoiceChallansModal' // CHANGED: click an invoice number → its challans → challan details
 import { isFreightCategory, fetchChallanBoard, groupChallans, linksForChallans, fetchExpenseChallanLinks } from '../../utils/challans'
 
 const GST_RATES = [0, 5, 12, 18, 28]
@@ -123,12 +123,20 @@ export default function Expenses() {
   // CHANGED: expenses can now be edited. editingExpense = the row being edited
   // (null = creating a new one). The same form and modal serve both.
   const [editingExpense, setEditingExpense] = useState(null)
+  // CHANGED: invoice numbers on the list are clickable. directInvoices = numbers
+  // for expenses tagged straight to an invoice, viewInvoiceId = the one opened.
+  const [directInvoices, setDirectInvoices] = useState({})
+  const [viewInvoiceId, setViewInvoiceId]   = useState(null)
+  const [moreInvoices, setMoreInvoices]     = useState(new Set()) // rows showing their full invoice list
   const showChallans = isFreightCategory(form.expense_type)
 
   const load = useCallback(async () => {
     setLoading(true)
     // Decorative only — never blocks the expense list (returns empty maps on error).
     fetchExpenseChallanLinks().then(l => setChallanLinks({ byKey: l.byKey, byExpense: l.byExpense, rowsByExpense: l.rowsByExpense }))
+    // CHANGED: the challan board (challan → invoices) is also loaded with the list, so
+    // each expense can show the invoices behind its challans. Decorative as well.
+    fetchChallanBoard().then(({ data, error }) => { if (!error) setChallanGroups(groupChallans(data)) })
     const [{ data: exps }, { data: es }, { data: os }, { data: cats }, { data: pts }] = await Promise.all([
       supabase.from('expenses')
         .select('*, entity:entity_id(name,short_name), vendor:vendor_entity_id(name,short_name), orders(name)')
@@ -139,6 +147,15 @@ export default function Expenses() {
       supabase.from('parties').select('id,name,gstin,payment_terms,payment_days,rcm_applicable').eq('is_deleted', false).eq('is_active', true).order('name'), // CHANGED
     ])
     setExpenses(exps || [])
+    // CHANGED: invoice numbers for expenses tagged straight to an invoice (fetched
+    // separately, in small batches, so the main list never depends on it).
+    const invIds = [...new Set((exps || []).map(e => e.invoice_id).filter(Boolean))]
+    const invMap = {}
+    for (let i = 0; i < invIds.length; i += 100) {
+      const { data: invs } = await supabase.from('invoices').select('id,invoice_no').in('id', invIds.slice(i, i + 100))
+      for (const inv of invs || []) invMap[inv.id] = inv.invoice_no
+    }
+    setDirectInvoices(invMap)
     setEntities(es || [])
     setOrders(os || [])
     setCategoryRows(cats || []) // CHANGED: full rows for the manager
@@ -429,11 +446,22 @@ export default function Expenses() {
     load()
   }
 
+  // CHANGED: the invoices behind an expense — through its challans, plus the
+  // one it is tagged to directly. [{ id, invoice_no }], no repeats.
+  function invoicesOf(e) {
+    const out = []
+    const keys = (challanLinks.rowsByExpense[e.id] || []).map(r => r.key)
+    for (const g of challanGroups) if (keys.includes(g.key)) for (const i of g.invoices) if (!out.some(x => x.id === i.id)) out.push({ id: i.id, invoice_no: i.invoice_no })
+    if (e.invoice_id && !out.some(x => x.id === e.invoice_id)) out.push({ id: e.invoice_id, invoice_no: directInvoices[e.invoice_id] })
+    return out
+  }
+
   const filtered = expenses.filter(e => {
     // CHANGED: search also matches the vendor invoice number and the system number
     const q = search.toLowerCase()
     const ms = !search || e.description.toLowerCase().includes(q) || e.entity?.name?.toLowerCase().includes(q)
       || (e.vendor_invoice_no || '').toLowerCase().includes(q) || (e.expense_no || '').toLowerCase().includes(q)
+      || (!!search && invoicesOf(e).some(i => (i.invoice_no || '').toLowerCase().includes(q)))
     // CHANGED: the type lives in expense_type on the live table
     const mt = typeFilter.length === 0 || typeFilter.includes(e.expense_type || e.category)
     // CHANGED: entity / order multi-select + expense-date range
@@ -500,10 +528,28 @@ export default function Expenses() {
     { label: 'Desc',     render: e => <span style={{ fontSize: '12px' }}>{e.description}
         {challanLinks.byExpense[e.id]?.length > 0 && <span style={{ display: 'block', fontSize: '11px', color: C.textMuted }}>Challan: {challanLinks.byExpense[e.id].join(', ')}</span>}
       </span> },
+    // CHANGED: clickable invoice numbers — opens the challans on that invoice
+    { label: 'Invoices', render: e => {
+        const invs = invoicesOf(e)
+        if (invs.length === 0) return <span style={{ fontSize: '12px', color: C.textMuted }}>—</span>
+        const all = moreInvoices.has(e.id)
+        return (
+          <span style={{ fontSize: '12px', display: 'flex', flexWrap: 'wrap', gap: '2px 8px', maxWidth: '260px' }}>
+            {(all ? invs : invs.slice(0, 3)).map(i => (
+              <button key={i.id} type='button' title='View challans on this invoice' onClick={ev => { ev.stopPropagation(); setViewInvoiceId(i.id) }}
+                style={{ background: 'none', border: 'none', padding: 0, color: C.accent, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit', fontSize: '12px' }}>{i.invoice_no || '(no number)'}</button>
+            ))}
+            {invs.length > 3 && (
+              <button type='button' onClick={ev => { ev.stopPropagation(); setMoreInvoices(s => { const n = new Set(s); n.has(e.id) ? n.delete(e.id) : n.add(e.id); return n }) }}
+                style={{ background: 'none', border: 'none', padding: 0, color: C.textMuted, cursor: 'pointer', fontFamily: 'inherit', fontSize: '11px' }}>{all ? 'show less' : `+${invs.length - 3} more`}</button>
+            )}
+          </span>
+        )
+      } },
     { label: 'Vendor',   render: e => <span style={{ fontSize: '12px', color: C.textSoft }}>{e.vendor?.short_name || e.vendor?.name || e.vendor_name || '—'}{e.is_rcm && <span style={{ marginLeft: '6px' }}><Badge status='rcm' label='RCM' /></span>}</span> },
     { label: 'Total',    right: true, render: e => <span style={{ fontWeight: 600 }}>{formatINR(e.total_amount)}</span> },
     { label: 'Status',   render: e => <Badge status={e.status} /> },
-    { label: 'Docs',     render: e => <DocumentAttachments sourceType='expenses' sourceId={e.id} entityId={e.entity_id} entityName={e.entity?.name || 'General'} compact /> }, // CHANGED: entityId added
+    // CHANGED: the Docs column (and its + Doc upload) is no longer shown on this list. Documents already uploaded are untouched.
     // CHANGED: per-row edit — anyone who can see the expense; the database still decides who may save
     { label: '', render: e => <Btn size='sm' variant='ghost' onClick={ev => { ev.stopPropagation(); openEdit(e) }}>Edit</Btn> },
     // CHANGED: per-row delete, master-only
@@ -558,7 +604,7 @@ export default function Expenses() {
         <input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} title='Expense date to'
           style={{ padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
         {!!anyFilter && <Btn size='sm' variant='ghost' onClick={clearFilters}>Clear filters</Btn>}
-        <Btn variant='ghost' onClick={() => { if (!exportRows('expenses', filtered, e => ({ type: e.expense_type || e.category || '', challans: (challanLinks.byExpense[e.id] || []).join(', ') }))) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
+        <Btn variant='ghost' onClick={() => { if (!exportRows('expenses', filtered, e => ({ type: e.expense_type || e.category || '', challans: (challanLinks.byExpense[e.id] || []).join(', '), invoices: invoicesOf(e).map(i => i.invoice_no).filter(Boolean).join(', ') }))) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
       </div>
 
       {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
@@ -803,6 +849,8 @@ export default function Expenses() {
         title='Delete Expense' message={`Delete "${confirmDelete?.description || 'this expense'}"? This cannot be undone.`} danger
         confirmDisabled={deleting} confirmLabel={deleting ? 'Deleting…' : 'Confirm'} />
 
+      {/* CHANGED: invoice → challans → challan details popup */}
+      {viewInvoiceId && <InvoiceChallansModal invoiceId={viewInvoiceId} onClose={() => setViewInvoiceId(null)} />}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>
   )

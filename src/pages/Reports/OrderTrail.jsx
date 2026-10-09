@@ -34,7 +34,7 @@ export default function OrderTrail({ entities }) {
   const [entityFilter, setEntityFilter] = useState([])
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo]     = useState('')
-  const [open, setOpen]         = useState(new Set()) // expanded order ids
+  const [open, setOpen]         = useState(new Set()) // expanded order + leg rows
 
   useEffect(() => {
     let cancelled = false
@@ -225,30 +225,75 @@ export default function OrderTrail({ entities }) {
     if (rows.length) downloadCSV(`order_trail_${today()}.csv`, Object.keys(rows[0]), rows)
   }
 
-  // ── Small render helpers ───────────────────────────────────────────────────
+  // ── Table rendering ─────────────────────────────────────────────────────────
+  // One table, one header. Order rows open into leg rows, leg rows open into
+  // detail lines (one line per invoice / challan / expense). Repeated invoice
+  // and challan values are printed once per group so the lines read cleanly.
   const dateInput = { padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }
-  const tag = (text, bg, color) => <span style={{ fontSize: '10px', fontWeight: 700, background: bg, color, padding: '2px 6px', borderRadius: '4px', textTransform: 'uppercase', letterSpacing: '0.03em', whiteSpace: 'nowrap' }}>{text}</span>
-  const expenseLine = (e, via) => {
-    const note = tree.sharedNote(e)
-    return (
-      <div key={e.id} style={{ display: 'flex', gap: '10px', alignItems: 'baseline', padding: '5px 10px', background: '#f3ede8', borderRadius: '5px', fontSize: '12px', flexWrap: 'wrap' }}>
-        {tag('Expense', '#e9dfd2', C.warning)}
-        <span style={{ fontWeight: 700 }}>{expLabel(e)}</span>
-        {e.vendor_invoice_no && e.expense_no && <span style={{ fontFamily: 'monospace', fontSize: '10px', color: C.textMuted }}>{e.expense_no}</span>}
-        <span style={{ color: C.textSoft }}>{fmtDate(e.expense_date)} · {e.expense_type || '—'} · {e.vendor_name || '—'} · paid by {entName(e.entity)}</span>
-        {via && <span style={{ color: C.textMuted }}>({via})</span>}
-        {note && <span style={{ color: C.danger, fontWeight: 600 }}>{note}</span>}
-        <span style={{ marginLeft: 'auto', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(e.total_amount)}</span>
-        {tag(e.status || '—', e.status === 'paid' ? '#e8f3ec' : '#fff3cc', e.status === 'paid' ? C.success : C.warning)}
-      </div>
-    )
-  }
+  const th = { padding: '9px 10px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', textAlign: 'left', whiteSpace: 'nowrap' }
+  const td = { padding: '7px 10px', borderBottom: '1px solid #f0e8d8', fontSize: '12px', verticalAlign: 'top' }
+  const num = { textAlign: 'right', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }
+  const COLS = 13
 
   if (loading) return <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Loading…</div>
   if (error) return <div style={{ padding: '12px 14px', background: '#fbeaea', color: C.danger, borderRadius: '6px', fontSize: '13px' }}>Report could not be loaded: {error}</div>
 
   const orderOptions = [...data.orders.map(o => ({ value: o.id, label: o.name })), { value: NO_ORDER, label: 'No order linked' }]
   const t = tree.totals
+  const legKeyOf = (n, lg) => `${n.id}|${lg.id}`
+  const sumExp = list => { const seen = new Map(); for (const e of list) seen.set(e.id, Number(e.total_amount) || 0); return [...seen.values()].reduce((s, v) => s + v, 0) }
+
+  // The 5 expense-side cells of a detail line
+  const expenseCells = (e, via) => {
+    if (!e) return <><td style={{ ...td, color: C.warning }}>{via || ''}</td><td style={td} /><td style={td} /><td style={{ ...td, ...num }} /><td style={td} /></>
+    const note = tree.sharedNote(e)
+    return (
+      <>
+        <td style={td}>
+          <span style={{ fontWeight: 700 }}>{expLabel(e)}</span>
+          {note && <span title={note} style={{ display: 'block', fontSize: '10px', color: C.danger, fontWeight: 600 }}>{note}</span>}
+          {via && <span style={{ display: 'block', fontSize: '10px', color: C.textMuted }}>{via}</span>}
+        </td>
+        <td style={{ ...td, fontFamily: 'monospace', fontSize: '11px', color: C.textSoft, whiteSpace: 'nowrap' }}>{e.vendor_invoice_no ? (e.expense_no || '') : ''}</td>
+        <td style={td}>{e.vendor_name || '—'}<span style={{ display: 'block', fontSize: '10px', color: C.textMuted }}>{e.expense_type || ''}{e.expense_date ? ` · ${fmtDate(e.expense_date)}` : ''}</span></td>
+        <td style={{ ...td, ...num, fontWeight: 700 }}>{formatINR(e.total_amount)}</td>
+        <td style={td}><span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', padding: '2px 6px', borderRadius: '4px', background: e.status === 'paid' ? '#e8f3ec' : '#fff3cc', color: e.status === 'paid' ? C.success : C.warning }}>{e.status || '—'}</span></td>
+      </>
+    )
+  }
+  const invoiceCells = (inv, show) => show ? (
+    <>
+      <td style={{ ...td, fontFamily: 'monospace', fontWeight: 700, whiteSpace: 'nowrap' }}>{inv.invoice_no || '—'}{inv.invoice_type === 'purchase' && <span style={{ display: 'block', fontFamily: 'inherit', fontSize: '10px', fontWeight: 500, color: C.textMuted }}>Purchase</span>}</td>
+      <td style={{ ...td, whiteSpace: 'nowrap' }}>{fmtDate(inv.invoice_date)}</td>
+      <td style={{ ...td, whiteSpace: 'nowrap' }}>{entName(inv.seller)} → {entName(inv.buyer)}</td>
+      <td style={{ ...td, ...num }}>{formatINR(inv.total_amount)}</td>
+      <td style={{ ...td, whiteSpace: 'nowrap' }}>{inv.eway_bill_no || <span style={{ color: C.textMuted }}>—</span>}</td>
+    </>
+  ) : <><td style={td} /><td style={td} /><td style={td} /><td style={td} /><td style={td} /></>
+  const challanCells = (c, show) => show && c ? (
+    <>
+      <td style={{ ...td, fontWeight: 700, whiteSpace: 'nowrap' }}>{c.challan_no}{c.transporter && <span style={{ display: 'block', fontSize: '10px', fontWeight: 500, color: C.textMuted }}>{c.transporter}</span>}</td>
+      <td style={td}>{c.vehicles.join(', ') || '—'}</td>
+    </>
+  ) : <><td style={td} /><td style={td} /></>
+
+  // Detail lines for one invoice
+  const invoiceLines = (row, stripe) => {
+    const { inv, challans, loose, direct } = row
+    const lines = []
+    let first = true
+    const push = (key, challanPart, expensePart) => {
+      lines.push(<tr key={key} style={{ background: stripe ? '#faf6ed' : C.surface }}><td style={td} />{invoiceCells(inv, first)}{challanPart}{expensePart}</tr>)
+      first = false
+    }
+    for (const c of challans) {
+      if (c.expenses.length === 0) push(`${inv.id}|${c.key}`, challanCells(c, true), expenseCells(null, 'No expense yet'))
+      c.expenses.forEach((e, i) => push(`${inv.id}|${c.key}|${e.id}`, challanCells(c, i === 0), expenseCells(e)))
+    }
+    for (const e of direct) push(`${inv.id}|d|${e.id}`, <><td style={{ ...td, color: C.textMuted }}>—</td><td style={td}>{loose.join(', ')}</td></>, expenseCells(e, 'Tagged to the invoice'))
+    if (lines.length === 0) push(`${inv.id}|none`, <><td style={{ ...td, color: C.textMuted }}>No challan</td><td style={td}>{loose.join(', ')}</td></>, expenseCells(null))
+    return lines
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -260,7 +305,7 @@ export default function OrderTrail({ entities }) {
         <input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} title='Date from' style={dateInput} />
         <input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} title='Date to' style={dateInput} />
         {!!anyFilter && <Btn size='sm' variant='ghost' onClick={clearFilters}>Clear filters</Btn>}
-        <Btn size='sm' variant='ghost' onClick={() => setOpen(new Set(tree.list.map(n => n.id)))}>Expand all</Btn>
+        <Btn size='sm' variant='ghost' onClick={() => setOpen(new Set(tree.list.flatMap(n => [n.id, ...n.legs.map(lg => legKeyOf(n, lg)), `${n.id}|other`])))}>Expand all</Btn>
         <Btn size='sm' variant='ghost' onClick={() => setOpen(new Set())}>Collapse all</Btn>
         <Btn variant='ghost' onClick={handleExportCSV} disabled={tree.list.length === 0}>↓ Export CSV</Btn>
       </div>
@@ -272,77 +317,87 @@ export default function OrderTrail({ entities }) {
         <StatCard label='Expenses linked' value={formatINR(t.expenseTotal)} sub={`${t.expenses} expense${t.expenses === 1 ? '' : 's'}, each counted once`} />
       </div>
 
-      {tree.list.length === 0 && <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Nothing matches these filters.</div>}
-
-      {tree.list.map(n => (
-        <Card key={n.id}>
-          {/* Order */}
-          <div onClick={() => toggle(n.id)} style={{ display: 'flex', gap: '12px', alignItems: 'baseline', padding: '12px 14px', cursor: 'pointer', flexWrap: 'wrap' }}>
-            <span style={{ width: '12px', color: C.textMuted }}>{isOpen(n.id) ? '▾' : '▸'}</span>
-            <span style={{ fontSize: '14px', fontWeight: 700, color: C.text }}>{n.name}</span>
-            {n.description && <span style={{ fontSize: '12px', color: C.textSoft }}>{n.description}</span>}
-            <span style={{ marginLeft: 'auto', fontSize: '12px', color: C.textSoft }}>
-              {n.legs.length} leg{n.legs.length === 1 ? '' : 's'} · {n.invoiceCount} invoice{n.invoiceCount === 1 ? '' : 's'} · {n.challanKeys.size} challan{n.challanKeys.size === 1 ? '' : 's'}
-              {n.unbilledKeys.size > 0 && <span style={{ color: C.warning, fontWeight: 600 }}> ({n.unbilledKeys.size} no expense)</span>}
-            </span>
-            <span style={{ fontSize: '13px', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{formatINR(n.expenseTotal)}</span>
-          </div>
-
-          {isOpen(n.id) && (
-            <div style={{ padding: '0 14px 14px 38px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              {n.legs.map(lg => (
-                <div key={lg.id}>
-                  {/* Leg */}
-                  <div style={{ fontSize: '12px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', paddingBottom: '6px', borderBottom: `1px solid ${C.border}`, marginBottom: '8px' }}>
-                    {lg.leg ? <>Leg {lg.leg.leg_no} <span style={{ fontWeight: 500, textTransform: 'none', letterSpacing: 0 }}>· {entName(lg.leg.from_entity)} → {entName(lg.leg.to_entity)}</span></> : 'No leg linked'}
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', paddingLeft: '14px' }}>
-                    {lg.invoices.map(({ inv, challans, loose, direct }) => (
-                      <div key={inv.id}>
-                        {/* Invoice */}
-                        <div style={{ display: 'flex', gap: '10px', alignItems: 'baseline', fontSize: '13px', flexWrap: 'wrap' }}>
-                          {tag(inv.invoice_type === 'purchase' ? 'Purchase' : 'Invoice', C.bg, C.textSoft)}
-                          <span style={{ fontWeight: 700, fontFamily: 'monospace', fontSize: '12px' }}>{inv.invoice_no || '—'}</span>
-                          <span style={{ color: C.textSoft, fontSize: '12px' }}>{fmtDate(inv.invoice_date)} · {entName(inv.seller)} → {entName(inv.buyer)}{inv.eway_bill_no ? ` · EWB ${inv.eway_bill_no}` : ' · no E-way Bill'}</span>
-                          <span style={{ marginLeft: 'auto', fontVariantNumeric: 'tabular-nums', color: C.textSoft }}>{formatINR(inv.total_amount)}</span>
-                        </div>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '6px 0 0 20px' }}>
-                          {challans.map(c => (
-                            <div key={c.key} style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                              {/* Challan */}
-                              <div style={{ display: 'flex', gap: '10px', alignItems: 'baseline', fontSize: '12px', flexWrap: 'wrap' }}>
-                                {tag('Challan', '#e8eef3', C.accent)}
-                                <span style={{ fontWeight: 700 }}>{c.challan_no}</span>
-                                <span style={{ color: C.textSoft }}>{[c.transporter, c.vehicles.join(', ')].filter(Boolean).join(' · ') || '—'}</span>
-                                {c.expenses.length === 0 && <span style={{ color: C.warning, fontWeight: 600 }}>No expense on this challan</span>}
-                              </div>
-                              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingLeft: '20px' }}>
-                                {c.expenses.map(e => expenseLine(e))}
-                              </div>
-                            </div>
-                          ))}
-                          {direct.map(e => expenseLine(e, 'tagged to this invoice'))}
-                          {challans.length === 0 && direct.length === 0 && (
-                            <div style={{ fontSize: '12px', color: C.textMuted }}>No challan on this invoice{loose.length ? ` · vehicle ${loose.join(', ')}` : ''}</div>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
-              {n.other.length > 0 && (
-                <div>
-                  <div style={{ fontSize: '12px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', paddingBottom: '6px', borderBottom: `1px solid ${C.border}`, marginBottom: '8px' }}>Other expenses on this order</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', paddingLeft: '14px' }}>
-                    {n.other.map(e => expenseLine(e, 'tagged to the order'))}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </Card>
-      ))}
+      <Card>
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead><tr>
+              <th style={th}>Order / Leg</th>
+              <th style={th}>Invoice No</th>
+              <th style={th}>Inv Date</th>
+              <th style={th}>From → To</th>
+              <th style={{ ...th, textAlign: 'right' }}>Invoice Amt</th>
+              <th style={th}>E-way Bill</th>
+              <th style={th}>Challan</th>
+              <th style={th}>Vehicle</th>
+              <th style={th}>Vendor Inv No</th>
+              <th style={th}>Expense Ref</th>
+              <th style={th}>Vendor</th>
+              <th style={{ ...th, textAlign: 'right' }}>Expense Amt</th>
+              <th style={th}>Status</th>
+            </tr></thead>
+            <tbody>
+              {tree.list.length === 0 && <tr><td colSpan={COLS} style={{ padding: '32px', textAlign: 'center', color: C.textMuted, fontSize: '13px' }}>Nothing matches these filters.</td></tr>}
+              {tree.list.map(n => {
+                const rows = []
+                // ── Order row ──
+                rows.push(
+                  <tr key={n.id} onClick={() => toggle(n.id)} style={{ cursor: 'pointer', background: '#efe7d6' }}>
+                    <td style={{ ...td, fontSize: '13px', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                      <span style={{ display: 'inline-block', width: '14px', color: C.textSoft }}>{isOpen(n.id) ? '▾' : '▸'}</span>{n.name}
+                      {n.description && <span style={{ display: 'block', paddingLeft: '14px', fontSize: '11px', fontWeight: 500, color: C.textSoft, whiteSpace: 'normal' }}>{n.description}</span>}
+                    </td>
+                    <td style={{ ...td, fontWeight: 600 }} colSpan={5}>{n.legs.length} leg{n.legs.length === 1 ? '' : 's'} · {n.invoiceCount} invoice{n.invoiceCount === 1 ? '' : 's'}</td>
+                    <td style={{ ...td, fontWeight: 600 }} colSpan={2}>{n.challanKeys.size} challan{n.challanKeys.size === 1 ? '' : 's'}{n.unbilledKeys.size > 0 && <span style={{ color: C.warning }}> · {n.unbilledKeys.size} no expense</span>}</td>
+                    <td style={{ ...td, fontWeight: 600 }} colSpan={3}>{n.shown.size} expense{n.shown.size === 1 ? '' : 's'}</td>
+                    <td style={{ ...td, ...num, fontSize: '13px', fontWeight: 700 }}>{formatINR(n.expenseTotal)}</td>
+                    <td style={td} />
+                  </tr>
+                )
+                if (!isOpen(n.id)) return rows
+                // ── Leg rows ──
+                for (const lg of n.legs) {
+                  const lk = legKeyOf(n, lg)
+                  const legExpenses = lg.invoices.flatMap(r => [...r.challans.flatMap(c => c.expenses), ...r.direct])
+                  const legChallans = new Set(lg.invoices.flatMap(r => r.challans.map(c => c.key)))
+                  rows.push(
+                    <tr key={lk} onClick={() => toggle(lk)} style={{ cursor: 'pointer', background: '#f7f1e3' }}>
+                      <td style={{ ...td, fontWeight: 700, paddingLeft: '28px', whiteSpace: 'nowrap' }}>
+                        <span style={{ display: 'inline-block', width: '14px', color: C.textSoft }}>{isOpen(lk) ? '▾' : '▸'}</span>
+                        {lg.leg ? `Leg ${lg.leg.leg_no}` : 'No leg linked'}
+                      </td>
+                      <td style={{ ...td, fontWeight: 600 }} colSpan={2}>{lg.invoices.length} invoice{lg.invoices.length === 1 ? '' : 's'}</td>
+                      <td style={{ ...td, fontWeight: 600, whiteSpace: 'nowrap' }} colSpan={3}>{lg.leg ? `${entName(lg.leg.from_entity)} → ${entName(lg.leg.to_entity)}` : ''}</td>
+                      <td style={{ ...td, fontWeight: 600 }} colSpan={2}>{legChallans.size} challan{legChallans.size === 1 ? '' : 's'}</td>
+                      <td style={td} colSpan={3} />
+                      <td style={{ ...td, ...num, fontWeight: 700 }}>{formatINR(sumExp(legExpenses))}</td>
+                      <td style={td} />
+                    </tr>
+                  )
+                  if (isOpen(lk)) lg.invoices.forEach((row, i) => rows.push(...invoiceLines(row, i % 2 === 1)))
+                }
+                // ── Expenses tagged to the order only ──
+                if (n.other.length > 0) {
+                  const ok = `${n.id}|other`
+                  rows.push(
+                    <tr key={ok} onClick={() => toggle(ok)} style={{ cursor: 'pointer', background: '#f7f1e3' }}>
+                      <td style={{ ...td, fontWeight: 700, paddingLeft: '28px', whiteSpace: 'nowrap' }} colSpan={8}>
+                        <span style={{ display: 'inline-block', width: '14px', color: C.textSoft }}>{isOpen(ok) ? '▾' : '▸'}</span>Other expenses on this order
+                      </td>
+                      <td style={td} colSpan={3} />
+                      <td style={{ ...td, ...num, fontWeight: 700 }}>{formatINR(sumExp(n.other))}</td>
+                      <td style={td} />
+                    </tr>
+                  )
+                  if (isOpen(ok)) n.other.forEach(e => rows.push(
+                    <tr key={`${ok}|${e.id}`} style={{ background: C.surface }}><td style={td} colSpan={8} />{expenseCells(e, 'Tagged to the order')}</tr>
+                  ))
+                }
+                return rows
+              })}
+            </tbody>
+          </table>
+        </div>
+      </Card>
     </div>
   )
 }

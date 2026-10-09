@@ -96,14 +96,26 @@ describe('buildDocumentHTML', () => {
     expect(html.slice(shipToIdx, shipToIdx + 300)).toContain('Siddhi Trading Co')
   })
 
-  it('refuses to generate for an entity with no registered document theme', () => {
+  // CHANGED: an entity with no format of its own now prints in the Tally
+  // style (Kirti Sales format) with its own details, instead of being blocked.
+  it('falls back to the Tally style for an entity with no registered document theme', () => {
     const unconfigured = { ...baseDoc, sellerEntity: { ...baseDoc.sellerEntity, name: 'Siddhi Trading Co', gstin: '29AABCU9603R1ZM' } }
-    expect(() => buildDocumentHTML(unconfigured)).toThrow(/no document format has been configured for "siddhi trading co"/i)
+    const html = buildDocumentHTML(unconfigured)
+    expect(html).toContain('Siddhi Trading Co')
+    expect(html).toContain('29AABCU9603R1ZM')
+    expect(html).toContain('tally-items') // the Tally template's item table
   })
 
-  it('refuses to generate when the seller entity has no gstin at all', () => {
+  it('falls back to the Tally style when the seller entity has no gstin at all', () => {
     const noGstin = { ...baseDoc, sellerEntity: { ...baseDoc.sellerEntity, gstin: '' } }
-    expect(() => buildDocumentHTML(noGstin)).toThrow(/no document format has been configured/i)
+    expect(() => buildDocumentHTML(noGstin)).not.toThrow()
+  })
+
+  it('uses the format chosen in Entity Settings over the entity\'s own format', () => {
+    const own = buildDocumentHTML(baseDoc)
+    const asTally = buildDocumentHTML({ ...baseDoc, sellerEntity: { ...baseDoc.sellerEntity, document_format: 'tally' } })
+    expect(asTally).not.toBe(own)
+    expect(buildDocumentHTML({ ...baseDoc, sellerEntity: { ...baseDoc.sellerEntity, document_format: '' } })).toBe(own)
   })
 })
 
@@ -123,9 +135,9 @@ describe('buildDocumentExcelXML', () => {
     expect(inter).toContain('IGST')
   })
 
-  it('refuses to generate for an entity with no registered document theme', () => {
+  it('falls back to the Tally style for an entity with no registered document theme', () => {
     const unconfigured = { ...baseDoc, sellerEntity: { ...baseDoc.sellerEntity, name: 'Siddhi Trading Co', gstin: '29AABCU9603R1ZM' } }
-    expect(() => buildDocumentExcelXML(unconfigured)).toThrow(/no document format has been configured for "siddhi trading co"/i)
+    expect(buildDocumentExcelXML(unconfigured)).toContain('Siddhi Trading Co')
   })
 })
 

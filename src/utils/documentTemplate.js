@@ -40,14 +40,14 @@
  */
 import { fmtDate } from './dates'
 import { esc, fmtN, fmtInt, numWords, addressLines, paginateLines } from './documentHelpers'
-import { resolveEntityTheme } from './entityDocumentThemes'
+import { resolveThemeForEntity } from './entityDocumentThemes'
 import { buildSRPLDocumentHTML, getSRPLDocumentStyles } from './srplDocumentTemplate'
 import { buildKirtiDocumentHTML, getKirtiDocumentStyles } from './kirtiDocumentTemplate'
 import { buildKamakhyaDocumentHTML, getKamakhyaDocumentStyles } from './kamakhyaDocumentTemplate'
 
 // Columns needed from `entities` to render a document header/address block —
 // shared by every page that builds a doc for printDocument/downloadDocumentExcel.
-export const ENTITY_DOC_COLUMNS = 'name,short_name,gstin,pan,city,address,pincode,state_name,bank_name,bank_account_no,bank_ifsc,bank_branch,logo_url,logo_file_id,terms_and_conditions'
+export const ENTITY_DOC_COLUMNS = 'name,short_name,gstin,pan,city,address,pincode,state_name,bank_name,bank_account_no,bank_ifsc,bank_branch,logo_url,logo_file_id,terms_and_conditions,document_format' // CHANGED: document_format — the print format chosen in Entity Settings
 
 export const DOC_META = {
   PI: { title: 'Proforma Invoice', short: 'PI', dateLabel: 'Valid Until' },
@@ -56,19 +56,13 @@ export const DOC_META = {
 }
 
 /**
- * Every entity's documents must look visually distinct from every other
- * entity's — there is no generic fallback look. Throws (rather than
- * defaulting to some shared style) when the issuing entity has no
- * configured theme yet, so document generation is blocked with a clear
- * message until that entity's actual format has been replicated and
- * registered in entityDocumentThemes.js.
+ * CHANGED: resolves the print format for the issuing entity — the one chosen
+ * in Entity Settings, else the entity's own hand-built format, else the Tally
+ * style (Kirti Sales format). It no longer blocks an entity that has no
+ * format of its own; the name is kept so every caller stays unchanged.
  */
 export function resolveThemeOrThrow(sellerEntity) {
-  const theme = resolveEntityTheme(sellerEntity?.gstin)
-  if (!theme) {
-    throw new Error(`No document format has been configured for "${sellerEntity?.name || 'this entity'}" yet — share its Proforma Invoice/Invoice/PO format to have it added.`)
-  }
-  return theme
+  return resolveThemeForEntity(sellerEntity)
 }
 
 /**

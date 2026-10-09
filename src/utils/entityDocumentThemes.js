@@ -96,7 +96,41 @@ const ENTITY_THEMES = {
   }
 })()
 
-/** Returns the configured theme for a GSTIN, or null if none is set up yet. */
+// CHANGED: formats an entity can be set to in Entity Settings (entities.document_format).
+// 'tally' is the Kirti Sales format and is the default for any entity that has
+// no format of its own.
+export const DOCUMENT_FORMATS = [
+  { value: 'tally',    label: 'Tally style (Kirti Sales format)' },
+  { value: 'vananam',  label: 'VRVPL style' },
+  { value: 'srpl',     label: 'SRPL style' },
+  { value: 'kamakhya', label: 'Kamakhya style' },
+]
+export const DEFAULT_DOCUMENT_FORMAT = 'tally'
+
+/**
+ * CHANGED: the format an entity's documents print in.
+ *   1. the format chosen in Entity Settings, if any;
+ *   2. otherwise the entity's own hand-built format (matched by GSTIN);
+ *   3. otherwise the Tally style — so no entity is ever left without a format.
+ * The entity's own name, address, GSTIN, bank and logo are filled in by the
+ * template itself from the entity record; only the layout is shared.
+ */
+export function resolveThemeForEntity(entity) {
+  const own = resolveEntityTheme(entity?.gstin)
+  const chosen = (entity?.document_format || '').trim().toLowerCase()
+  const family = DOCUMENT_FORMATS.some(f => f.value === chosen) ? chosen : (own?.family || DEFAULT_DOCUMENT_FORMAT)
+  if (own && own.family === family) return own
+  const base = Object.values(ENTITY_THEMES).find(t => t.family === family)
+  return { ...base, family, label: entity?.short_name || entity?.name || 'Entity' }
+}
+
+/** Label of the format an entity gets when Entity Settings is left on Automatic. */
+export function automaticFormatLabel(gstin) {
+  const family = resolveEntityTheme(gstin)?.family || DEFAULT_DOCUMENT_FORMAT
+  return DOCUMENT_FORMATS.find(f => f.value === family)?.label || family
+}
+
+/** Returns the hand-built theme registered for a GSTIN, or null if there is none. */
 export function resolveEntityTheme(gstin) {
   if (!gstin) return null
   return ENTITY_THEMES[gstin.trim().toUpperCase()] || null

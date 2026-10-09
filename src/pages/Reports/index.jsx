@@ -10,6 +10,8 @@ import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/p
 import { matchPurchasesToSales, calcMarginPct } from '../../utils/margin'
 import { downloadCSV } from '../../utils/csvTemplate'
 import OrderTrail from './OrderTrail' // CHANGED: order → leg → invoice → challan → expense drill-down
+import TallyLedgerTable, { LedgerExportButtons } from './TallyLedger' // CHANGED: Tally-style ledger statements
+import { ledgerTotals } from '../../utils/ledgerExport'
 
 // CHANGED: "Compliance" is one tab in the main row, sitting next to Party
 // Ledger. Selecting it reveals a second-level sub-tab row for its two
@@ -33,6 +35,12 @@ function monthLabel(ym) {
 function resolveDateRange(fyFilter, dateFrom, dateTo) {
   if (dateFrom || dateTo) return { start: dateFrom || null, end: dateTo || null }
   return fyFilter ? { start: fyFilter.start_date, end: fyFilter.end_date } : null
+}
+// CHANGED: the period line printed on a ledger statement, e.g. "1 Apr 2026 to 31 Mar 2027".
+function periodLabel(range) {
+  if (!range || (!range.start && !range.end)) return 'All dates'
+  if (range.start && range.end) return `${fmtDate(range.start)} to ${fmtDate(range.end)}`
+  return range.start ? `From ${fmtDate(range.start)}` : `Up to ${fmtDate(range.end)}`
 }
 // Applies a resolved range to a Supabase query builder on one date column.
 function applyDateRange(query, range, col) {
@@ -625,13 +633,17 @@ function Ledger({ entities, fys, defaultEntityId }) {
   const [fyId, setFyId]             = useState('')
   const [dateFrom, setDateFrom]     = useState('')
   const [dateTo, setDateTo]         = useState('')
-  const [rows, setRows]             = useState([])
+  const [ledger, setLedger]         = useState(null) // CHANGED: Tally-style statement (see TallyLedger.jsx)
+  const [exportError, setExportError] = useState('')
   const [loading, setLoading]       = useState(false)
 
   async function runReport() {
     if (!ourEntityId) return
     setLoading(true)
     const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
+    // CHANGED: fetched up to the period end only — entries before the period
+    // start are needed for the Opening Balance.
+    const upTo = range?.end ? { end: range.end } : null
 
     // Sales invoices (Dr for our entity)
     // CHANGED: excludeAutoPurchaseMirrors — see utils/query.js. A sale to an
@@ -642,28 +654,28 @@ function Ledger({ entities, fys, defaultEntityId }) {
       .select('id,invoice_no,invoice_date,total_amount,buyer_entity_id,buyer:buyer_entity_id(name,short_name)')
       .eq('seller_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled'))
     if (partyId !== 'all') salesQ = salesQ.eq('buyer_entity_id', partyId)
-    salesQ = applyDateRange(salesQ, range, 'invoice_date')
+    salesQ = applyDateRange(salesQ, upTo, 'invoice_date')
 
     // Purchase invoices (Cr for our entity)
     let purchasesQ = excludeAutoPurchaseMirrors(supabase.from('invoices')
       .select('id,invoice_no,invoice_date,total_amount,seller_entity_id,seller:seller_entity_id(name,short_name)')
       .eq('buyer_entity_id', ourEntityId).eq('is_deleted', false).neq('status', 'cancelled'))
     if (partyId !== 'all') purchasesQ = purchasesQ.eq('seller_entity_id', partyId)
-    purchasesQ = applyDateRange(purchasesQ, range, 'invoice_date')
+    purchasesQ = applyDateRange(purchasesQ, upTo, 'invoice_date')
 
     // Receipts (Cr for our entity)
     let receiptsQ = supabase.from('payments')
       .select('id,payment_no,payment_date,net_amount,party_entity_id,party:party_entity_id(name,short_name),party_name')
       .eq('entity_id', ourEntityId).eq('payment_type', 'receipt').eq('is_deleted', false)
     if (partyId !== 'all') receiptsQ = receiptsQ.eq('party_entity_id', partyId)
-    receiptsQ = applyDateRange(receiptsQ, range, 'payment_date')
+    receiptsQ = applyDateRange(receiptsQ, upTo, 'payment_date')
 
     // Payments sent (Dr for our entity)
     let paymentsQ = supabase.from('payments')
       .select('id,payment_no,payment_date,net_amount,party_entity_id,party:party_entity_id(name,short_name),party_name')
       .eq('entity_id', ourEntityId).eq('payment_type', 'payment').eq('is_deleted', false)
     if (partyId !== 'all') paymentsQ = paymentsQ.eq('party_entity_id', partyId)
-    paymentsQ = applyDateRange(paymentsQ, range, 'payment_date')
+    paymentsQ = applyDateRange(paymentsQ, upTo, 'payment_date')
 
     const [{ data: sales }, { data: purchases }, { data: receipts }, { data: paymentsMade }] = await Promise.all([salesQ, purchasesQ, receiptsQ, paymentsQ])
 
@@ -671,12 +683,12 @@ function Ledger({ entities, fys, defaultEntityId }) {
     let bdEventsQ = supabase.from('bill_discounting_events')
       .select('id,discounting_date,net_proceeds,bank_name,bank:bank_id(name,short_name)')
       .eq('entity_id', ourEntityId).eq('is_deleted', false)
-    bdEventsQ = applyDateRange(bdEventsQ, range, 'discounting_date')
+    bdEventsQ = applyDateRange(bdEventsQ, upTo, 'discounting_date')
 
     let bdRepaysQ = supabase.from('bill_discounting_repayments')
       .select('id,repayment_date,amount,interest_amount,total_payment,event_id, event:event_id(entity_id,bank_name,bank:bank_id(name,short_name))')
       .order('repayment_date')
-    bdRepaysQ = applyDateRange(bdRepaysQ, range, 'repayment_date')
+    bdRepaysQ = applyDateRange(bdRepaysQ, upTo, 'repayment_date')
 
     // Standalone (non-invoice) entries recorded in Payments → Entity Ledger —
     // matches whichever side of `entity_payments` names our entity, so an
@@ -686,7 +698,7 @@ function Ledger({ entities, fys, defaultEntityId }) {
     let entPayQ = supabase.from('entity_payments')
       .select('id,actual_payment_date,entity_id,party_entity_id,party_name,direction,amount,reference_no,notes')
       .eq('is_deleted', false).or(`entity_id.eq.${ourEntityId},party_entity_id.eq.${ourEntityId}`)
-    entPayQ = applyDateRange(entPayQ, range, 'actual_payment_date')
+    entPayQ = applyDateRange(entPayQ, upTo, 'actual_payment_date')
 
     const [{ data: bdEvents }, { data: bdRepays }, { data: entPayments }] = await Promise.all([bdEventsQ, bdRepaysQ, entPayQ])
 
@@ -709,36 +721,49 @@ function Ledger({ entities, fys, defaultEntityId }) {
       })
 
     const ledgerRows = [
-      ...(sales || []).map(i => ({ date: i.invoice_date, doc: i.invoice_no, party: i.buyer?.short_name || i.buyer?.name, type: 'Sales Invoice', dr: i.total_amount, cr: 0, _raw: i })),
-      ...(paymentsMade || []).map(p => ({ date: p.payment_date, doc: p.payment_no, party: p.party?.short_name || p.party?.name || p.party_name, type: 'Payment Out', dr: p.net_amount, cr: 0, _raw: p })),
-      ...(purchases || []).map(i => ({ date: i.invoice_date, doc: i.invoice_no, party: i.seller?.short_name || i.seller?.name, type: 'Purchase Invoice', dr: 0, cr: i.total_amount, _raw: i })),
-      ...(receipts || []).map(p => ({ date: p.payment_date, doc: p.payment_no, party: p.party?.short_name || p.party?.name || p.party_name, type: 'Receipt', dr: 0, cr: p.net_amount, _raw: p })),
+      ...(sales || []).map(i => ({ date: i.invoice_date, doc: i.invoice_no, party: i.buyer?.short_name || i.buyer?.name, type: 'Sales Invoice', dr: i.total_amount, cr: 0 })),
+      ...(paymentsMade || []).map(p => ({ date: p.payment_date, doc: p.payment_no, party: p.party?.short_name || p.party?.name || p.party_name, type: 'Payment Out', dr: p.net_amount, cr: 0 })),
+      ...(purchases || []).map(i => ({ date: i.invoice_date, doc: i.invoice_no, party: i.seller?.short_name || i.seller?.name, type: 'Purchase Invoice', dr: 0, cr: i.total_amount })),
+      ...(receipts || []).map(p => ({ date: p.payment_date, doc: p.payment_no, party: p.party?.short_name || p.party?.name || p.party_name, type: 'Receipt', dr: 0, cr: p.net_amount })),
       // Bill Discounting — disbursement is Dr (cash in), repayment is Cr (cash out)
-      ...(bdEvents || []).map(e => ({ date: e.discounting_date, doc: '—', party: e.bank?.name || e.bank_name, type: 'BD Disbursement', dr: e.net_proceeds || 0, cr: 0, _raw: e })),
-      ...myRepays.map(r => ({ date: r.repayment_date, doc: '—', party: r.event?.bank?.name || r.event?.bank_name, type: 'BD Repayment', dr: 0, cr: (r.total_payment || r.amount) || 0, _raw: r })),
+      ...(bdEvents || []).map(e => ({ date: e.discounting_date, doc: '', party: e.bank?.name || e.bank_name, type: 'BD Disbursement', dr: e.net_proceeds || 0, cr: 0 })),
+      ...myRepays.map(r => ({ date: r.repayment_date, doc: '', party: r.event?.bank?.name || r.event?.bank_name, type: 'BD Repayment', dr: 0, cr: (r.total_payment || r.amount) || 0 })),
       ...entPayRows,
     ].sort((a, b) => new Date(a.date) - new Date(b.date))
 
-    // Add running balance
-    let balance = 0
-    const withBalance = ledgerRows.map(r => {
-      balance += r.dr - r.cr
-      return { ...r, balance }
+    // CHANGED: Tally-style statement. Everything dated before the period start
+    // rolls into the Opening Balance; the rest are the vouchers of the period.
+    // Which side each entry posts to (Dr/Cr) is unchanged from before.
+    const VCH = { 'Sales Invoice': 'Sales', 'Purchase Invoice': 'Purchase', 'Receipt': 'Receipt', 'Payment Out': 'Payment', 'BD Disbursement': 'Bill Discounting', 'BD Repayment': 'BD Repayment' }
+    const start = range?.start || null
+    let opening = 0
+    const period = []
+    for (const r of ledgerRows) {
+      const dr = Number(r.dr) || 0, cr = Number(r.cr) || 0
+      if (start && (r.date || '') < start) { opening += dr - cr; continue }
+      period.push({ date: r.date, particulars: r.party || '—', vchType: VCH[r.type] || (dr > 0 ? 'Payment' : 'Receipt'), vchNo: r.doc && r.doc !== '—' ? r.doc : '', dr, cr })
+    }
+    const our = entities.find(e => e.id === ourEntityId)
+    const party = entities.find(e => e.id === partyId)
+    setLedger({
+      title: our?.name || our?.short_name || 'Ledger',
+      account: partyId === 'all' ? 'All parties' : (party?.name || party?.short_name || 'Party'),
+      period: periodLabel(range),
+      opening, rows: period,
     })
-
-    setRows(withBalance)
     setLoading(false)
   }
 
   function handleExportCSV() {
-    downloadCSV(`ledger_${today()}.csv`, ['date', 'doc', 'party', 'type', 'dr', 'cr', 'balance'], rows)
+    if (!ledger) return
+    const t = ledgerTotals(ledger)
+    downloadCSV(`ledger_${today()}.csv`, ['date', 'particulars', 'vch_type', 'vch_no', 'debit', 'credit'], [
+      { date: '', particulars: 'Opening Balance', vch_type: '', vch_no: '', debit: t.opening > 0 ? t.opening : '', credit: t.opening < 0 ? -t.opening : '' },
+      ...ledger.rows.map(r => ({ date: r.date, particulars: r.particulars, vch_type: r.vchType, vch_no: r.vchNo, debit: r.dr || '', credit: r.cr || '' })),
+      { date: '', particulars: 'Current Total', vch_type: '', vch_no: '', debit: t.totalDr, credit: t.totalCr },
+      { date: '', particulars: `Closing Balance (${t.closing >= 0 ? 'Dr' : 'Cr'})`, vch_type: '', vch_no: '', debit: t.closing >= 0 ? t.closing : '', credit: t.closing < 0 ? -t.closing : '' },
+    ])
   }
-
-  const totalDr = rows.reduce((s, r) => s + r.dr, 0)
-  const totalCr = rows.reduce((s, r) => s + r.cr, 0)
-  const netBalance = totalDr - totalCr
-
-  const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -766,65 +791,16 @@ function Ledger({ entities, fys, defaultEntityId }) {
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !ourEntityId ? 'not-allowed' : 'pointer', opacity: !ourEntityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
-        <Btn variant='ghost' onClick={handleExportCSV} disabled={rows.length === 0}>↓ Export CSV</Btn>
+        <LedgerExportButtons ledger={ledger} onError={setExportError} />
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!ledger}>↓ CSV</Btn>
       </div>
+      {exportError && <div style={{ padding: '10px 14px', background: '#fbeaea', color: C.danger, borderRadius: '6px', fontSize: '13px' }}>{exportError}</div>}
 
-      {rows.length > 0 && (
-        <>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px' }}>
-            <StatCard label='Total Debit'  value={formatINR(totalDr)} />
-            <StatCard label='Total Credit' value={formatINR(totalCr)} />
-            <StatCard label='Net Balance'  value={formatINR(Math.abs(netBalance))} sub={netBalance >= 0 ? 'Debit balance (owed to us)' : 'Credit balance (we owe)'} color={netBalance >= 0 ? C.success : C.danger} />
-          </div>
+      {ledger && <TallyLedgerTable ledger={ledger} />}
 
-          <Card>
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
-                <thead>
-                  <tr>
-                    <th style={{ ...th, textAlign: 'left' }}>Date</th>
-                    <th style={{ ...th, textAlign: 'left' }}>Document</th>
-                    <th style={{ ...th, textAlign: 'left' }}>Party</th>
-                    <th style={{ ...th, textAlign: 'left' }}>Type</th>
-                    <th style={{ ...th, textAlign: 'right' }}>Debit (Dr)</th>
-                    <th style={{ ...th, textAlign: 'right' }}>Credit (Cr)</th>
-                    <th style={{ ...th, textAlign: 'right' }}>Balance</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((r, i) => (
-                    <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
-                      <td style={{ padding: '9px 12px', borderBottom: `1px solid #f0e8d8` }}>{fmtDate(r.date)}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: `1px solid #f0e8d8`, fontFamily: 'monospace', fontSize: '12px' }}>{r.doc || '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: `1px solid #f0e8d8`, color: C.textSoft }}>{r.party || '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: `1px solid #f0e8d8` }}>
-                        <span style={{ fontSize: '11px', background: r.type==='BD Disbursement'?'#e8f0f3':r.type==='BD Repayment'?'#f3e8f0':r.dr > 0 ? '#e8f3ec' : '#f3ede8', color: r.type==='BD Disbursement'?'#1a4a6a':r.type==='BD Repayment'?'#6a1a4a':r.dr > 0 ? C.success : C.warning, padding: '2px 7px', borderRadius: '4px', fontWeight: 600 }}>{r.type}</span>
-                      </td>
-                      <td style={{ padding: '9px 12px', borderBottom: `1px solid #f0e8d8`, textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.dr > 0 ? C.success : C.textMuted }}>{r.dr > 0 ? formatINR(r.dr) : '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: `1px solid #f0e8d8`, textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.cr > 0 ? C.warning : C.textMuted }}>{r.cr > 0 ? formatINR(r.cr) : '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: `1px solid #f0e8d8`, textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: r.balance >= 0 ? C.text : C.danger }}>{formatINR(Math.abs(r.balance))} {r.balance < 0 ? 'Cr' : 'Dr'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot>
-                  <tr style={{ background: '#f0ebe0' }}>
-                    <td colSpan={4} style={{ padding: '10px 12px', fontWeight: 700 }}>Closing Balance</td>
-                    <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: C.success }}>{formatINR(totalDr)}</td>
-                    <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: C.warning }}>{formatINR(totalCr)}</td>
-                    <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', fontSize: '14px', color: netBalance >= 0 ? C.success : C.danger }}>
-                      {formatINR(Math.abs(netBalance))} {netBalance < 0 ? 'Cr' : 'Dr'}
-                    </td>
-                  </tr>
-                </tfoot>
-              </table>
-            </div>
-          </Card>
-        </>
-      )}
-
-      {!loading && rows.length === 0 && ourEntityId && (
+      {!loading && !ledger && (
         <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>
-          Click "Run Report" to generate the ledger.
+          Select an entity, then click "Run Report" to generate the ledger.
         </div>
       )}
     </div>
@@ -1651,7 +1627,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
   const [fyId, setFyId]         = useState('')
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo]     = useState('')
-  const [rows, setRows]         = useState(null)
+  const [ledger, setLedger]     = useState(null)
   const [loading, setLoading]   = useState(false)
   const [error, setError]       = useState('')
 
@@ -1659,54 +1635,69 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
     setLoading(true)
     setError('')
     const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
+    // CHANGED: fetched up to the period end only, so everything before the
+    // period start can be rolled into the Opening Balance.
+    const upTo = range?.end ? { end: range.end } : null
     const scope = q => {
       if (entityIds.length) q = q.in('entity_id', entityIds)
       if (partyIds.length)  q = q.in('party_id', partyIds)
       return q
     }
-    // CHANGED: vendor_invoice_no is the main identifier; expense_no is the system reference.
+    // vendor_invoice_no is the main identifier; expense_no is the system reference.
     const [{ data: exps, error: expErr }, { data: pays, error: payErr }] = await Promise.all([
       fetchAllPages(() => applyDateRange(scope(supabase.from('expenses')
         .select('id,entity_id,party_id,expense_no,vendor_invoice_no,vendor_invoice_date,expense_date,description,total_amount')
-        .eq('is_deleted', false).not('party_id', 'is', null)), range, 'expense_date').order('expense_date').order('id')),
+        .eq('is_deleted', false).not('party_id', 'is', null)), upTo, 'expense_date').order('expense_date').order('id')),
       fetchAllPages(() => applyDateRange(scope(supabase.from('party_payments')
         .select('id,entity_id,party_id,payment_date,amount,tds_amount,reference,mode,expense:expense_id(expense_no,vendor_invoice_no)')
-        .eq('is_deleted', false)), range, 'payment_date').order('payment_date').order('id')),
+        .eq('is_deleted', false)), upTo, 'payment_date').order('payment_date').order('id')),
     ])
-    if (expErr || payErr) { setRows(null); setError((expErr || payErr).message); setLoading(false); return }
+    if (expErr || payErr) { setLedger(null); setError((expErr || payErr).message); setLoading(false); return }
 
     const entityName = id => { const e = entities.find(x => x.id === id); return e ? (e.short_name || e.name) : '—' }
     const partyName  = id => parties.find(p => p.id === id)?.name || '—'
-    const ledger = [
+    // CHANGED: Tally-style statement of the party's account in our books.
+    //   Expense booked  → Credit (we owe the party)
+    //   Payment made    → Debit  (cash paid + TDS withheld — the TDS still
+    //                     settles the bill, same convention as computeInvoiceOutstanding)
+    // So a Credit closing balance = still payable to the party.
+    const all = [
       ...(exps || []).map(e => ({ date: e.expense_date, entity: entityName(e.entity_id), party: partyName(e.party_id),
-        vendor_invoice_no: e.vendor_invoice_no || '', vendor_invoice_date: e.vendor_invoice_date || '', ref_no: e.expense_no || '',
-        type: 'Expense', desc: e.description, bill: e.total_amount || 0, paid: 0 })),
-      // CHANGED: "paid" (what settles the bill) = cash actually paid + TDS withheld —
-      // the TDS portion still settles the expense (paid to govt on the party's
-      // behalf), same convention as computeInvoiceOutstanding in utils/payments.js.
-      // Without this, a TDS-withheld payment would leave the ledger permanently
-      // short by the withheld amount.
-      // A payment made against a specific expense carries that expense's vendor invoice number.
+        particulars: partyName(e.party_id), note: [entityName(e.entity_id), e.description].filter(Boolean).join(' · '),
+        vchType: 'Expense', vchNo: e.vendor_invoice_no || e.expense_no || '', dr: 0, cr: Number(e.total_amount) || 0 })),
       ...(pays || []).map(p => ({ date: p.payment_date, entity: entityName(p.entity_id), party: partyName(p.party_id),
-        vendor_invoice_no: p.expense?.vendor_invoice_no || '', vendor_invoice_date: '', ref_no: p.reference || '',
-        type: 'Payment', desc: p.mode || '', bill: 0, paid: (p.amount || 0) + (p.tds_amount || 0) })),
+        particulars: partyName(p.party_id),
+        note: [entityName(p.entity_id), p.mode, (p.expense?.vendor_invoice_no || p.expense?.expense_no) ? `against ${p.expense.vendor_invoice_no || p.expense.expense_no}` : '', Number(p.tds_amount) ? `incl. TDS ${formatINR(p.tds_amount)}` : ''].filter(Boolean).join(' · '),
+        vchType: 'Payment', vchNo: p.reference || '', dr: (Number(p.amount) || 0) + (Number(p.tds_amount) || 0), cr: 0 })),
     ].sort((a, b) => new Date(a.date) - new Date(b.date))
 
-    let bal = 0
-    setRows(ledger.map(r => { bal += r.bill - r.paid; return { ...r, balance: bal } }))
+    const start = range?.start || null
+    let opening = 0
+    const period = []
+    for (const r of all) { if (start && (r.date || '') < start) opening += r.dr - r.cr; else period.push(r) }
+    const names = (ids, list, label, allLabel) => ids.length === 0 ? allLabel : ids.length <= 3 ? ids.map(id => { const x = list.find(v => v.id === id); return x ? (x.name || x.short_name) : '' }).filter(Boolean).join(', ') : `${ids.length} ${label}`
+    setLedger({
+      title: names(entityIds, entities, 'entities', 'All entities'),
+      account: names(partyIds, parties, 'parties', 'All parties'),
+      period: periodLabel(range),
+      opening, rows: period,
+    })
     setLoading(false)
   }
 
   function handleExportCSV() {
-    if (!rows) return
-    downloadCSV(`party_ledger_${today()}.csv`, ['date', 'entity', 'party', 'vendor_invoice_no', 'vendor_invoice_date', 'ref_no', 'type', 'desc', 'bill', 'paid', 'balance'], rows)
+    if (!ledger) return
+    const t = ledgerTotals(ledger)
+    const blank = { date: '', entity: '', party: '', vch_type: '', vch_no: '', note: '' }
+    downloadCSV(`party_ledger_${today()}.csv`, ['date', 'entity', 'party', 'particulars', 'vch_type', 'vch_no', 'note', 'debit', 'credit'], [
+      { ...blank, particulars: 'Opening Balance', debit: t.opening > 0 ? t.opening : '', credit: t.opening < 0 ? -t.opening : '' },
+      ...ledger.rows.map(r => ({ date: r.date, entity: r.entity, party: r.party, particulars: r.particulars, vch_type: r.vchType, vch_no: r.vchNo, note: r.note, debit: r.dr || '', credit: r.cr || '' })),
+      { ...blank, particulars: 'Current Total', debit: t.totalDr, credit: t.totalCr },
+      { ...blank, particulars: `Closing Balance (${t.closing >= 0 ? 'Dr' : 'Cr'})`, debit: t.closing >= 0 ? t.closing : '', credit: t.closing < 0 ? -t.closing : '' },
+    ])
   }
 
-  const totalBill = (rows || []).reduce((s, r) => s + r.bill, 0)
-  const totalPaid = (rows || []).reduce((s, r) => s + r.paid, 0)
-  const outstanding = totalBill - totalPaid
-  const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
-  const td = { padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }
+  const closing = ledger ? ledgerTotals(ledger).closing : 0
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -1728,59 +1719,21 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1 }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
-        <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
+        <LedgerExportButtons ledger={ledger} onError={setError} />
+        <Btn variant='ghost' onClick={handleExportCSV} disabled={!ledger}>↓ CSV</Btn>
       </div>
 
       {error && <div style={{ padding: '12px 14px', background: '#fbeaea', color: C.danger, borderRadius: '6px', fontSize: '13px' }}>Report could not be loaded: {error}</div>}
 
-      {rows && (
+      {ledger && (
         <>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px' }}>
-            <StatCard label='Total Billed' value={formatINR(totalBill)} />
-            <StatCard label='Total Paid'   value={formatINR(totalPaid)} color={C.success} />
-            <StatCard label='Outstanding'  value={formatINR(Math.abs(outstanding))} sub={outstanding > 0 ? 'We still owe' : outstanding < 0 ? 'Advance / overpaid' : 'Settled'} color={outstanding > 0 ? C.danger : C.success} />
+          <div style={{ fontSize: '12px', color: C.textSoft }}>
+            {closing < 0 ? `Credit closing balance — ${formatINR(-closing)} still payable.` : closing > 0 ? `Debit closing balance — ${formatINR(closing)} paid in advance / overpaid.` : 'Settled — nothing outstanding.'}
           </div>
-          <Card>
-            <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
-                <thead><tr>
-                  <th style={{ ...th, textAlign: 'left' }}>Date</th>
-                  <th style={{ ...th, textAlign: 'left' }}>Entity</th>
-                  <th style={{ ...th, textAlign: 'left' }}>Party</th>
-                  <th style={{ ...th, textAlign: 'left' }}>Vendor Inv No</th>
-                  <th style={{ ...th, textAlign: 'left' }}>Ref No</th>
-                  <th style={{ ...th, textAlign: 'left' }}>Type</th>
-                  <th style={{ ...th, textAlign: 'right' }}>Billed</th>
-                  <th style={{ ...th, textAlign: 'right' }}>Paid</th>
-                  <th style={{ ...th, textAlign: 'right' }}>Outstanding</th>
-                </tr></thead>
-                <tbody>
-                  {rows.map((r, i) => (
-                    <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
-                      <td style={td}>{fmtDate(r.date)}</td>
-                      <td style={{ ...td, fontSize: '12px' }}>{r.entity}</td>
-                      <td style={{ ...td, fontSize: '12px' }}>{r.party}</td>
-                      <td style={{ ...td, fontWeight: 600 }}>
-                        {r.vendor_invoice_no || '—'}
-                        {r.vendor_invoice_date && <span style={{ display: 'block', fontSize: '11px', fontWeight: 400, color: C.textMuted }}>{fmtDate(r.vendor_invoice_date)}</span>}
-                      </td>
-                      <td style={{ ...td, fontFamily: 'monospace', fontSize: '11px', color: C.textSoft }}>{r.ref_no || '—'}</td>
-                      <td style={td}>
-                        <span style={{ fontSize: '11px', background: r.type === 'Payment' ? '#e8f3ec' : '#f3ede8', color: r.type === 'Payment' ? C.success : C.warning, padding: '2px 7px', borderRadius: '4px', fontWeight: 600 }}>{r.type}</span>
-                      </td>
-                      <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.bill > 0 ? C.warning : C.textMuted }}>{r.bill > 0 ? formatINR(r.bill) : '—'}</td>
-                      <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.paid > 0 ? C.success : C.textMuted }}>{r.paid > 0 ? formatINR(r.paid) : '—'}</td>
-                      <td style={{ ...td, textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: r.balance > 0 ? C.danger : C.text }}>{formatINR(Math.abs(r.balance))}</td>
-                    </tr>
-                  ))}
-                  {rows.length === 0 && <tr><td colSpan={9} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No expenses or payments for this selection.</td></tr>}
-                </tbody>
-              </table>
-            </div>
-          </Card>
+          <TallyLedgerTable ledger={ledger} />
         </>
       )}
-      {!loading && !error && rows === null && (
+      {!loading && !error && !ledger && (
         <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Pick entities and parties (leave blank for all), then Run Report.</div>
       )}
     </div>
