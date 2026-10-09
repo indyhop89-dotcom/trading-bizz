@@ -9,7 +9,7 @@ import {
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, formatQty, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
-import { suggestNextNo } from '../../utils/numbering'
+import { suggestNextNo, nextDocNo } from '../../utils/numbering' // CHANGED: nextDocNo — entity-wise number formats
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import { calcLineTax } from '../../utils/tax'
 import { withTimeout } from '../../utils/query'
@@ -299,7 +299,10 @@ function InvoiceList({ refreshKey }) {
       if (invoiceNo) {
         if (usedInvoiceNos.has(invoiceNo.toLowerCase())) { errors.push(`Invoice ${meta.invoice_date} ${meta.seller_entity}→${meta.buyer_entity}: invoice number "${invoiceNo}" is already in use`); continue }
       } else {
-        invoiceNo = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerE.short_name || sellerE.name, fyCode, excludeSet: usedInvoiceNos })
+        // CHANGED: a sales invoice uses the seller's own number format when one is set (Entities → Document Numbering)
+        invoiceNo = (meta.invoice_type || 'sales') === 'sales'
+          ? await nextDocNo({ docType: 'sales_invoice', entityId: sellerE.id, date: invoiceDate, table: 'invoices', noCol: 'invoice_no', entityShort: sellerE.short_name || sellerE.name, fyCode, excludeSet: usedInvoiceNos })
+          : await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerE.short_name || sellerE.name, fyCode, excludeSet: usedInvoiceNos })
       }
       usedInvoiceNos.add(invoiceNo.toLowerCase())
 
@@ -772,7 +775,10 @@ function NewInvoice() {
       if (dup?.length) { setSaving(false); return setToast({ message: `Invoice number "${invoiceNo}" is already in use`, type: 'error' }) }
     } else {
       const sellerEntity = entities.find(e => e.id === form.seller_entity_id)
-      invoiceNo = await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerEntity?.short_name || sellerEntity?.name, fyCode })
+      // CHANGED: a sales invoice uses the seller's own number format when one is set (Entities → Document Numbering)
+      invoiceNo = form.invoice_type === 'sales'
+        ? await nextDocNo({ docType: 'sales_invoice', entityId: form.seller_entity_id, date: form.invoice_date, table: 'invoices', noCol: 'invoice_no', entityShort: sellerEntity?.short_name || sellerEntity?.name, fyCode })
+        : await suggestNextNo({ table: 'invoices', noCol: 'invoice_no', entityShort: sellerEntity?.short_name || sellerEntity?.name, fyCode })
     }
 
     const payload = {
@@ -1032,7 +1038,7 @@ function NewInvoice() {
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
           <Btn variant='ghost' onClick={() => navigate('/invoices')}>Cancel</Btn>
-          <Btn onClick={() => handleSave(false)} disabled={saving}>{saving ? 'Saving…' : 'Create Invoice'}</Btn>
+          <Btn shortcut onClick={() => handleSave(false)} disabled={saving}>{saving ? 'Saving…' : 'Create Invoice'}</Btn>
         </div>
       </div>
 
@@ -1583,7 +1589,7 @@ function InvoiceDetail() {
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             {!editing && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing && <Btn size='sm' variant='ghost' onClick={() => setEditing(false)}>Discard</Btn>}
-            {editing && <Btn size='sm' onClick={() => handleSaveEdit()} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
+            {editing && <Btn shortcut size='sm' onClick={() => handleSaveEdit()} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
             {!editing && inv.status === 'draft' && <Btn size='sm' onClick={() => updateStatus('submitted')}>Submit</Btn>}
             {!editing && inv.status === 'submitted' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('paid')}>Mark Paid</Btn>}
             {!editing && !['cancelled','paid'].includes(inv.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
@@ -1788,7 +1794,7 @@ function InvoiceDetail() {
             </div>
             <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
               <Btn variant='ghost' onClick={() => setEwbEdit(false)}>Cancel</Btn>
-              <Btn onClick={saveEwbForm} disabled={sectSaving}>{sectSaving ? 'Saving…' : 'Save'}</Btn>
+              <Btn shortcut onClick={saveEwbForm} disabled={sectSaving}>{sectSaving ? 'Saving…' : 'Save'}</Btn>
             </div>
           </div>
         ) : inv.eway_bill_no ? (
@@ -1880,7 +1886,7 @@ function InvoiceDetail() {
             </FormRow>
             <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
               <Btn variant='ghost' onClick={() => setIrnEdit(false)}>Cancel</Btn>
-              <Btn onClick={saveIrnForm} disabled={sectSaving}>{sectSaving ? 'Saving…' : 'Save'}</Btn>
+              <Btn shortcut onClick={saveIrnForm} disabled={sectSaving}>{sectSaving ? 'Saving…' : 'Save'}</Btn>
             </div>
           </div>
         ) : (inv.einvoice_irn || inv.einvoice_ack_no) ? (

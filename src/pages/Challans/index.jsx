@@ -8,7 +8,7 @@
 // utils/challans.js and 057_invoice_vehicles_and_expense_challans.sql.
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Link } from 'react-router-dom'
-import { C, Btn, Card, PageHeader, StatCard, Toast, ConfirmModal, EmptyState, MultiSelectDropdown } from '../../components/UI/index'
+import { C, Btn, Card, PageHeader, StatCard, Toast, ConfirmModal, EmptyState, MultiSelectDropdown, Modal, Input } from '../../components/UI/index'
 import { supabase } from '../../supabaseClient'
 import { exportRows } from '../../utils/exportCsv' // CHANGED: CSV export of the rows on screen
 import { InlineCell, newVehicleRow } from '../../components/InvoiceVehicles'
@@ -16,9 +16,25 @@ import { fmtDate } from '../../utils/dates'
 import {
   clean, challanKey, fetchChallanBoard, fetchExpenseChallanLinks, groupChallans,
   saveVehicleField, deleteVehicleRow, syncInvoiceTransport, saveErrorMessage,
+  externalKeySet, challanStatus, setRowsExternal, // CHANGED: External challans
 } from '../../utils/challans'
+import { useAuth } from '../../hooks/useAuth'
+import { hasFullAccess } from '../../utils/roles'
 
 const entName = e => e?.short_name || e?.name || '—'
+// CHANGED: challan status filter. "Invoiced" = a freight expense (the
+// transporter's bill) is recorded against the challan.
+const STATUS_TABS = [
+  { value: 'uninvoiced', label: 'Uninvoiced' },
+  { value: 'invoiced',   label: 'Invoiced' },
+  { value: 'external',   label: 'External' },
+  { value: 'all',        label: 'All Challans' },
+]
+const STATUS_STYLE = {
+  uninvoiced: { label: 'Uninvoiced', bg: '#fff3cc', color: '#8a6200' },
+  invoiced:   { label: 'Invoiced',   bg: '#e8f3ec', color: '#15663a' },
+  external:   { label: 'External',   bg: '#e8eef3', color: '#3a5a78' },
+}
 
 export default function Challans() {
   const [invoices, setInvoices] = useState([])
@@ -27,6 +43,14 @@ export default function Challans() {
   const [loadError, setLoadError] = useState('')
   const [search, setSearch]     = useState('')
   const [missingOnly, setMissingOnly] = useState(false)
+  // CHANGED: status (default: only what is still pending), supplier and invoice-number filters
+  const { profile } = useAuth()
+  const canRevert = hasFullAccess(profile) // changing External back is for master / admin
+  const [statusFilter, setStatusFilter]           = useState('uninvoiced')
+  const [transporterFilter, setTransporterFilter] = useState([])
+  const [invoiceNoFilter, setInvoiceNoFilter]     = useState('')
+  const [extModal, setExtModal] = useState(null) // { inv, v, external, note, count }
+  const [extSaving, setExtSaving] = useState(false)
   // CHANGED: From / To entity, Order and Leg filters (multi-select — an empty
   // array means "all") plus an invoice-date range, same as the Invoices list.
   const [fromFilter, setFromFilter]   = useState([])
@@ -112,6 +136,39 @@ export default function Challans() {
     setConfirmRemove({ invId: inv.id, key: v._key, label: `${v.vehicle_no || 'this vehicle'}${v.challan_no ? ` (challan ${v.challan_no})` : ''} from ${inv.invoice_no || 'the invoice'}` })
   }
 
+  // CHANGED: mark a challan External (transport paid by someone else) or change it back.
+  // A challan that sits on several invoices is marked on all of them together.
+  function rowsOfChallan(v) {
+    const key = challanKey(v.challan_no, v.transporter_name)
+    if (!key) return v.id ? [v] : []
+    return dataRef.current.flatMap(inv => inv.vehicles).filter(x => x.id && challanKey(x.challan_no, x.transporter_name) === key)
+  }
+  function askExternal(inv, v, external) {
+    setExtModal({ inv, v, external, note: v.external_note || '', count: Math.max(1, rowsOfChallan(v).length) })
+  }
+  function confirmExternal() {
+    const m = extModal
+    setExtSaving(true)
+    enqueue(async () => {
+      const row = dataRef.current.find(i => i.id === m.inv.id)?.vehicles.find(x => x._key === m.v._key) || m.v
+      const ids = rowsOfChallan(row).map(x => x.id)
+      const { data, error } = await setRowsExternal({ ids, newRow: row.id ? null : row, external: m.external, note: m.note, userId: profile?.id })
+      setExtSaving(false)
+      if (error) return setToast({ message: saveErrorMessage(error), type: 'error' })
+      const byId = new Map((data || []).map(r => [r.id, r]))
+      apply(dataRef.current.map(inv => ({
+        ...inv,
+        vehicles: inv.vehicles.map(x => {
+          if (x.id && byId.has(x.id)) return { ...byId.get(x.id), _key: x._key }
+          if (!row.id && inv.id === m.inv.id && x._key === row._key && data?.[0]) return { ...data[0], _key: x._key } // the new row just created
+          return x
+        }),
+      })))
+      setExtModal(null)
+      setToast({ message: m.external ? 'Marked External' : 'Changed back — no longer External', type: 'success' })
+    })
+  }
+
   // How many invoices each challan covers — shown beside a shared challan.
   const invoiceCountByKey = useMemo(() => {
     const m = {}
@@ -130,12 +187,23 @@ export default function Challans() {
   const orderOptions = uniq(invoices.map(i => [i.order_id, i.orders?.description ? `${i.orders.name} · ${i.orders.description}` : i.orders?.name]))
   // Picking orders narrows the Leg list to those orders' legs.
   const legOptions   = uniq(invoices.filter(i => i.order_leg_id && (orderFilter.length === 0 || orderFilter.includes(i.order_id))).map(i => [i.order_leg_id, legLabel(i)]))
-  const anyFilter = fromFilter.length || toFilter.length || orderFilter.length || legFilter.length || dateFrom || dateTo
-  function clearFilters() { setFromFilter([]); setToFilter([]); setOrderFilter([]); setLegFilter([]); setDateFrom(''); setDateTo('') }
+  const transporterOptions = uniq(allRows.map(({ v }) => [clean(v.transporter_name).toLowerCase(), clean(v.transporter_name)]))
+  const anyFilter = fromFilter.length || toFilter.length || orderFilter.length || legFilter.length || transporterFilter.length || invoiceNoFilter || dateFrom || dateTo
+  function clearFilters() { setFromFilter([]); setToFilter([]); setOrderFilter([]); setLegFilter([]); setTransporterFilter([]); setInvoiceNoFilter(''); setDateFrom(''); setDateTo('') }
+
+  // CHANGED: status of every vehicle row, and how many rows sit in each status
+  const externalKeys = useMemo(() => externalKeySet(invoices), [invoices])
+  const statusOf = v => challanStatus(v, externalKeys, expLinks)
+  const statusCounts = { uninvoiced: 0, invoiced: 0, external: 0, all: allRows.length }
+  for (const { v } of allRows) statusCounts[statusOf(v)]++
 
   const q = search.trim().toLowerCase()
+  const invQ = invoiceNoFilter.trim().toLowerCase()
   const rows = allRows.filter(({ inv, v }) => {
+    if (statusFilter !== 'all' && statusOf(v) !== statusFilter) return false
     if (missingOnly && clean(v.challan_no)) return false
+    if (transporterFilter.length && !transporterFilter.includes(clean(v.transporter_name).toLowerCase())) return false
+    if (invQ && !(inv.invoice_no || '').toLowerCase().includes(invQ)) return false
     if (fromFilter.length  && !fromFilter.includes(inv.seller_entity_id)) return false
     if (toFilter.length    && !toFilter.includes(inv.buyer_entity_id)) return false
     if (orderFilter.length && !orderFilter.includes(inv.order_id)) return false
@@ -147,7 +215,8 @@ export default function Challans() {
       inv.orders?.name, v.vehicle_no, v.challan_no, v.transporter_name]
       .some(x => (x || '').toLowerCase().includes(q))
   })
-  const missingCount = allRows.filter(({ v }) => !clean(v.challan_no)).length
+  // "Challan missing" = still pending and no challan number typed yet (External rows are not waiting for one)
+  const missingCount = allRows.filter(({ v }) => !clean(v.challan_no) && statusOf(v) !== 'external').length
 
   const th = {
     padding: '8px 10px', textAlign: 'left', fontSize: '11px', fontWeight: 700, color: '#9a8a6a',
@@ -164,7 +233,7 @@ export default function Challans() {
             // CHANGED: CSV export of the vehicle rows on screen (after filters and search)
             const out = rows.map(({ inv, v }) => {
               const key = challanKey(v.challan_no, v.transporter_name)
-              return { invoice_no: inv.invoice_no || '', invoice_date: inv.invoice_date || '', order: inv.orders?.name || '', leg_no: legs[inv.order_leg_id] ?? '', from: entName(inv.seller), to: entName(inv.buyer), eway_bill_no: inv.eway_bill_no || '', eway_bill_date: inv.eway_bill_date || '', vehicle_no: v.vehicle_no || '', transporter: v.transporter_name || '', challan_no: v.challan_no || '', freight_expense: key && expLinks[key] ? expLinks[key].join(', ') : '' }
+              return { invoice_no: inv.invoice_no || '', invoice_date: inv.invoice_date || '', order: inv.orders?.name || '', leg_no: legs[inv.order_leg_id] ?? '', from: entName(inv.seller), to: entName(inv.buyer), eway_bill_no: inv.eway_bill_no || '', eway_bill_date: inv.eway_bill_date || '', vehicle_no: v.vehicle_no || '', transporter: v.transporter_name || '', challan_no: v.challan_no || '', status: STATUS_STYLE[statusOf(v)].label, freight_expense: key && expLinks[key] ? expLinks[key].join(', ') : '', external_note: v.external_note || '' }
             })
             if (!exportRows('challans', out)) setToast({ message: 'Nothing to export', type: 'error' })
           }}>↓ Export CSV</Btn>
@@ -176,7 +245,17 @@ export default function Challans() {
         <StatCard label='Vehicles' value={allRows.length.toLocaleString('en-IN')} />
         <StatCard label='Challan missing' value={missingCount.toLocaleString('en-IN')} color={missingCount ? C.warning : C.success}
           sub={missingOnly ? 'Showing only these — click to show all' : 'Click to show only these'}
-          onClick={() => setMissingOnly(m => !m)} />
+          onClick={() => { setMissingOnly(m => !m); setStatusFilter('uninvoiced') }} />
+      </div>
+
+      {/* CHANGED: status filter — Uninvoiced is the default view */}
+      <div style={{ display: 'flex', gap: '6px', marginBottom: '12px', flexWrap: 'wrap' }}>
+        {STATUS_TABS.map(t => (
+          <button key={t.value} type='button' onClick={() => setStatusFilter(t.value)} style={{
+            padding: '6px 14px', borderRadius: '999px', cursor: 'pointer', fontFamily: 'inherit', fontSize: '13px', fontWeight: statusFilter === t.value ? 700 : 500,
+            border: `1.5px solid ${statusFilter === t.value ? C.accent : C.border}`, background: statusFilter === t.value ? C.accent : C.surface, color: statusFilter === t.value ? '#fff' : C.textSoft,
+          }}>{t.label} <span style={{ opacity: 0.75 }}>({statusCounts[t.value].toLocaleString('en-IN')})</span></button>
+        ))}
       </div>
 
       <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
@@ -184,6 +263,9 @@ export default function Challans() {
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '220px', fontFamily: 'inherit' }} />
         <MultiSelectDropdown options={fromOptions} selected={fromFilter} onChange={setFromFilter} placeholder='All From Entities' capitalize={false} title='From (seller)' />
         <MultiSelectDropdown options={toOptions} selected={toFilter} onChange={setToFilter} placeholder='All To Entities' capitalize={false} title='To (buyer)' />
+        <MultiSelectDropdown options={transporterOptions} selected={transporterFilter} onChange={setTransporterFilter} placeholder='All suppliers' capitalize={false} title='Supplier / transporter' />
+        <input value={invoiceNoFilter} onChange={e => setInvoiceNoFilter(e.target.value)} placeholder='Invoice no' title='Filter by invoice number'
+          style={{ padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit', width: '130px' }} />
         <MultiSelectDropdown options={orderOptions} selected={orderFilter} onChange={setOrderFilter} placeholder='All orders' capitalize={false} />
         <MultiSelectDropdown options={legOptions} selected={legFilter} onChange={setLegFilter} placeholder='All legs' capitalize={false} />
         <input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} title='Invoice date from'
@@ -218,6 +300,7 @@ export default function Challans() {
                   <th style={th}>Vehicle No</th>
                   <th style={th}>Transporter</th>
                   <th style={th}>Challan No</th>
+                  <th style={th}>Status</th>
                   <th style={th}>Freight Expense</th>
                   <th style={th} />
                 </tr>
@@ -227,6 +310,8 @@ export default function Challans() {
                   const key = challanKey(v.challan_no, v.transporter_name)
                   const shared = key ? invoiceCountByKey[key] || 0 : 0
                   const exps = key ? expLinks[key] : null
+                  const status = statusOf(v)
+                  const st = STATUS_STYLE[status]
                   return (
                     <tr key={v._key} style={{ background: C.surfaceRaised }}>
                       <td style={{ ...td, whiteSpace: 'nowrap', opacity: first ? 1 : 0.55 }}>
@@ -243,8 +328,22 @@ export default function Challans() {
                         <InlineCell col='challan_no' warnEmpty value={v.challan_no} placeholder='Challan no' onCommit={val => commit(inv.id, v._key, 'challan_no', val)} />
                         {shared > 1 && <div style={{ fontSize: '11px', color: C.textMuted, marginTop: '2px' }}>Same challan on {shared} invoices</div>}
                       </td>
-                      <td style={{ ...td, fontSize: '12px', fontFamily: exps ? 'monospace' : 'inherit', color: exps ? C.text : C.textMuted }}>{exps ? exps.join(', ') : '—'}</td>
+                      <td style={{ ...td, whiteSpace: 'nowrap' }}>
+                        <span style={{ fontSize: '10px', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.03em', padding: '2px 7px', borderRadius: '4px', background: st.bg, color: st.color }}>{st.label}</span>
+                      </td>
+                      <td style={{ ...td, fontSize: '12px', fontFamily: exps ? 'monospace' : 'inherit', color: exps ? C.text : C.textMuted }}>
+                        {exps ? exps.join(', ') : status === 'external' ? (v.external_note || 'Paid by another party') : '—'}
+                      </td>
                       <td style={{ ...td, whiteSpace: 'nowrap', textAlign: 'right' }}>
+                        {/* CHANGED: External — transport paid by someone else, so no expense will be booked here */}
+                        {status === 'uninvoiced' && (
+                          <button type='button' title='Transport paid by the supplier or another party — no expense to book here' onClick={() => askExternal(inv, v, true)}
+                            style={{ background: 'none', border: 'none', color: C.textSoft, cursor: 'pointer', fontSize: '12px', fontFamily: 'inherit', padding: '2px 6px' }}>Mark External</button>
+                        )}
+                        {status === 'external' && canRevert && (
+                          <button type='button' title='Change back to a normal challan' onClick={() => askExternal(inv, v, false)}
+                            style={{ background: 'none', border: 'none', color: C.textSoft, cursor: 'pointer', fontSize: '12px', fontFamily: 'inherit', padding: '2px 6px' }}>Undo External</button>
+                        )}
                         <button type='button' title='Add another vehicle to this invoice' onClick={() => addVehicle(inv.id)}
                           style={{ background: 'none', border: 'none', color: C.accent, cursor: 'pointer', fontSize: '12px', fontFamily: 'inherit', padding: '2px 6px' }}>+ Vehicle</button>
                         {(v.id || inv.vehicles.length > 1) && (
@@ -270,6 +369,30 @@ export default function Challans() {
         message={`Remove ${confirmRemove?.label || 'this vehicle'}? Its challan number goes with it.`}
         onClose={() => setConfirmRemove(null)}
         onConfirm={() => { const c = confirmRemove; setConfirmRemove(null); if (c) remove(c.invId, c.key) }} />
+
+      {/* CHANGED: mark / un-mark External */}
+      <Modal open={!!extModal} onClose={() => setExtModal(null)} title={extModal?.external ? 'Mark as External' : 'Change back from External'} width={460}>
+        {extModal && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+            <div style={{ fontSize: '13px', color: C.textSoft, lineHeight: 1.6 }}>
+              {extModal.external
+                ? <>Use this when the supplier or another party paid the transport, so no freight expense will be recorded here. {clean(extModal.v.challan_no) ? <>Challan <b>{extModal.v.challan_no}</b></> : <>This vehicle ({extModal.v.vehicle_no || 'no vehicle number'}) on <b>{extModal.inv.invoice_no}</b></>} will leave the pending list and the challan list on freight expenses. It stays under the External filter.</>
+                : <>{clean(extModal.v.challan_no) ? <>Challan <b>{extModal.v.challan_no}</b></> : 'This vehicle'} will go back to the pending list and can be picked on a freight expense again.</>}
+              {extModal.count > 1 && <div style={{ marginTop: '6px', color: C.text }}>This challan is on {extModal.count} vehicle rows — all of them change together.</div>}
+            </div>
+            {extModal.external && (
+              <div>
+                <div style={{ fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '4px' }}>Who paid (optional)</div>
+                <Input value={extModal.note} onChange={e => setExtModal(m => ({ ...m, note: e.target.value }))} placeholder='e.g. Paid by supplier' />
+              </div>
+            )}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+              <Btn variant='ghost' onClick={() => setExtModal(null)}>Cancel</Btn>
+              <Btn onClick={confirmExternal} disabled={extSaving}>{extSaving ? 'Saving…' : extModal.external ? 'Mark External' : 'Change back'}</Btn>
+            </div>
+          </div>
+        )}
+      </Modal>
 
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </div>

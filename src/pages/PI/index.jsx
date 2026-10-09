@@ -10,7 +10,7 @@ import {
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, formatQty, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
-import { suggestNextNo } from '../../utils/numbering'
+import { nextDocNo } from '../../utils/numbering' // CHANGED: was suggestNextNo — now also honours entity-wise number formats
 import { cleanProductName, findProductByName, productKey } from '../../utils/products'
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import { calcLineTax } from '../../utils/tax'
@@ -256,7 +256,7 @@ function PIList({ refreshKey }) {
       if (dup) { setSaving(false); return setToast({ message: `PI number "${piNo}" is already in use`, type: 'error' }) }
     } else {
       const fromEntity = entities.find(e => e.id === form.from_entity_id)
-      piNo = await suggestNextNo({ table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromEntity?.short_name || fromEntity?.name, fyCode })
+      piNo = await nextDocNo({ docType: 'pi', entityId: form.from_entity_id, date: form.pi_date, table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromEntity?.short_name || fromEntity?.name, fyCode })
     }
     // CHANGED: financial_year_id does NOT exist on the live proforma_invoices
     // table (confirmed via information_schema — only pi_no, no FK column at all).
@@ -416,7 +416,7 @@ function PIList({ refreshKey }) {
       if (piNo) {
         if (usedPiNos.has(piNo.toLowerCase())) { errors.push(`PI ${meta.pi_date} ${meta.from_entity}→${meta.to_entity}: PI number "${piNo}" is already in use`); continue }
       } else {
-        piNo = await suggestNextNo({ table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromE.short_name || fromE.name, fyCode, excludeSet: usedPiNos })
+        piNo = await nextDocNo({ docType: 'pi', entityId: fromE.id, date: piDate, table: 'proforma_invoices', noCol: 'pi_no', entityShort: fromE.short_name || fromE.name, fyCode, excludeSet: usedPiNos })
       }
       usedPiNos.add(piNo.toLowerCase())
 
@@ -1003,7 +1003,7 @@ function PIDetail() {
             {editing&&<Btn size='sm' variant='ghost' onClick={()=>{setBulkCsvText('');setBulkCsvResult(null);setBulkCsvModal(true)}}>↑ Bulk Upload</Btn>}
             {!editing&&<Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing&&<Btn size='sm' variant='ghost' onClick={()=>setEditing(false)}>Discard</Btn>}
-            {editing&&<Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving?'Saving…':'Save Changes'}</Btn>}
+            {editing&&<Btn shortcut size='sm' onClick={handleSaveEdit} disabled={saving}>{saving?'Saving…':'Save Changes'}</Btn>}
             {!editing&&pi.status==='draft'&&<Btn size='sm' variant='ghost' onClick={()=>updateStatus('sent')}>Mark Sent</Btn>}
             {!editing&&pi.status==='sent'&&<Btn size='sm' variant='ghost' onClick={()=>updateStatus('accepted')}>Mark Accepted</Btn>}
             {canConvert&&<Btn size='sm' onClick={()=>navigate(`/invoices/new?from_pi=${id}`)}>Convert to Invoice</Btn>}

@@ -48,7 +48,8 @@ export default function InvoiceChallansModal({ invoiceId, onClose }) {
         const key = challanKey(row.challan_no, row.transporter_name)
         const veh = clean(row.vehicle_no)
         if (!key) { if (veh) noChallan.push(veh); continue }
-        if (!groups.has(key)) groups.set(key, { key, challan_no: clean(row.challan_no), transporter: clean(row.transporter_name), vehicles: [] })
+        if (!groups.has(key)) groups.set(key, { key, challan_no: clean(row.challan_no), transporter: clean(row.transporter_name), vehicles: [], external: false, note: '' })
+        if (row.is_external) { groups.get(key).external = true; groups.get(key).note = row.external_note || '' } // CHANGED: External challans
         if (veh && !groups.get(key).vehicles.includes(veh)) groups.get(key).vehicles.push(veh)
       }
       setInv(i.data); setChallans([...groups.values()]); setLoose(noChallan); setExpByKey(links.byKey || {})
@@ -99,7 +100,7 @@ export default function InvoiceChallansModal({ invoiceId, onClose }) {
             </div>
             <div>
               <div style={{ fontSize: '12px', fontWeight: 700, marginBottom: '6px' }}>Freight expense</div>
-              <div style={{ fontSize: '13px', color: expByKey[challan.key] ? C.text : C.warning }}>{expByKey[challan.key] ? expByKey[challan.key].join(', ') : 'No expense recorded against this challan yet'}</div>
+              <div style={{ fontSize: '13px', color: expByKey[challan.key] ? C.text : challan.external ? C.textSoft : C.warning }}>{expByKey[challan.key] ? expByKey[challan.key].join(', ') : challan.external ? `External — transport paid by another party${challan.note ? ` (${challan.note})` : ''}` : 'No expense recorded against this challan yet'}</div>
             </div>
             <div>
               <div style={{ fontSize: '12px', fontWeight: 700, marginBottom: '6px' }}>Invoices on this challan</div>
@@ -145,7 +146,7 @@ export default function InvoiceChallansModal({ invoiceId, onClose }) {
                           <td style={td}><button type='button' style={linkBtn} title='View challan details' onClick={() => setChallan(c)}>{c.challan_no}</button></td>
                           <td style={td}>{c.transporter || '—'}</td>
                           <td style={td}>{c.vehicles.join(', ') || '—'}</td>
-                          <td style={{ ...td, color: expByKey[c.key] ? C.text : C.warning }}>{expByKey[c.key] ? expByKey[c.key].join(', ') : 'No expense yet'}</td>
+                          <td style={{ ...td, color: expByKey[c.key] ? C.text : c.external ? C.textSoft : C.warning }}>{expByKey[c.key] ? expByKey[c.key].join(', ') : c.external ? `External${c.note ? ` — ${c.note}` : ''}` : 'No expense yet'}</td>
                         </tr>
                       ))}
                     </tbody>

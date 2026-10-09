@@ -48,7 +48,7 @@ export default function OrderTrail({ entities }) {
         fetchAllPages(() => excludeAutoPurchaseMirrors(supabase.from('invoices')
           .select('id,invoice_no,invoice_date,invoice_type,status,total_amount,eway_bill_no,order_id,order_leg_id,seller_entity_id,buyer_entity_id,' +
             'seller:seller_entity_id(name,short_name),buyer:buyer_entity_id(name,short_name),' +
-            'vehicles:invoice_vehicles(vehicle_no,challan_no,transporter_name)')
+            'vehicles:invoice_vehicles(vehicle_no,challan_no,transporter_name,is_external)')
           .eq('is_deleted', false).neq('status', 'cancelled')).order('invoice_date').order('id')),
         fetchAllPages(() => supabase.from('expense_challans').select('id,expense_id,challan_no,transporter_name').order('id')),
         fetchAllPages(() => supabase.from('expenses')
@@ -101,6 +101,10 @@ export default function OrderTrail({ entities }) {
       return `Shared bill — covers ${keys.size} challans${ords.size > 1 ? ` across ${ords.size} orders` : ''}`
     }
 
+    // CHANGED: External challans (transport paid by someone else) are not pending an expense
+    const externalKeys = new Set()
+    for (const inv of data.invoices) for (const v of inv.vehicles || []) { const k = challanKey(v.challan_no, v.transporter_name); if (v.is_external && k) externalKeys.add(k) }
+
     const q = search.trim().toLowerCase()
     const inDates = d => (!dateFrom || (d || '') >= dateFrom) && (!dateTo || (d || '') <= dateTo)
     const orderOk = id => orderFilter.length === 0 || orderFilter.includes(id || NO_ORDER)
@@ -125,7 +129,7 @@ export default function OrderTrail({ entities }) {
         const key = challanKey(v.challan_no, v.transporter_name)
         const veh = clean(v.vehicle_no)
         if (!key) { if (veh) loose.push(veh); continue }
-        if (!challans.has(key)) challans.set(key, { key, challan_no: clean(v.challan_no), transporter: clean(v.transporter_name), vehicles: [], expenses: [] })
+        if (!challans.has(key)) challans.set(key, { key, challan_no: clean(v.challan_no), transporter: clean(v.transporter_name), vehicles: [], expenses: [], external: externalKeys.has(key) })
         if (veh && !challans.get(key).vehicles.includes(veh)) challans.get(key).vehicles.push(veh)
       }
       const onInvoice = new Set()
@@ -151,7 +155,7 @@ export default function OrderTrail({ entities }) {
       node.legs.get(legKey).invoices.push({ inv, challans: [...challans.values()], loose, direct })
       node.invoiceCount++
       onInvoice.forEach(id => node.shown.add(id))
-      for (const c of challans.values()) { node.challanKeys.add(c.key); if (c.expenses.length === 0) node.unbilledKeys.add(c.key) }
+      for (const c of challans.values()) { node.challanKeys.add(c.key); if (c.expenses.length === 0 && !c.external) node.unbilledKeys.add(c.key) }
     }
 
     // Expenses tagged to an order only — not to one of its invoices, and not
@@ -213,7 +217,7 @@ export default function OrderTrail({ entities }) {
         let any = false
         for (const c of row.challans) {
           const cb = { ...b, challan_no: c.challan_no, transporter: c.transporter, vehicles: c.vehicles.join(', ') }
-          if (c.expenses.length === 0) rows.push({ ...cb, note: 'No expense on this challan' })
+          if (c.expenses.length === 0) rows.push({ ...cb, note: c.external ? 'External — transport paid by another party' : 'No expense on this challan' })
           for (const e of c.expenses) rows.push({ ...cb, ...exp(e, 'Challan') })
           any = true
         }
@@ -245,7 +249,7 @@ export default function OrderTrail({ entities }) {
 
   // The 5 expense-side cells of a detail line
   const expenseCells = (e, via) => {
-    if (!e) return <><td style={{ ...td, color: C.warning }}>{via || ''}</td><td style={td} /><td style={td} /><td style={{ ...td, ...num }} /><td style={td} /></>
+    if (!e) return <><td style={{ ...td, color: via === 'External' ? C.textSoft : C.warning }}>{via || ''}</td><td style={td} /><td style={td} /><td style={{ ...td, ...num }} /><td style={td} /></>
     const note = tree.sharedNote(e)
     return (
       <>
@@ -287,7 +291,7 @@ export default function OrderTrail({ entities }) {
       first = false
     }
     for (const c of challans) {
-      if (c.expenses.length === 0) push(`${inv.id}|${c.key}`, challanCells(c, true), expenseCells(null, 'No expense yet'))
+      if (c.expenses.length === 0) push(`${inv.id}|${c.key}`, challanCells(c, true), expenseCells(null, c.external ? 'External' : 'No expense yet'))
       c.expenses.forEach((e, i) => push(`${inv.id}|${c.key}|${e.id}`, challanCells(c, i === 0), expenseCells(e)))
     }
     for (const e of direct) push(`${inv.id}|d|${e.id}`, <><td style={{ ...td, color: C.textMuted }}>—</td><td style={td}>{loose.join(', ')}</td></>, expenseCells(e, 'Tagged to the invoice'))

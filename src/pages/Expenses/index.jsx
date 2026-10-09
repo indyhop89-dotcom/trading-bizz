@@ -189,8 +189,10 @@ export default function Expenses() {
   const editChallanRows = editingExpense ? (challanLinks.rowsByExpense[editingExpense.id] || []) : []
   // What the picker lists: every challan on an invoice, plus any tagged on
   // this expense that no longer sits on an invoice.
+  // CHANGED: External challans (transport paid by someone else) are left out —
+  // unless one is already tagged on the expense being edited.
   const pickerGroups = [
-    ...challanGroups,
+    ...challanGroups.filter(g => !g.external || editChallanRows.some(r => r.key === g.key)),
     ...editChallanRows.filter(r => !challanGroups.some(g => g.key === r.key))
       .map(r => ({ ...r, vehicles: [], invoices: [], orders: [] })),
   ]

@@ -12,6 +12,8 @@ import { supabase } from '../supabaseClient'
 import { fetchAllPages } from './query'
 
 export const VEHICLE_FIELDS = ['vehicle_no', 'transporter_name', 'challan_no']
+// CHANGED: is_external / external_note — see 062_external_challans.sql
+const VEHICLE_COLUMNS = 'id,invoice_id,vehicle_no,challan_no,transporter_name,created_at,is_external,external_note'
 
 export function clean(v) { return (v ?? '').toString().trim() }
 
@@ -63,7 +65,7 @@ export function saveErrorMessage(error) {
 
 export async function fetchInvoiceVehicles(invoiceId) {
   return supabase.from('invoice_vehicles')
-    .select('id,invoice_id,vehicle_no,challan_no,transporter_name,created_at')
+    .select(VEHICLE_COLUMNS)
     .eq('invoice_id', invoiceId).order('created_at').order('id')
 }
 
@@ -73,11 +75,11 @@ export async function saveVehicleField(invoiceId, row, field, value) {
   const v = clean(value) || null
   if (row.id) {
     return supabase.from('invoice_vehicles').update({ [field]: v, updated_at: new Date() }).eq('id', row.id)
-      .select('id,invoice_id,vehicle_no,challan_no,transporter_name,created_at').single()
+      .select(VEHICLE_COLUMNS).single()
   }
   if (!v) return { data: null, error: null }
   return supabase.from('invoice_vehicles').insert({ invoice_id: invoiceId, [field]: v })
-    .select('id,invoice_id,vehicle_no,challan_no,transporter_name,created_at').single()
+    .select(VEHICLE_COLUMNS).single()
 }
 
 export async function deleteVehicleRow(id) {
@@ -91,7 +93,7 @@ export async function fetchChallanBoard() {
   const { data, error } = await fetchAllPages(() => supabase.from('invoices')
     .select('id,invoice_no,invoice_date,status,eway_bill_no,eway_bill_date,order_id,order_leg_id,seller_entity_id,buyer_entity_id,' +
       'seller:seller_entity_id(name,short_name),buyer:buyer_entity_id(name,short_name),orders(name,description),' +
-      'vehicles:invoice_vehicles(id,invoice_id,vehicle_no,challan_no,transporter_name,created_at)')
+      `vehicles:invoice_vehicles(${VEHICLE_COLUMNS})`)
     .eq('invoice_type', 'sales').eq('is_deleted', false).neq('status', 'cancelled')
     .not('eway_bill_no', 'is', null)
     .order('invoice_date', { ascending: false }).order('id'))
@@ -113,9 +115,10 @@ export function groupChallans(invoices) {
       if (!key) continue
       let g = groups.get(key)
       if (!g) {
-        g = { key, challan_no: clean(v.challan_no), transporter_name: clean(v.transporter_name), vehicles: [], invoices: [], orders: [] }
+        g = { key, challan_no: clean(v.challan_no), transporter_name: clean(v.transporter_name), vehicles: [], invoices: [], orders: [], external: false }
         groups.set(key, g)
       }
+      if (v.is_external) g.external = true // CHANGED: marked External on any of its rows
       const veh = clean(v.vehicle_no)
       if (veh && !g.vehicles.some(x => x.toLowerCase() === veh.toLowerCase())) g.vehicles.push(veh)
       if (!g.invoices.some(i => i.id === inv.id)) {
@@ -127,6 +130,51 @@ export function groupChallans(invoices) {
     }
   }
   return [...groups.values()]
+}
+
+// ── External challans ───────────────────────────────────────────────────────
+// CHANGED: a challan is External when transport was paid by someone else, so
+// no freight expense is booked for it here. Status of a vehicle row:
+//   external    marked External (on this row, or on any row with the same challan)
+//   invoiced    a freight expense is recorded against its challan
+//   uninvoiced  everything else — including rows still waiting for a challan number
+export function externalKeySet(invoices) {
+  const keys = new Set()
+  for (const inv of invoices || []) for (const v of inv.vehicles || []) {
+    const key = challanKey(v.challan_no, v.transporter_name)
+    if (v.is_external && key) keys.add(key)
+  }
+  return keys
+}
+export function challanStatus(v, externalKeys, expenseLinks) {
+  const key = challanKey(v.challan_no, v.transporter_name)
+  if (v.is_external || (key && externalKeys.has(key))) return 'external'
+  return key && expenseLinks?.[key]?.length ? 'invoiced' : 'uninvoiced'
+}
+
+// Marks (or un-marks) vehicle rows as External. `ids` = saved rows to update;
+// `newRow` = a row not saved yet (no id) that is created already marked.
+export async function setRowsExternal({ ids, newRow, external, note, userId }) {
+  const patch = {
+    is_external: !!external,
+    external_note: external ? (clean(note) || null) : null,
+    external_marked_at: external ? new Date() : null,
+    external_marked_by: external ? (userId || null) : null,
+    updated_at: new Date(),
+  }
+  if (ids?.length) {
+    const { data, error } = await supabase.from('invoice_vehicles').update(patch).in('id', ids).select(VEHICLE_COLUMNS)
+    if (error) return { data: null, error }
+    if (!data?.length) return { data: null, error: { code: 'PGRST116' } } // no rights — see saveErrorMessage
+    return { data, error: null }
+  }
+  if (newRow && external) {
+    const { data, error } = await supabase.from('invoice_vehicles')
+      .insert({ invoice_id: newRow.invoice_id, vehicle_no: clean(newRow.vehicle_no) || null, challan_no: clean(newRow.challan_no) || null, transporter_name: clean(newRow.transporter_name) || null, ...patch })
+      .select(VEHICLE_COLUMNS)
+    return { data, error }
+  }
+  return { data: [], error: null }
 }
 
 // Invoices and orders behind a set of selected challans (deduped).

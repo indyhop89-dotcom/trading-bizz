@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import Sidebar, { NAV } from './Sidebar'
 import NotificationBell from '../NotificationBell'
+import { useCtrlEnter } from '../../utils/ctrlEnter' // CHANGED: Ctrl+Enter = save / run report
 
 // ─── Route → breadcrumb label map ────────────────────────────────────────────
 const ROUTE_LABELS = {
@@ -134,6 +135,7 @@ function CommandPalette({ open, onClose }) {
 export default function Layout({ children }) {
   const location = useLocation()
   const navigate = useNavigate()
+  useCtrlEnter() // CHANGED: Ctrl+Enter presses the screen's Save / Run Report button
 
   // Sidebar collapsed state — persisted in localStorage
   const [collapsed, setCollapsed] = useState(() => {

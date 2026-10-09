@@ -113,6 +113,7 @@ export function Modal({ open, onClose, title, width = 640, children, zIndex = 10
 
   return (
     <div
+      data-modal=''
       onClick={e => { if (e.target === e.currentTarget) onClose() }}
       style={{
         position: 'fixed', inset: 0,
@@ -240,7 +241,8 @@ export function EmptyState({ icon = '📋', title, message, action }) {
 }
 
 // ─── Btn ──────────────────────────────────────────────────────────────────────
-export function Btn({ children, onClick, variant = 'primary', size = 'md', disabled, type = 'button', style: extraStyle }) {
+// CHANGED: `shortcut` marks the button Ctrl+Enter presses on its page (see utils/ctrlEnter.js).
+export function Btn({ children, onClick, variant = 'primary', size = 'md', disabled, type = 'button', style: extraStyle, shortcut = false }) {
   const base = {
     border: 'none', cursor: disabled ? 'not-allowed' : 'pointer',
     fontFamily: 'var(--font-sans)', fontWeight: 600, letterSpacing: '0.01em',
@@ -279,6 +281,8 @@ export function Btn({ children, onClick, variant = 'primary', size = 'md', disab
       type={type}
       disabled={disabled}
       onClick={onClick}
+      data-variant={variant}
+      data-ctrl-enter={shortcut ? '' : undefined}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
@@ -382,6 +386,11 @@ export function Select({ value, onChange, children, disabled, style: extra }) {
 export function MultiSelectDropdown({ options, selected, onChange, placeholder = 'All', style: extra, capitalize = true, disabled = false, title, floating = false }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
+  // CHANGED: type to find — a search box at the top of the list filters the
+  // options as you type; Enter ticks the first match. Cleared when the list closes.
+  const [query, setQuery] = useState('')
+  const searchRef = useRef(null)
+  useEffect(() => { if (open) searchRef.current?.focus(); else setQuery('') }, [open])
   // CHANGED: `floating` (optional) — pins the option list to the viewport
   // instead of the parent, so it is not cut off when the dropdown sits inside
   // a scrolling/clipped container such as a table's filter row. It closes on
@@ -411,6 +420,9 @@ export function MultiSelectDropdown({ options, selected, onChange, placeholder =
     onChange([...next])
   }
 
+  const needle = query.trim().toLowerCase()
+  const shown = needle ? options.filter(o => String(norm(o).label ?? '').toLowerCase().includes(needle)) : options
+
   const label = selected.length === 0 ? placeholder
     : selected.length === 1 ? norm(options.find(o => norm(o).value === selected[0]) || selected[0]).label
     : `${selected.length} selected`
@@ -438,7 +450,15 @@ export function MultiSelectDropdown({ options, selected, onChange, placeholder =
               Clear all
             </div>
           )}
-          {options.map(opt => {
+          {/* CHANGED: type to find */}
+          <input ref={searchRef} autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder='Type to search…'
+            onKeyDown={e => {
+              if (e.key === 'Escape') { e.stopPropagation(); setOpen(false) }
+              if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey && shown.length) { e.preventDefault(); toggle(norm(shown[0]).value) }
+            }}
+            style={{ width: '100%', boxSizing: 'border-box', padding: '6px 8px', marginBottom: '4px', border: `1px solid var(--border)`, borderRadius: '4px', background: 'var(--surface-raised)', fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+          {shown.length === 0 && <div style={{ padding: '6px 8px', fontSize: '12px', color: 'var(--text-muted)' }}>No match</div>}
+          {shown.map(opt => {
             const { value, label } = norm(opt)
             return (
               <label key={value} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 8px', fontSize: '13px', cursor: 'pointer', borderRadius: '4px', textTransform: capitalize ? 'capitalize' : 'none', whiteSpace: 'nowrap' }}>

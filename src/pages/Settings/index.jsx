@@ -12,6 +12,7 @@ import { formatSlabSummary } from '../../utils/hsn'
 import { downloadTemplate, detectDelimiter } from '../../utils/csvTemplate'
 import { useAuth } from '../../hooks/useAuth'
 import { hasFullAccess } from '../../utils/roles'
+import InvoiceFormats from './InvoiceFormats' // CHANGED: preview / rename / assign invoice formats
 import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
 
 // REBUILT — this file was found to contain a copy of the Invoices module
@@ -21,7 +22,7 @@ import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/va
 // existing hsn_master CSV template format already defined in csvTemplate.js.
 // If a better version turns up in git history, prefer that over this file.
 
-const TABS = ['My Profile', 'Financial Years', 'Entity Groups', 'HSN Master', 'Parties', 'Users']
+const TABS = ['My Profile', 'Financial Years', 'Entity Groups', 'HSN Master', 'Parties', 'Invoice Formats', 'Users'] // CHANGED: Invoice Formats
 
 // ─── Row Actions Menu ───────────────────────────────────────────────────────────
 // A dropdown rendered via a portal into document.body, positioned by the
@@ -1415,6 +1416,7 @@ export default function Settings() {
       {tab === 'Entity Groups'   && <EntityGroups />}
       {tab === 'HSN Master'      && <HsnMaster />}
       {tab === 'Parties'         && <Parties />}
+      {tab === 'Invoice Formats' && <InvoiceFormats />}
       {tab === 'Users'           && <Users />}
     </div>
   )

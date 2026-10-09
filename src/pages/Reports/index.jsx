@@ -181,7 +181,7 @@ function PLReport({ entities, fys, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={!entityId || loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -345,7 +345,7 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={!entityId || loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -567,7 +567,7 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={!entityId || loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -787,7 +787,7 @@ function Ledger({ entities, fys, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={!ourEntityId || loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={!ourEntityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !ourEntityId ? 'not-allowed' : 'pointer', opacity: !ourEntityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -892,7 +892,7 @@ function ProfitabilityReport({ entities, fys }) {
             <option value='group'>Group</option>
           </Select>
         </FormRow>
-        <button onClick={runReport} disabled={loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -1120,7 +1120,7 @@ function MarginReport({ entities, fys, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} toHint='Bounds the purchase side; matching sales are found regardless of date' />
-        <button onClick={runReport} disabled={!entityId || loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -1245,7 +1245,7 @@ function ActualStockReport({ entities, defaultEntityId }) {
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo}
           toHint="Stock position is a snapshot — only 'To Date' applies, used as the as-of date." />
-        <button onClick={runReport} disabled={loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -1354,7 +1354,7 @@ function StockMovementReport({ entities }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -1435,7 +1435,7 @@ function MissingProductReport() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -1597,7 +1597,7 @@ function AgeingReport({ entities, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={!entityId || loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={!entityId || loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: !entityId ? 'not-allowed' : 'pointer', opacity: !entityId ? 0.5 : 1, fontFamily: 'inherit' }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
@@ -1715,7 +1715,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={loading}
+        <button data-ctrl-enter='' title='Ctrl+Enter' onClick={runReport} disabled={loading}
           style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1 }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>

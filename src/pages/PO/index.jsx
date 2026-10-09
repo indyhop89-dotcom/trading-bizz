@@ -10,7 +10,7 @@ import {
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import { formatINR, formatQty, toNum, round2, roundRupees } from '../../utils/money'
 import { fmtDate, today, currentFYLabel, parseFlexibleDate, fyCodeForDate } from '../../utils/dates'
-import { suggestNextNo } from '../../utils/numbering'
+import { nextDocNo } from '../../utils/numbering' // CHANGED: was suggestNextNo — now also honours entity-wise number formats
 import { buildHSNMap, resolveGSTRate } from '../../utils/hsn'
 import { calcLineTax } from '../../utils/tax'
 import { withTimeout } from '../../utils/query'
@@ -262,7 +262,7 @@ function POList({ refreshKey }) {
       if (dup) { setSaving(false); return setToast({ message: `PO number "${poNo}" is already in use`, type: 'error' }) }
     } else {
       const buyerEntity = entities.find(e => e.id === form.buyer_entity_id)
-      poNo = await suggestNextNo({ table: 'purchase_orders', noCol: 'po_no', entityShort: buyerEntity?.short_name || buyerEntity?.name, fyCode })
+      poNo = await nextDocNo({ docType: 'po', entityId: form.buyer_entity_id, date: form.po_date, table: 'purchase_orders', noCol: 'po_no', entityShort: buyerEntity?.short_name || buyerEntity?.name, fyCode })
     }
     // CHANGED: financial_year_id does NOT exist on the live purchase_orders
     // table (confirmed via information_schema).
@@ -430,7 +430,7 @@ function POList({ refreshKey }) {
       if (poNo) {
         if (usedPoNos.has(poNo.toLowerCase())) { errors.push(`PO ${meta.po_date} ${meta.buyer_entity}→${meta.seller_entity}: PO number "${poNo}" is already in use`); continue }
       } else {
-        poNo = await suggestNextNo({ table: 'purchase_orders', noCol: 'po_no', entityShort: buyerE.short_name || buyerE.name, fyCode, excludeSet: usedPoNos })
+        poNo = await nextDocNo({ docType: 'po', entityId: buyerE.id, date: poDate, table: 'purchase_orders', noCol: 'po_no', entityShort: buyerE.short_name || buyerE.name, fyCode, excludeSet: usedPoNos })
       }
       usedPoNos.add(poNo.toLowerCase())
 
@@ -965,7 +965,7 @@ function PODetail() {
             <Btn size='sm' variant='ghost' onClick={handleDownloadExcel} disabled={!!docBusy}>{docBusy==='excel'?'Generating…':'↓ Download Excel'}</Btn>
             {!editing && <Btn size='sm' variant='ghost' onClick={startEdit}>✏ Edit</Btn>}
             {editing && <Btn size='sm' variant='ghost' onClick={() => setEditing(false)}>Discard</Btn>}
-            {editing && <Btn size='sm' onClick={handleSaveEdit} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
+            {editing && <Btn shortcut size='sm' onClick={handleSaveEdit} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</Btn>}
             {!editing && po.status === 'open' && <Btn size='sm' variant='ghost' onClick={() => updateStatus('completed')}>Mark Completed</Btn>}
             {!editing && !['cancelled','completed'].includes(po.status) && <Btn size='sm' variant='ghost' onClick={() => setConfirmCancel(true)} style={{ color: C.danger }}>Cancel</Btn>}
             {!editing && canDelete && <Btn size='sm' variant='danger' onClick={() => setConfirmDelete(true)} disabled={deleting}>{deleting?'Deleting…':'Delete'}</Btn>}

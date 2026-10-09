@@ -100,10 +100,10 @@ const ENTITY_THEMES = {
 // 'tally' is the Kirti Sales format and is the default for any entity that has
 // no format of its own.
 export const DOCUMENT_FORMATS = [
-  { value: 'tally',    label: 'Tally style (Kirti Sales format)' },
-  { value: 'vananam',  label: 'VRVPL style' },
-  { value: 'srpl',     label: 'SRPL style' },
-  { value: 'kamakhya', label: 'Kamakhya style' },
+  { value: 'tally',    label: 'Tally style (Kirti Sales format)', builtFor: 'Kirti Sales and Services, MVL' },
+  { value: 'vananam',  label: 'VRVPL style',                      builtFor: 'Vananam Retail Ventures (VRVPL)' },
+  { value: 'srpl',     label: 'SRPL style',                       builtFor: 'Siddhidhatri Retail (SRPL)' },
+  { value: 'kamakhya', label: 'Kamakhya style',                   builtFor: 'Kamakhya Loyalties' },
 ]
 export const DEFAULT_DOCUMENT_FORMAT = 'tally'
 

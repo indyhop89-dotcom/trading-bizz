@@ -9,7 +9,10 @@ import { GST_STATES } from '../../constants/states'
 import { downloadTemplate } from '../../utils/csvTemplate'
 import { uploadFileToDrive, deleteFileFromDrive, getDriveViewUrl } from '../../utils/drive'
 import { isValidGSTIN, isValidPAN, GSTIN_ERROR, PAN_ERROR } from '../../utils/validation'
-import { DOCUMENT_FORMATS, automaticFormatLabel } from '../../utils/entityDocumentThemes' // CHANGED: invoice format picker
+import { DOCUMENT_FORMATS } from '../../utils/entityDocumentThemes' // CHANGED: invoice format picker
+import { fetchFormatNames, formatName, automaticFormatKey } from '../../utils/documentFormats' // CHANGED: formats show their renamed names
+import NumberingSettings from '../../components/NumberingSettings' // CHANGED: entity-wise numbering
+import { finalizeNumbering, suggestedNumbering } from '../../utils/numbering'
 
 const ENTITY_TYPES = ['group', 'associate', 'external']
 
@@ -21,6 +24,7 @@ const EMPTY_FORM = {
   logo_url: '', logo_file_id: '',
   terms_and_conditions: '',
   document_format: '', // CHANGED: print format for PI / PO / Tax Invoice — blank = automatic
+  numbering: null,     // CHANGED: per-document number formats — null = standard numbering
   reliance_vendor_id: '', reliance_sales_id: '',
   reliance_onboarded: false, reliance_notes: '',
   is_active: true,
@@ -37,6 +41,9 @@ export default function Entities() {
   const [form, setForm]           = useState(EMPTY_FORM)
   const [saving, setSaving]       = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(null)
+  // CHANGED: custom names given to the invoice formats in Settings → Invoice Formats
+  const [formatNames, setFormatNames] = useState({})
+  useEffect(() => { fetchFormatNames().then(setFormatNames) }, [])
   const [toast, setToast]         = useState(null)
   // CHANGED: CSV upload state
   const [csvResult, setCsvResult] = useState(null)   // { added, skipped, errors }
@@ -63,7 +70,8 @@ export default function Entities() {
 
   function openNew() {
     setEditing(null)
-    setForm(EMPTY_FORM)
+    // CHANGED: a new entity starts with its own number format suggested for every document type
+    setForm({ ...EMPTY_FORM, numbering: suggestedNumbering() })
     setLogoPreview('')
     setModalOpen(true)
   }
@@ -92,6 +100,7 @@ export default function Entities() {
       logo_file_id:       entity.logo_file_id || '',
       terms_and_conditions: entity.terms_and_conditions || '',
       document_format: entity.document_format || '',
+      numbering: entity.numbering || null,
       reliance_vendor_id: entity.reliance_vendor_id || '',
       reliance_sales_id:  entity.reliance_sales_id || '',
       reliance_onboarded: entity.reliance_onboarded || false,
@@ -151,6 +160,7 @@ export default function Entities() {
     const payload = { ...form }
     if (!payload.group_id) delete payload.group_id
     payload.document_format = payload.document_format || null // CHANGED: blank = automatic
+    payload.numbering = finalizeNumbering(payload.numbering, payload.short_name || payload.name) // CHANGED: number formats
 
     let error
     if (editing) {
@@ -395,15 +405,22 @@ export default function Entities() {
 
           <SectionDivider label='Documents' />
           {/* CHANGED: print format for this entity's PI / PO / Tax Invoice */}
-          <FormRow label='Invoice Format' hint='The layout used when this entity prints or downloads a Proforma Invoice, Purchase Order or Tax Invoice. Its own name, address, GSTIN, bank details and logo are filled in automatically.'>
+          <FormRow label='Invoice Format' hint='The layout used when this entity prints or downloads a Proforma Invoice, Purchase Order or Tax Invoice. Its own name, address, GSTIN, bank details and logo are filled in automatically. Preview and rename formats in Settings → Invoice Formats.'>
             <Select value={form.document_format} onChange={e => setF('document_format', e.target.value)}>
-              <option value=''>Automatic — {automaticFormatLabel(form.gstin)}</option>
-              {DOCUMENT_FORMATS.map(f => <option key={f.value} value={f.value}>{f.label}</option>)}
+              <option value=''>Automatic — {formatName(automaticFormatKey(form.gstin), formatNames)}</option>
+              {DOCUMENT_FORMATS.map(f => <option key={f.value} value={f.value}>{formatName(f.value, formatNames)}</option>)}
             </Select>
           </FormRow>
           <FormRow label='Terms & Conditions' hint='Printed on every PI/PO/Tax Invoice this entity issues — leave blank to omit it from the document'>
             <Textarea value={form.terms_and_conditions} onChange={e => setF('terms_and_conditions', e.target.value)} rows={3} />
           </FormRow>
+
+          {/* CHANGED: entity-wise document numbering */}
+          <SectionDivider label='Document Numbering' />
+          <div style={{ fontSize: '12px', color: C.textSoft, marginBottom: '10px' }}>
+            Tick a document to give it this entity's own number format. It is used when a new document is created with its number left blank; numbers already issued are never changed.
+          </div>
+          <NumberingSettings value={form.numbering} onChange={v => setF('numbering', v)} shortName={form.short_name || form.name} />
 
           <SectionDivider label='Reliance Portal' />
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
