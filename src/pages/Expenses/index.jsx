@@ -102,6 +102,11 @@ export default function Expenses() {
   const [tab, setTab]           = useState('Expenses') // CHANGED: Expenses / Party Payments / Summary
   const [search, setSearch]     = useState('')
   const [typeFilter, setType]   = useState([]) // CHANGED: multi-select — empty means all types
+  // CHANGED: entity + order multi-select and a from/to date range, same as the other list pages
+  const [entityFilter, setEntityFilter] = useState([])
+  const [orderFilter, setOrderFilter]   = useState([])
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo]     = useState('')
   const [modalOpen, setModalOpen] = useState(false)
   const [form, setForm]         = useState(EMPTY)
   const [saving, setSaving]     = useState(false)
@@ -424,9 +429,6 @@ export default function Expenses() {
     load()
   }
 
-  const totalUnpaid = expenses.filter(e => e.status === 'unpaid').reduce((s, e) => s + e.total_amount, 0)
-  const totalPaid   = expenses.filter(e => e.status === 'paid').reduce((s, e) => s + e.total_amount, 0)
-
   const filtered = expenses.filter(e => {
     // CHANGED: search also matches the vendor invoice number and the system number
     const q = search.toLowerCase()
@@ -434,8 +436,20 @@ export default function Expenses() {
       || (e.vendor_invoice_no || '').toLowerCase().includes(q) || (e.expense_no || '').toLowerCase().includes(q)
     // CHANGED: the type lives in expense_type on the live table
     const mt = typeFilter.length === 0 || typeFilter.includes(e.expense_type || e.category)
-    return ms && mt // CHANGED: removed dateFrom/dateTo (undeclared state; date filter not in UI)
+    // CHANGED: entity / order multi-select + expense-date range
+    const me = entityFilter.length === 0 || entityFilter.includes(e.entity_id)
+    const mo = orderFilter.length === 0 || orderFilter.includes(e.order_id)
+    const md = (!dateFrom || (e.expense_date || '') >= dateFrom) && (!dateTo || (e.expense_date || '') <= dateTo)
+    return ms && mt && me && mo && md
   })
+  // CHANGED: the Unpaid / Paid cards follow the filters, so they total what the list shows
+  const totalUnpaid = filtered.filter(e => e.status === 'unpaid').reduce((s, e) => s + e.total_amount, 0)
+  const totalPaid   = filtered.filter(e => e.status === 'paid').reduce((s, e) => s + e.total_amount, 0)
+  // Filter choices: only entities and orders that actually have an expense
+  const entityOptions = entities.filter(en => expenses.some(e => e.entity_id === en.id)).map(en => ({ value: en.id, label: en.short_name || en.name }))
+  const orderOptions  = orders.filter(o => expenses.some(e => e.order_id === o.id)).map(o => ({ value: o.id, label: o.name }))
+  const anyFilter = typeFilter.length || entityFilter.length || orderFilter.length || dateFrom || dateTo
+  function clearFilters() { setType([]); setEntityFilter([]); setOrderFilter([]); setDateFrom(''); setDateTo('') }
 
   // CHANGED: multi-select + bulk/single soft-delete, same shape as PI/PO/Invoices
   function toggleSelect(id) {
@@ -533,10 +547,17 @@ export default function Expenses() {
         <StatCard label='Paid'   value={formatINR(totalPaid)} color={C.success} />
       </div>
 
-      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
-        <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search description, entity…'
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search vendor invoice no, description, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
+        <MultiSelectDropdown options={entityOptions} selected={entityFilter} onChange={setEntityFilter} placeholder='All entities' capitalize={false} />
         <MultiSelectDropdown options={categories} selected={typeFilter} onChange={setType} placeholder='All types' capitalize={false} />
+        <MultiSelectDropdown options={orderOptions} selected={orderFilter} onChange={setOrderFilter} placeholder='All orders' capitalize={false} />
+        <input type='date' value={dateFrom} onChange={e => setDateFrom(e.target.value)} title='Expense date from'
+          style={{ padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+        <input type='date' value={dateTo} onChange={e => setDateTo(e.target.value)} title='Expense date to'
+          style={{ padding: '8px 10px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', fontFamily: 'inherit' }} />
+        {!!anyFilter && <Btn size='sm' variant='ghost' onClick={clearFilters}>Clear filters</Btn>}
         <Btn variant='ghost' onClick={() => { if (!exportRows('expenses', filtered, e => ({ type: e.expense_type || e.category || '', challans: (challanLinks.byExpense[e.id] || []).join(', ') }))) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
       </div>
 
