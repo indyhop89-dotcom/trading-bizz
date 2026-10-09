@@ -9,12 +9,13 @@ import { fetchActualStockPosition } from '../../utils/stock'
 import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
 import { matchPurchasesToSales, calcMarginPct } from '../../utils/margin'
 import { downloadCSV } from '../../utils/csvTemplate'
+import OrderTrail from './OrderTrail' // CHANGED: order → leg → invoice → challan → expense drill-down
 
 // CHANGED: "Compliance" is one tab in the main row, sitting next to Party
 // Ledger. Selecting it reveals a second-level sub-tab row for its two
 // reports (GST Summary, TDS/TCS Report) rather than splitting the main row
 // into groups.
-const TABS = ['P&L', 'Party Ledger', 'Compliance', 'Ledger', 'Profitability', 'Margin Report', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing']
+const TABS = ['P&L', 'Party Ledger', 'Compliance', 'Ledger', 'Profitability', 'Margin Report', 'Actual Stock', 'Stock Movements', 'Missing Products', 'Ageing', 'Order Trail'] // CHANGED: Order Trail — order → leg → invoice → challan → expense drill-down
 const COMPLIANCE_TABS = ['GST Summary', 'TDS/TCS Report']
 
 // 'YYYY-MM' → 'Jul 2026' for the month-wise GST table
@@ -1637,8 +1638,8 @@ function AgeingReport({ entities, defaultEntityId }) {
 }
 
 // ─── Party Ledger ───────────────────────────────────────────────────────────────
-// A vendor ledger for a party from the global parties master, scoped to one of
-// our entities: expenses booked (what we owe) vs party_payments (what we paid),
+// A vendor ledger for parties from the global parties master, across one or
+// more of our entities: expenses booked (what we owe) vs party_payments (what we paid),
 // with a running outstanding balance. Distinct from the entity-vs-entity Ledger.
 function PartyLedger({ entities, parties, fys, defaultEntityId }) {
   // CHANGED: entity and party are multi-select. Nothing ticked = all of them
@@ -1855,6 +1856,7 @@ export default function Reports() {
       {tab === 'Stock Movements' && <StockMovementReport entities={entities} />}
       {tab === 'Missing Products' && <MissingProductReport />}
       {tab === 'Ageing'      && <AgeingReport entities={entities} defaultEntityId={defaultEntityId} />}
+      {tab === 'Order Trail' && <OrderTrail entities={entities} />}
     </div>
   )
 }
