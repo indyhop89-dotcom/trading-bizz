@@ -179,15 +179,15 @@ export default function Expenses() {
     setForm({ ...EMPTY, entity_id: defaultEntityId })
     setModalOpen(true)
   }
-  // CHANGED: load an existing expense into the form. `category` is the column
-  // the save writes; expense_type is read as a fallback for older rows.
+  // CHANGED: load an existing expense into the form. expense_type is the
+  // live column the save writes.
   function openEdit(e) {
     setEditingExpense(e)
     setSelChallans((challanLinks.rowsByExpense[e.id] || []).map(r => r.key))
     setForm({
       ...EMPTY,
       expense_date: e.expense_date || today(), entity_id: e.entity_id || '',
-      expense_type: e.category || e.expense_type || '',
+      expense_type: e.expense_type || e.category || '',
       description: e.description || '', amount: e.amount ?? '',
       gst_rate: e.gst_rate ?? 0, is_rcm: !!e.is_rcm, rcm_gst_rate: e.rcm_gst_rate ?? '',
       vendor_entity_id: e.vendor_entity_id || '', vendor_name: e.vendor_name || '', vendor_gstin: e.vendor_gstin || '',
@@ -356,10 +356,13 @@ export default function Expenses() {
     const total_amount   = amount + gst_amount   // vendor payable — RCM GST never added here
     const rcm_gst_amount = form.is_rcm ? roundRupees(round2(amount * Number(form.rcm_gst_rate) / 100)) : 0
     const payload = {
-      ...(isEdit ? {} : { expense_no: expNo, financial_year_id: fy.id }),
+      // CHANGED: the live expenses table has no financial_year_id column — the FY
+      // is only used above to build the expense number.
+      ...(isEdit ? {} : { expense_no: expNo }),
       expense_date:    form.expense_date,
       entity_id:       form.entity_id,
-      category:        form.expense_type || form.category || 'other',
+      // CHANGED: the live column is expense_type — there is no `category` column.
+      expense_type:    form.expense_type || form.category || 'other',
       description:     form.description,
       amount,
       gst_rate:        form.is_rcm ? 0 : Number(form.gst_rate),
@@ -418,8 +421,8 @@ export default function Expenses() {
 
   const filtered = expenses.filter(e => {
     const ms = !search || e.description.toLowerCase().includes(search.toLowerCase()) || e.entity?.name?.toLowerCase().includes(search.toLowerCase())
-    // CHANGED: the save writes the type to `category`; expense_type is only a fallback for older rows
-    const mt = typeFilter.length === 0 || typeFilter.includes(e.category || e.expense_type)
+    // CHANGED: the type lives in expense_type on the live table
+    const mt = typeFilter.length === 0 || typeFilter.includes(e.expense_type || e.category)
     return ms && mt // CHANGED: removed dateFrom/dateTo (undeclared state; date filter not in UI)
   })
 
@@ -462,7 +465,7 @@ export default function Expenses() {
     { label: 'No',       render: e => <span style={{ fontFamily: 'monospace', fontSize: '11px' }}>{e.expense_no || '—'}</span> },
     { label: 'Date',     render: e => <span style={{ fontSize: '12px' }}>{fmtDate(e.expense_date)}</span> },
     { label: 'Entity',   render: e => <span style={{ fontSize: '12px' }}>{e.entity?.short_name || e.entity?.name}</span> },
-    { label: 'Type',     render: e => <Badge status={e.category || e.expense_type} label={e.category || e.expense_type} /> },
+    { label: 'Type',     render: e => <Badge status={e.expense_type || e.category} label={e.expense_type || e.category} /> },
     // CHANGED: challans tagged on the expense show under the description
     { label: 'Desc',     render: e => <span style={{ fontSize: '12px' }}>{e.description}
         {challanLinks.byExpense[e.id]?.length > 0 && <span style={{ display: 'block', fontSize: '11px', color: C.textMuted }}>Challan: {challanLinks.byExpense[e.id].join(', ')}</span>}
@@ -518,7 +521,7 @@ export default function Expenses() {
         <input value={search} onChange={e => setSearch(e.target.value)} placeholder='Search description, entity…'
           style={{ padding: '8px 12px', border: `1.5px solid ${C.border}`, borderRadius: '6px', background: C.surface, fontSize: '13px', outline: 'none', flex: 1, minWidth: '180px', fontFamily: 'inherit' }} />
         <MultiSelectDropdown options={categories} selected={typeFilter} onChange={setType} placeholder='All types' capitalize={false} />
-        <Btn variant='ghost' onClick={() => { if (!exportRows('expenses', filtered, e => ({ type: e.category || e.expense_type || '', challans: (challanLinks.byExpense[e.id] || []).join(', ') }))) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
+        <Btn variant='ghost' onClick={() => { if (!exportRows('expenses', filtered, e => ({ type: e.expense_type || e.category || '', challans: (challanLinks.byExpense[e.id] || []).join(', ') }))) setToast({ message: 'Nothing to export', type: 'error' }) }}>↓ Export CSV</Btn>
       </div>
 
       {/* CHANGED: bulk-selection action bar, same pattern as PI/PO/Invoices */}
@@ -819,7 +822,7 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
       const next = { ...f, expense_id: id }
       if (ex) {
         next.basis = String(ex.total_amount || '')
-        const s = suggestTds(ex.category)
+        const s = suggestTds(ex.expense_type || ex.category)
         if (s && !f.tds_section && !f.tds_rate) { next.apply_tds = true; next.tds_section = s.section; next.tds_rate = String(s.rate) }
       }
       return next
@@ -1131,7 +1134,7 @@ function ExpenseSummary({ expenses, parties, loading }) {
     en.count++; en.taxable += e.amount || 0; en.gst += e.gst_amount || 0; en.total += e.total_amount || 0
     byEntityBooked.set(ek, en)
 
-    const ck = e.category || '—'
+    const ck = e.expense_type || e.category || '—'
     const cc = byCategory.get(ck) || { count: 0, total: 0 }
     cc.count++; cc.total += e.total_amount || 0
     byCategory.set(ck, cc)

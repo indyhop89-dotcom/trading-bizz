@@ -1655,7 +1655,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
     setLoading(true)
     const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
     let expQ = supabase.from('expenses')
-      .select('id,expense_no,expense_date,description,total_amount,net_payable')
+      .select('id,expense_no,expense_date,description,total_amount') // CHANGED: net_payable is not a column on the live expenses table
       .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
     let payQ = supabase.from('party_payments')
       .select('id,payment_date,amount,tds_amount,reference,mode')
@@ -1665,7 +1665,7 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
     const [{ data: exps }, { data: pays }] = await Promise.all([expQ, payQ])
 
     const ledger = [
-      ...(exps || []).map(e => ({ date: e.expense_date, doc: e.expense_no, type: 'Expense', desc: e.description, bill: (e.net_payable ?? e.total_amount) || 0, paid: 0 })),
+      ...(exps || []).map(e => ({ date: e.expense_date, doc: e.expense_no, type: 'Expense', desc: e.description, bill: e.total_amount || 0, paid: 0 })),
       // CHANGED: "paid" (what settles the bill) = cash actually paid + TDS withheld —
       // the TDS portion still settles the expense (paid to govt on the party's
       // behalf), same convention as computeInvoiceOutstanding in utils/payments.js.
