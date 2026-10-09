@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../../supabaseClient'
 import { fetchAllPages, excludeAutoPurchaseMirrors } from '../../utils/query'
-import { C, Card, FormRow, Select, StatCard, Badge, Btn } from '../../components/UI/index'
+import { C, Card, FormRow, Select, StatCard, Badge, Btn, MultiSelectDropdown } from '../../components/UI/index'
 import { formatINR, formatQty, toNum, round2 } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
@@ -1641,37 +1641,54 @@ function AgeingReport({ entities, defaultEntityId }) {
 // our entities: expenses booked (what we owe) vs party_payments (what we paid),
 // with a running outstanding balance. Distinct from the entity-vs-entity Ledger.
 function PartyLedger({ entities, parties, fys, defaultEntityId }) {
-  const [entityId, setEntityId] = useState('')
-  useEffect(() => { if (defaultEntityId && !entityId) setEntityId(defaultEntityId) }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
-  const [partyId, setPartyId]   = useState('')
+  // CHANGED: entity and party are multi-select. Nothing ticked = all of them
+  // (entities are still limited to the ones this user has access to, by RLS).
+  const [entityIds, setEntityIds] = useState([])
+  const [defaulted, setDefaulted] = useState(false)
+  useEffect(() => { if (defaultEntityId && !defaulted) { setEntityIds([defaultEntityId]); setDefaulted(true) } }, [defaultEntityId]) // eslint-disable-line react-hooks/exhaustive-deps
+  const [partyIds, setPartyIds] = useState([])
   const [fyId, setFyId]         = useState('')
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo]     = useState('')
   const [rows, setRows]         = useState(null)
   const [loading, setLoading]   = useState(false)
+  const [error, setError]       = useState('')
 
   async function runReport() {
-    if (!entityId || !partyId) return
     setLoading(true)
+    setError('')
     const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
-    let expQ = supabase.from('expenses')
-      .select('id,expense_no,vendor_invoice_no,expense_date,description,total_amount') // CHANGED: net_payable is not a column on the live expenses table
-      .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
-    let payQ = supabase.from('party_payments')
-      .select('id,payment_date,amount,tds_amount,reference,mode')
-      .eq('entity_id', entityId).eq('party_id', partyId).eq('is_deleted', false)
-    expQ = applyDateRange(expQ, range, 'expense_date')
-    payQ = applyDateRange(payQ, range, 'payment_date')
-    const [{ data: exps }, { data: pays }] = await Promise.all([expQ, payQ])
+    const scope = q => {
+      if (entityIds.length) q = q.in('entity_id', entityIds)
+      if (partyIds.length)  q = q.in('party_id', partyIds)
+      return q
+    }
+    // CHANGED: vendor_invoice_no is the main identifier; expense_no is the system reference.
+    const [{ data: exps, error: expErr }, { data: pays, error: payErr }] = await Promise.all([
+      fetchAllPages(() => applyDateRange(scope(supabase.from('expenses')
+        .select('id,entity_id,party_id,expense_no,vendor_invoice_no,vendor_invoice_date,expense_date,description,total_amount')
+        .eq('is_deleted', false).not('party_id', 'is', null)), range, 'expense_date').order('expense_date').order('id')),
+      fetchAllPages(() => applyDateRange(scope(supabase.from('party_payments')
+        .select('id,entity_id,party_id,payment_date,amount,tds_amount,reference,mode,expense:expense_id(expense_no,vendor_invoice_no)')
+        .eq('is_deleted', false)), range, 'payment_date').order('payment_date').order('id')),
+    ])
+    if (expErr || payErr) { setRows(null); setError((expErr || payErr).message); setLoading(false); return }
 
+    const entityName = id => { const e = entities.find(x => x.id === id); return e ? (e.short_name || e.name) : '—' }
+    const partyName  = id => parties.find(p => p.id === id)?.name || '—'
     const ledger = [
-      ...(exps || []).map(e => ({ date: e.expense_date, doc: e.vendor_invoice_no || e.expense_no, type: 'Expense', desc: e.description, bill: e.total_amount || 0, paid: 0 })),
+      ...(exps || []).map(e => ({ date: e.expense_date, entity: entityName(e.entity_id), party: partyName(e.party_id),
+        vendor_invoice_no: e.vendor_invoice_no || '', vendor_invoice_date: e.vendor_invoice_date || '', ref_no: e.expense_no || '',
+        type: 'Expense', desc: e.description, bill: e.total_amount || 0, paid: 0 })),
       // CHANGED: "paid" (what settles the bill) = cash actually paid + TDS withheld —
       // the TDS portion still settles the expense (paid to govt on the party's
       // behalf), same convention as computeInvoiceOutstanding in utils/payments.js.
       // Without this, a TDS-withheld payment would leave the ledger permanently
       // short by the withheld amount.
-      ...(pays || []).map(p => ({ date: p.payment_date, doc: p.reference || '—', type: 'Payment', desc: p.mode || '', bill: 0, paid: (p.amount || 0) + (p.tds_amount || 0) })),
+      // A payment made against a specific expense carries that expense's vendor invoice number.
+      ...(pays || []).map(p => ({ date: p.payment_date, entity: entityName(p.entity_id), party: partyName(p.party_id),
+        vendor_invoice_no: p.expense?.vendor_invoice_no || '', vendor_invoice_date: '', ref_no: p.reference || '',
+        type: 'Payment', desc: p.mode || '', bill: 0, paid: (p.amount || 0) + (p.tds_amount || 0) })),
     ].sort((a, b) => new Date(a.date) - new Date(b.date))
 
     let bal = 0
@@ -1681,28 +1698,23 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
 
   function handleExportCSV() {
     if (!rows) return
-    downloadCSV(`party_ledger_${today()}.csv`, ['date', 'doc', 'type', 'desc', 'bill', 'paid', 'balance'], rows)
+    downloadCSV(`party_ledger_${today()}.csv`, ['date', 'entity', 'party', 'vendor_invoice_no', 'vendor_invoice_date', 'ref_no', 'type', 'desc', 'bill', 'paid', 'balance'], rows)
   }
 
   const totalBill = (rows || []).reduce((s, r) => s + r.bill, 0)
   const totalPaid = (rows || []).reduce((s, r) => s + r.paid, 0)
   const outstanding = totalBill - totalPaid
   const th = { padding: '9px 12px', background: C.bg, borderBottom: `1px solid ${C.border}`, fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.04em' }
+  const td = { padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', alignItems: 'flex-end' }}>
         <FormRow label='Entity'>
-          <Select value={entityId} onChange={e => setEntityId(e.target.value)} style={{ minWidth: '180px' }}>
-            <option value=''>Select entity</option>
-            {entities.map(e => <option key={e.id} value={e.id}>{e.short_name || e.name}</option>)}
-          </Select>
+          <MultiSelectDropdown options={entities.map(e => ({ value: e.id, label: e.short_name || e.name }))} selected={entityIds} onChange={setEntityIds} placeholder='All entities' capitalize={false} style={{ minWidth: '180px' }} />
         </FormRow>
         <FormRow label='Party'>
-          <Select value={partyId} onChange={e => setPartyId(e.target.value)} style={{ minWidth: '200px' }}>
-            <option value=''>Select party</option>
-            {parties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-          </Select>
+          <MultiSelectDropdown options={parties.map(p => ({ value: p.id, label: p.name }))} selected={partyIds} onChange={setPartyIds} placeholder='All parties' capitalize={false} style={{ minWidth: '200px' }} />
         </FormRow>
         <FormRow label='Financial Year'>
           <Select value={fyId} onChange={e => setFyId(e.target.value)} style={{ minWidth: '160px' }}>
@@ -1711,26 +1723,31 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
           </Select>
         </FormRow>
         <DateRangeFields dateFrom={dateFrom} setDateFrom={setDateFrom} dateTo={dateTo} setDateTo={setDateTo} />
-        <button onClick={runReport} disabled={!entityId || !partyId || loading}
-          style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: (!entityId || !partyId) ? 'not-allowed' : 'pointer', opacity: (!entityId || !partyId) ? 0.5 : 1, fontFamily: 'inherit' }}>
+        <button onClick={runReport} disabled={loading}
+          style={{ padding: '8px 18px', background: C.accent, color: '#f5f0e8', border: 'none', borderRadius: '6px', fontWeight: 600, fontSize: '13px', cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.5 : 1 }}>
           {loading ? 'Running…' : 'Run Report'}
         </button>
         <Btn variant='ghost' onClick={handleExportCSV} disabled={!rows}>↓ Export CSV</Btn>
       </div>
+
+      {error && <div style={{ padding: '12px 14px', background: '#fbeaea', color: C.danger, borderRadius: '6px', fontSize: '13px' }}>Report could not be loaded: {error}</div>}
 
       {rows && (
         <>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: '12px' }}>
             <StatCard label='Total Billed' value={formatINR(totalBill)} />
             <StatCard label='Total Paid'   value={formatINR(totalPaid)} color={C.success} />
-            <StatCard label='Outstanding'  value={formatINR(Math.abs(outstanding))} sub={outstanding > 0 ? 'We still owe the party' : outstanding < 0 ? 'Advance / overpaid' : 'Settled'} color={outstanding > 0 ? C.danger : C.success} />
+            <StatCard label='Outstanding'  value={formatINR(Math.abs(outstanding))} sub={outstanding > 0 ? 'We still owe' : outstanding < 0 ? 'Advance / overpaid' : 'Settled'} color={outstanding > 0 ? C.danger : C.success} />
           </div>
           <Card>
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
                 <thead><tr>
                   <th style={{ ...th, textAlign: 'left' }}>Date</th>
-                  <th style={{ ...th, textAlign: 'left' }}>Document</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Entity</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Party</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Vendor Inv No</th>
+                  <th style={{ ...th, textAlign: 'left' }}>Ref No</th>
                   <th style={{ ...th, textAlign: 'left' }}>Type</th>
                   <th style={{ ...th, textAlign: 'right' }}>Billed</th>
                   <th style={{ ...th, textAlign: 'right' }}>Paid</th>
@@ -1739,25 +1756,31 @@ function PartyLedger({ entities, parties, fys, defaultEntityId }) {
                 <tbody>
                   {rows.map((r, i) => (
                     <tr key={i} style={{ background: i % 2 === 0 ? C.surface : '#faf6ed' }}>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>{fmtDate(r.date)}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', fontFamily: 'monospace', fontSize: '12px' }}>{r.doc}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8' }}>
+                      <td style={td}>{fmtDate(r.date)}</td>
+                      <td style={{ ...td, fontSize: '12px' }}>{r.entity}</td>
+                      <td style={{ ...td, fontSize: '12px' }}>{r.party}</td>
+                      <td style={{ ...td, fontWeight: 600 }}>
+                        {r.vendor_invoice_no || '—'}
+                        {r.vendor_invoice_date && <span style={{ display: 'block', fontSize: '11px', fontWeight: 400, color: C.textMuted }}>{fmtDate(r.vendor_invoice_date)}</span>}
+                      </td>
+                      <td style={{ ...td, fontFamily: 'monospace', fontSize: '11px', color: C.textSoft }}>{r.ref_no || '—'}</td>
+                      <td style={td}>
                         <span style={{ fontSize: '11px', background: r.type === 'Payment' ? '#e8f3ec' : '#f3ede8', color: r.type === 'Payment' ? C.success : C.warning, padding: '2px 7px', borderRadius: '4px', fontWeight: 600 }}>{r.type}</span>
                       </td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.bill > 0 ? C.warning : C.textMuted }}>{r.bill > 0 ? formatINR(r.bill) : '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.paid > 0 ? C.success : C.textMuted }}>{r.paid > 0 ? formatINR(r.paid) : '—'}</td>
-                      <td style={{ padding: '9px 12px', borderBottom: '1px solid #f0e8d8', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: r.balance > 0 ? C.danger : C.text }}>{formatINR(Math.abs(r.balance))}</td>
+                      <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.bill > 0 ? C.warning : C.textMuted }}>{r.bill > 0 ? formatINR(r.bill) : '—'}</td>
+                      <td style={{ ...td, textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: r.paid > 0 ? C.success : C.textMuted }}>{r.paid > 0 ? formatINR(r.paid) : '—'}</td>
+                      <td style={{ ...td, textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: r.balance > 0 ? C.danger : C.text }}>{formatINR(Math.abs(r.balance))}</td>
                     </tr>
                   ))}
-                  {rows.length === 0 && <tr><td colSpan={6} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No expenses or payments for this party under this entity.</td></tr>}
+                  {rows.length === 0 && <tr><td colSpan={9} style={{ padding: '24px', textAlign: 'center', color: C.textMuted }}>No expenses or payments for this selection.</td></tr>}
                 </tbody>
               </table>
             </div>
           </Card>
         </>
       )}
-      {!loading && rows === null && (
-        <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Select an entity and party, then Run Report.</div>
+      {!loading && !error && rows === null && (
+        <div style={{ textAlign: 'center', padding: '48px', color: C.textMuted, fontSize: '13px' }}>Pick entities and parties (leave blank for all), then Run Report.</div>
       )}
     </div>
   )
