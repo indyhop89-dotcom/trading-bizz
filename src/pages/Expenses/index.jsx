@@ -863,6 +863,12 @@ export default function Expenses() {
 // Feeds the Reports → Party Ledger credit side.
 const EMPTY_PP = {
   entity_id: '', party_id: '', expense_id: '', payment_date: today(),
+  // CHANGED: several expenses can be settled by one payment. alloc maps
+  // expense id → gross amount settled against it (blank = nothing ticked).
+  // On save each ticked expense becomes its own party_payments row sharing
+  // date / mode / reference, so expense_id stays one-to-one per row and the
+  // Party Ledger + TDS reports need no change.
+  alloc: {},
   basis: '', mode: 'bank', reference: '', notes: '',
   // CHANGED: TDS/TCS now lives here — decided when the party is actually
   // paid, not when the expense was booked (see CATEGORY_TDS/suggestTds above).
@@ -896,6 +902,7 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
     setEditing(r)
     setForm({
       entity_id: r.entity_id || '', party_id: r.party_id || '', expense_id: r.expense_id || '',
+      alloc: {}, // edit works on one saved row, so stays single-expense
       payment_date: r.payment_date || today(),
       basis: String(toNum(r.amount) + toNum(r.tds_amount)), // reconstruct the gross settle amount, same as invoice_payments
       mode: r.mode || 'bank', reference: r.reference || '', notes: r.notes || '',
@@ -925,42 +932,79 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
     })
   }
 
-  const basisAmount = toNum(form.basis)
-  const tdsAmount   = form.apply_tds ? roundRupees(round2(basisAmount * (Number(form.tds_rate) || 0) / 100)) : 0
-  const tcsAmount   = form.apply_tcs ? roundRupees(round2(basisAmount * (Number(form.tcs_rate) || 0) / 100)) : 0
-  // CHANGED: same correctness rule as invoice_payments — TDS reduces what's
-  // actually paid (still "settles" the expense, withheld on the vendor's
-  // behalf); TCS is a separate collection on top, tracked in its own column,
-  // never folded into the persisted `amount`.
-  const cashAmount  = Math.max(0, roundRupees(basisAmount - tdsAmount))
+  // CHANGED: multi-expense selection (new payments only). Ticking an expense
+  // prefills its full amount; the settle amount becomes the sum of the ticks.
+  const allocIds = Object.keys(form.alloc || {})
+  const multi    = !editing && allocIds.length > 0
+  function toggleExpense(ex) {
+    setForm(f => {
+      const alloc = { ...(f.alloc || {}) }
+      if (ex.id in alloc) delete alloc[ex.id]
+      else alloc[ex.id] = String(ex.total_amount || '')
+      const next = { ...f, alloc }
+      // Suggest TDS from the first ticked expense's category, same as before.
+      if (!(ex.id in (f.alloc || {}))) {
+        const s = suggestTds(ex.expense_type || ex.category)
+        if (s && !f.tds_section && !f.tds_rate) { next.apply_tds = true; next.tds_section = s.section; next.tds_rate = String(s.rate) }
+      }
+      return next
+    })
+  }
+  function setAlloc(id, v) { setForm(f => ({ ...f, alloc: { ...f.alloc, [id]: v } })) }
+  function toggleAll() {
+    if (allocIds.length === linkableExpenses.length) return setForm(f => ({ ...f, alloc: {} }))
+    linkableExpenses.filter(ex => !(ex.id in form.alloc)).forEach(toggleExpense)
+  }
+
+  // One tranche per row that will be saved. TDS/TCS are worked out per row so
+  // what the summary shows is exactly what lands in the DB.
+  function tranche(basis) {
+    const tds  = form.apply_tds ? roundRupees(round2(basis * (Number(form.tds_rate) || 0) / 100)) : 0
+    const tcs  = form.apply_tcs ? roundRupees(round2(basis * (Number(form.tcs_rate) || 0) / 100)) : 0
+    // Same correctness rule as invoice_payments — TDS reduces what's
+    // actually paid (still "settles" the expense, withheld on the vendor's
+    // behalf); TCS is a separate collection on top, tracked in its own column,
+    // never folded into the persisted `amount`.
+    const cash = Math.max(0, roundRupees(basis - tds))
+    return { basis, tds, tcs, cash }
+  }
+  const tranches = multi
+    ? allocIds.map(id => ({ expense_id: id, ...tranche(toNum(form.alloc[id])) }))
+    : [{ expense_id: form.expense_id || null, ...tranche(toNum(form.basis)) }]
+  const basisAmount = tranches.reduce((s, t) => s + t.basis, 0)
+  const tdsAmount   = tranches.reduce((s, t) => s + t.tds, 0)
+  const tcsAmount   = tranches.reduce((s, t) => s + t.tcs, 0)
+  const cashAmount  = tranches.reduce((s, t) => s + t.cash, 0)
   const totalCashThisTranche = cashAmount + tcsAmount
 
   async function handleSave() {
     if (!form.entity_id || !form.party_id) return setToast({ message: 'Entity and party are required', type: 'error' })
     if (!basisAmount) return setToast({ message: 'Settle amount is required', type: 'error' })
+    if (multi && tranches.some(t => !(t.basis > 0))) return setToast({ message: 'Enter an amount for every ticked expense', type: 'error' })
     setSaving(true)
     const fy = await resolveFY()
-    const payload = {
+    const payloads = tranches.map(t => ({
       entity_id: form.entity_id, party_id: form.party_id,
-      expense_id: form.expense_id || null, financial_year_id: fy?.id || null,
-      payment_date: form.payment_date, amount: cashAmount, mode: form.mode || null,
+      expense_id: t.expense_id, financial_year_id: fy?.id || null,
+      payment_date: form.payment_date, amount: t.cash, mode: form.mode || null,
       reference: form.reference || null, notes: form.notes || null,
       tds_section: form.apply_tds ? (form.tds_section || null) : null,
       tds_rate: form.apply_tds ? (toNum(form.tds_rate) || 0) : 0,
-      tds_base_amount: form.apply_tds ? basisAmount : 0,
-      tds_amount: tdsAmount,
+      tds_base_amount: form.apply_tds ? t.basis : 0,
+      tds_amount: t.tds,
       tcs_section: form.apply_tcs ? (form.tcs_section || null) : null,
       tcs_rate: form.apply_tcs ? (toNum(form.tcs_rate) || 0) : 0,
-      tcs_base_amount: form.apply_tcs ? basisAmount : 0,
-      tcs_amount: tcsAmount,
-    }
+      tcs_base_amount: form.apply_tcs ? t.basis : 0,
+      tcs_amount: t.tcs,
+    }))
+    // A single bulk insert is one statement, so all rows save or none do.
     const res = editing
-      ? await supabase.from('party_payments').update(payload).eq('id', editing.id)
-      : await supabase.from('party_payments').insert(payload)
+      ? await supabase.from('party_payments').update(payloads[0]).eq('id', editing.id)
+      : await supabase.from('party_payments').insert(payloads)
     setSaving(false)
     if (res.error) return setToast({ message: res.error.message, type: 'error' })
     setModalOpen(false)
-    setToast({ message: editing ? 'Payment updated' : 'Payment recorded', type: 'success' })
+    setToast({ message: editing ? 'Payment updated' : payloads.length > 1 ? `Payment recorded against ${payloads.length} expenses` : 'Payment recorded', type: 'success' })
     load()
   }
   async function handleDelete() {
@@ -1011,13 +1055,13 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
             <FormRow label='Entity' required>
-              <Select value={form.entity_id} onChange={e => setForm(f => ({ ...f, entity_id: e.target.value, expense_id: '' }))}>
+              <Select value={form.entity_id} onChange={e => setForm(f => ({ ...f, entity_id: e.target.value, expense_id: '', alloc: {} }))}>
                 <option value=''>Select entity</option>
                 {entities.map(en => <option key={en.id} value={en.id}>{en.short_name || en.name}</option>)}
               </Select>
             </FormRow>
             <FormRow label='Party' required>
-              <Select value={form.party_id} onChange={e => setForm(f => ({ ...f, party_id: e.target.value, expense_id: '' }))}>
+              <Select value={form.party_id} onChange={e => setForm(f => ({ ...f, party_id: e.target.value, expense_id: '', alloc: {} }))}>
                 <option value=''>Select party</option>
                 {parties.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
               </Select>
@@ -1025,8 +1069,10 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
             <FormRow label='Payment Date' required>
               <Input type='date' value={form.payment_date} onChange={e => setF('payment_date', e.target.value)} />
             </FormRow>
-            <FormRow label='Settle Amount (₹)' required hint='Gross amount before any TDS/TCS'>
-              <Input type='number' value={form.basis} onChange={e => setF('basis', e.target.value)} placeholder='0' />
+            <FormRow label='Settle Amount (₹)' required hint={multi ? `Total of ${allocIds.length} ticked expense${allocIds.length > 1 ? 's' : ''}` : 'Gross amount before any TDS/TCS'}>
+              {multi
+                ? <Input value={formatINR(basisAmount)} disabled />
+                : <Input type='number' value={form.basis} onChange={e => setF('basis', e.target.value)} placeholder='0' />}
             </FormRow>
             <FormRow label='Mode'>
               <Select value={form.mode} onChange={e => setF('mode', e.target.value)}>
@@ -1040,7 +1086,8 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
               <Input value={form.reference} onChange={e => setF('reference', e.target.value)} />
             </FormRow>
           </div>
-          {form.entity_id && form.party_id && (
+          {/* Edit keeps the single dropdown — it changes one saved row. */}
+          {form.entity_id && form.party_id && editing && (
             <FormRow label='Against Expense' hint={linkableExpenses.length === 0 ? 'No expenses for this entity + party' : 'Selecting one prefills the settle amount and suggests TDS from its category'}>
               <Select value={form.expense_id} onChange={e => selectExpense(e.target.value)} disabled={linkableExpenses.length === 0}>
                 <option value=''>General / on account</option>
@@ -1048,6 +1095,35 @@ function PartyPayments({ entities, parties, expenses, canDelete, defaultEntityId
                   <option key={ex.id} value={ex.id}>{expenseLabel(ex) || ex.description} · {formatINR(ex.total_amount)}</option>
                 ))}
               </Select>
+            </FormRow>
+          )}
+          {/* CHANGED: new payments can be ticked against several expenses. */}
+          {form.entity_id && form.party_id && !editing && (
+            <FormRow label='Against Expenses' hint={linkableExpenses.length === 0 ? 'No expenses for this entity + party' : multi ? 'Each ticked expense is saved as its own payment line with the same date, mode and reference' : 'Tick one or more. Leave all unticked for a general / on-account payment'}>
+              {linkableExpenses.length > 0 && (
+                <div style={{ border: `1px solid ${C.border}`, borderRadius: '6px', maxHeight: '220px', overflowY: 'auto' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 10px', borderBottom: `1px solid ${C.border}`, background: C.bg, fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>
+                    <input type='checkbox' checked={allocIds.length === linkableExpenses.length} onChange={toggleAll} style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+                    Select all ({linkableExpenses.length})
+                  </label>
+                  {linkableExpenses.map(ex => {
+                    const on = ex.id in form.alloc
+                    return (
+                      <div key={ex.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', borderBottom: `1px solid ${C.border}` }}>
+                        <input type='checkbox' checked={on} onChange={() => toggleExpense(ex)} style={{ width: '15px', height: '15px', cursor: 'pointer' }} />
+                        <span onClick={() => toggleExpense(ex)} style={{ flex: 1, fontSize: '13px', cursor: 'pointer' }}>
+                          {expenseLabel(ex) || ex.description} <span style={{ color: C.textMuted }}>· {fmtDate(ex.expense_date)} · {formatINR(ex.total_amount)}</span>
+                        </span>
+                        {on && (
+                          <div style={{ width: '120px' }}>
+                            <Input type='number' value={form.alloc[ex.id]} onChange={e => setAlloc(ex.id, e.target.value)} placeholder='0' />
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
             </FormRow>
           )}
 
