@@ -10,6 +10,7 @@ import {
 import LineItemsEditor, { computeLine, computeTotals } from '../../components/LineItemsEditor'
 import DocumentAttachments from '../../components/DocumentAttachments'
 import { formatINR, toNum } from '../../utils/money'
+import { fetchInvoiceTaxRates } from '../../utils/payments'
 import { fmtDate, today, fyCodeForDate } from '../../utils/dates'
 import { buildHSNMap } from '../../utils/hsn'
 import { useAuth } from '../../hooks/useAuth' // CHANGED: master/admin-only delete, same convention as PI/PO/Invoices
@@ -182,10 +183,9 @@ function NoteList({ refreshKey }) {
   useEffect(() => {
     if (!form.against_invoice_id) { setLinkedRates({ tds: 0, tcs: 0 }); return }
     let cancelled = false
-    supabase.from('invoice_payments')
-      .select('tds_rate,tcs_rate').eq('invoice_id', form.against_invoice_id).eq('is_deleted', false)
-      .order('actual_payment_date', { ascending: false }).limit(1).maybeSingle()
-      .then(({ data }) => { if (!cancelled) setLinkedRates({ tds: toNum(data?.tds_rate) || 0, tcs: toNum(data?.tcs_rate) || 0 }) })
+    // CHANGED (064): rates come from the invoice's TDS / TCS register entry.
+    fetchInvoiceTaxRates(form.against_invoice_id)
+      .then(rates => { if (!cancelled) setLinkedRates(rates) })
     return () => { cancelled = true }
   }, [form.against_invoice_id])
 
@@ -244,11 +244,9 @@ function NoteList({ refreshKey }) {
     // rate the buyer/seller already applied when settling that invoice), so a
     // correction against a TDS/TCS-bearing invoice stays proportionally
     // consistent with it rather than needing a second manual entry surface.
-    const { data: lastTranche } = await supabase.from('invoice_payments')
-      .select('tds_rate,tcs_rate').eq('invoice_id', form.against_invoice_id).eq('is_deleted', false)
-      .order('actual_payment_date', { ascending: false }).limit(1).maybeSingle()
-    const tdsRate = toNum(lastTranche?.tds_rate) || 0
-    const tcsRate = toNum(lastTranche?.tcs_rate) || 0
+    // CHANGED (064): taken from the invoice's TDS / TCS register entry
+    // (previously the last payment row's rate).
+    const { tds: tdsRate, tcs: tcsRate } = await fetchInvoiceTaxRates(form.against_invoice_id)
     const payload = {
       note_type: form.note_type, against_invoice_id: form.against_invoice_id,
       issuer_entity_id: form.issuer_entity_id, receiver_entity_id: form.receiver_entity_id,
@@ -400,7 +398,7 @@ function NoteList({ refreshKey }) {
             </FormRow>
             <FormRow label='Against Invoice' required
               hint={(linkedRates.tds > 0 || linkedRates.tcs > 0)
-                ? `Will auto-apply from this invoice's payment: ${linkedRates.tds > 0 ? `TDS ${linkedRates.tds}%` : ''}${linkedRates.tds > 0 && linkedRates.tcs > 0 ? ', ' : ''}${linkedRates.tcs > 0 ? `TCS ${linkedRates.tcs}%` : ''}`
+                ? `Will auto-apply from this invoice's TDS / TCS entry: ${linkedRates.tds > 0 ? `TDS ${linkedRates.tds}%` : ''}${linkedRates.tds > 0 && linkedRates.tcs > 0 ? ', ' : ''}${linkedRates.tcs > 0 ? `TCS ${linkedRates.tcs}%` : ''}`
                 : undefined}>
               <Select value={form.against_invoice_id} onChange={e => setF('against_invoice_id', e.target.value)}>
                 <option value=''>Select invoice</option>

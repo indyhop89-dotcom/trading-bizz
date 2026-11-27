@@ -5,7 +5,7 @@
  */
 import { supabase } from '../supabaseClient'
 import { fetchActualStockPosition, NEGATIVE_STOCK_FLAG_ENABLED } from './stock'
-import { computeInvoiceOutstanding, groupTranchesByInvoice } from './payments'
+import { computeInvoiceOutstanding, groupTranchesByInvoice, fetchSettlements, groupSettlementsByInvoice, settlementFor } from './payments'
 import { formatINR, formatNumberIN } from './money'
 import { excludeAutoPurchaseMirrors } from './query'
 
@@ -37,17 +37,21 @@ export async function generateNotifications(userId) {
 
   const invIds = (invForNotif || []).map(i => i.id)
   let tranchesByInvoice = new Map()
+  let settlements = new Map()
   if (invIds.length > 0) {
     const { data: tranches } = await supabase
       .from('invoice_payments')
-      .select('invoice_id, amount, tds_amount, adjustments')
+      .select('invoice_id, amount, adjustments')
       .eq('is_deleted', false)
       .in('invoice_id', invIds)
     tranchesByInvoice = groupTranchesByInvoice(tranches)
+    // CHANGED (064): register TDS and journal set-offs also settle invoices.
+    const settle = await fetchSettlements(invIds)
+    settlements = groupSettlementsByInvoice(settle.tdsEntries, settle.setoffs)
   }
 
   for (const inv of (invForNotif || [])) {
-    const { pending } = computeInvoiceOutstanding(inv, tranchesByInvoice.get(inv.id))
+    const { pending } = computeInvoiceOutstanding(inv, tranchesByInvoice.get(inv.id), settlementFor(settlements, inv.id))
     if (pending <= 0) continue
     if (inv.due_date < today) {
       notifs.push({

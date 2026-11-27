@@ -6,7 +6,7 @@ import { formatINR, formatQty, toNum, round2 } from '../../utils/money'
 import { fmtDate, today } from '../../utils/dates'
 import { useEntityAccess } from '../../hooks/useEntityAccess'
 import { fetchActualStockPosition } from '../../utils/stock'
-import { computeInvoiceOutstanding, groupTranchesByInvoice } from '../../utils/payments'
+import { computeInvoiceOutstanding, groupTranchesByInvoice, fetchSettlements, groupSettlementsByInvoice, settlementFor } from '../../utils/payments'
 import { matchPurchasesToSales, calcMarginPct } from '../../utils/margin'
 import { downloadCSV } from '../../utils/csvTemplate'
 import OrderTrail from './OrderTrail' // CHANGED: order → leg → invoice → challan → expense drill-down
@@ -453,9 +453,9 @@ function GSTSummary({ entities, fys, defaultEntityId }) {
 }
 
 // ─── TDS/TCS Report ─────────────────────────────────────────────────────────────
-// Consolidates TDS/TCS across every source that carries it: invoice_payments
-// (TDS/TCS recognized at payment time — the single source of truth for
-// invoices, per the decision to stop recording it at invoice creation),
+// Consolidates TDS/TCS across every source that carries it: the per-invoice
+// TDS/TCS register (tds_tcs_entries — CHANGED (064): replaces the TDS/TCS
+// columns on invoice_payments; the old payment-row TDS was copied into it),
 // credit_debit_notes (auto-derived from the linked invoice's payment rate),
 // and party_payments (expense-side TDS/TCS — also recognized at payment
 // time, not when the expense was booked; we're always the payer here).
@@ -480,10 +480,10 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
     const range = resolveDateRange(fys.find(f => f.id === fyId), dateFrom, dateTo)
     const inRange = d => inDateRange(d, range)
 
-    const [{ data: ips }, { data: cdns }, { data: exps }] = await Promise.all([ // exps = party_payments (expense-side TDS/TCS)
-      supabase.from('invoice_payments')
-        .select('id,invoice_no,actual_payment_date,entity_id,party_entity_id,tds_section,tds_amount,tcs_section,tcs_amount')
-        .eq('is_deleted', false).or(`entity_id.eq.${entityId},party_entity_id.eq.${entityId}`),
+    const [{ data: regs }, { data: cdns }, { data: exps }] = await Promise.all([ // exps = party_payments (expense-side TDS/TCS)
+      supabase.from('tds_tcs_entries')
+        .select('id,entry_type,section_code,amount,entry_date,deducted_by_entity_id,deductee_entity_id,invoice:invoice_id(invoice_no)')
+        .eq('is_deleted', false).or(`deducted_by_entity_id.eq.${entityId},deductee_entity_id.eq.${entityId}`),
       supabase.from('credit_debit_notes')
         .select('id,note_no,note_type,note_date,issuer_entity_id,receiver_entity_id,tds_amount,tcs_amount')
         .eq('is_deleted', false).or(`issuer_entity_id.eq.${entityId},receiver_entity_id.eq.${entityId}`),
@@ -497,17 +497,16 @@ function TdsTcsReport({ entities, fys, defaultEntityId }) {
     let tdsDeducted = 0, tdsCredit = 0, tcsCollected = 0, tcsCredit = 0
     const rows = []
 
-    for (const p of (ips || [])) {
-      if (!inRange(p.actual_payment_date)) continue
-      const weArePayer = p.entity_id === entityId
-      if (toNum(p.tds_amount) > 0) {
-        if (weArePayer) tdsDeducted += p.tds_amount; else tdsCredit += p.tds_amount
-        rows.push({ source: 'Invoice Payment', doc: p.invoice_no, date: p.actual_payment_date, section: p.tds_section, kind: 'TDS', direction: weArePayer ? 'Liability' : 'Credit', amount: p.tds_amount })
-      }
-      if (toNum(p.tcs_amount) > 0) {
-        if (weArePayer) tcsCredit += p.tcs_amount; else tcsCollected += p.tcs_amount
-        rows.push({ source: 'Invoice Payment', doc: p.invoice_no, date: p.actual_payment_date, section: p.tcs_section, kind: 'TCS', direction: weArePayer ? 'Credit' : 'Liability', amount: p.tcs_amount })
-      }
+    // Register: deducted_by is the payer for TDS and the seller for TCS — in
+    // both cases the side that owes it to govt.
+    for (const e of (regs || [])) {
+      if (!inRange(e.entry_date)) continue
+      const amt = toNum(e.amount)
+      if (amt <= 0) continue
+      const weDeduct = e.deducted_by_entity_id === entityId
+      if (e.entry_type === 'tds') { if (weDeduct) tdsDeducted += amt; else tdsCredit += amt }
+      else { if (weDeduct) tcsCollected += amt; else tcsCredit += amt }
+      rows.push({ source: 'Invoice', doc: e.invoice?.invoice_no, date: e.entry_date, section: e.section_code, kind: e.entry_type === 'tds' ? 'TDS' : 'TCS', direction: weDeduct ? 'Liability' : 'Credit', amount: amt })
     }
 
     for (const n of (cdns || [])) {
@@ -663,21 +662,63 @@ function Ledger({ entities, fys, defaultEntityId }) {
     if (partyId !== 'all') purchasesQ = purchasesQ.eq('seller_entity_id', partyId)
     purchasesQ = applyDateRange(purchasesQ, upTo, 'invoice_date')
 
-    // Receipts (Cr for our entity)
-    let receiptsQ = supabase.from('payments')
-      .select('id,payment_no,payment_date,net_amount,party_entity_id,party:party_entity_id(name,short_name),party_name')
-      .eq('entity_id', ourEntityId).eq('payment_type', 'receipt').eq('is_deleted', false)
-    if (partyId !== 'all') receiptsQ = receiptsQ.eq('party_entity_id', partyId)
-    receiptsQ = applyDateRange(receiptsQ, upTo, 'payment_date')
+    // CHANGED (064): payments come from invoice_payments (where the Payments
+    // module records them) — the old `payments` table was never used and is
+    // empty. Our entity paying = Payment (Dr); our entity being paid =
+    // Receipt (Cr). Rows of one multi-invoice payment post as one voucher.
+    // Cash only: TDS on old payment rows now sits in the register (below).
+    let invPayQ = supabase.from('invoice_payments')
+      .select('id,payment_group_id,payment_ref,invoice_no,actual_payment_date,entity_id,party_entity_id,amount')
+      .eq('is_deleted', false).or(`entity_id.eq.${ourEntityId},party_entity_id.eq.${ourEntityId}`)
+    invPayQ = applyDateRange(invPayQ, upTo, 'actual_payment_date')
 
-    // Payments sent (Dr for our entity)
-    let paymentsQ = supabase.from('payments')
-      .select('id,payment_no,payment_date,net_amount,party_entity_id,party:party_entity_id(name,short_name),party_name')
-      .eq('entity_id', ourEntityId).eq('payment_type', 'payment').eq('is_deleted', false)
-    if (partyId !== 'all') paymentsQ = paymentsQ.eq('party_entity_id', partyId)
-    paymentsQ = applyDateRange(paymentsQ, upTo, 'payment_date')
+    // TDS register (TDS only — TCS is a record and stays out of the balance).
+    // We deducted = Dr (less payable to the party); deducted from us = Cr.
+    let tdsQ = supabase.from('tds_tcs_entries')
+      .select('id,entry_date,amount,section_code,deducted_by_entity_id,deductee_entity_id,invoice:invoice_id(invoice_no)')
+      .eq('is_deleted', false).eq('entry_type', 'tds')
+      .or(`deducted_by_entity_id.eq.${ourEntityId},deductee_entity_id.eq.${ourEntityId}`)
+    tdsQ = applyDateRange(tdsQ, upTo, 'entry_date')
 
-    const [{ data: sales }, { data: purchases }, { data: receipts }, { data: paymentsMade }] = await Promise.all([salesQ, purchasesQ, receiptsQ, paymentsQ])
+    // Journal set-offs: the purchase side settled = Dr, the sales side = Cr.
+    let setoffQ = supabase.from('invoice_setoffs')
+      .select('id,journal_no,journal_date,entity_id,party_entity_id,amount')
+      .eq('is_deleted', false).or(`entity_id.eq.${ourEntityId},party_entity_id.eq.${ourEntityId}`)
+    setoffQ = applyDateRange(setoffQ, upTo, 'journal_date')
+
+    const [{ data: sales }, { data: purchases }, { data: invPays }, { data: tdsRegs }, { data: setoffRows }] = await Promise.all([salesQ, purchasesQ, invPayQ, tdsQ, setoffQ])
+    const entName = id => entities.find(e => e.id === id)?.short_name || entities.find(e => e.id === id)?.name
+    const partyOk = id => partyId === 'all' || id === partyId
+
+    const payVouchers = new Map()
+    for (const p of (invPays || [])) {
+      const weArePayer = p.entity_id === ourEntityId
+      const party = weArePayer ? p.party_entity_id : p.entity_id
+      if (!partyOk(party)) continue
+      const key = p.payment_group_id ? `g:${p.payment_group_id}|${weArePayer}` : `r:${p.id}`
+      if (!payVouchers.has(key)) payVouchers.set(key, { date: p.actual_payment_date, doc: p.payment_ref || p.invoice_no, party: entName(party), type: weArePayer ? 'Payment Out' : 'Receipt', dr: 0, cr: 0 })
+      const v = payVouchers.get(key)
+      if (weArePayer) v.dr += Number(p.amount) || 0; else v.cr += Number(p.amount) || 0
+    }
+    const tdsLedgerRows = (tdsRegs || []).flatMap(e => {
+      const weDeducted = e.deducted_by_entity_id === ourEntityId
+      const party = weDeducted ? e.deductee_entity_id : e.deducted_by_entity_id
+      if (!partyOk(party)) return []
+      const amt = Number(e.amount) || 0
+      return [{ date: e.entry_date, doc: e.invoice?.invoice_no || '', party: entName(party), type: 'TDS', dr: weDeducted ? amt : 0, cr: weDeducted ? 0 : amt }]
+    })
+    const journalAgg = new Map()
+    for (const o of (setoffRows || [])) {
+      const party = o.entity_id === ourEntityId ? o.party_entity_id : o.entity_id
+      if (!partyOk(party)) continue
+      const key = `${o.entity_id}|${o.journal_no}`
+      if (!journalAgg.has(key)) journalAgg.set(key, { date: o.journal_date, doc: o.journal_no, party: entName(party), amount: 0 })
+      journalAgg.get(key).amount += Number(o.amount) || 0
+    }
+    const journalLedgerRows = [...journalAgg.values()].flatMap(j => [
+      { date: j.date, doc: j.doc, party: j.party, type: 'Journal', dr: j.amount, cr: 0 },
+      { date: j.date, doc: j.doc, party: j.party, type: 'Journal', dr: 0, cr: j.amount },
+    ])
 
     // Bill Discounting — disbursements (Dr: money received from bank) and repayments (Cr: money sent back)
     let bdEventsQ = supabase.from('bill_discounting_events')
@@ -722,9 +763,10 @@ function Ledger({ entities, fys, defaultEntityId }) {
 
     const ledgerRows = [
       ...(sales || []).map(i => ({ date: i.invoice_date, doc: i.invoice_no, party: i.buyer?.short_name || i.buyer?.name, type: 'Sales Invoice', dr: i.total_amount, cr: 0 })),
-      ...(paymentsMade || []).map(p => ({ date: p.payment_date, doc: p.payment_no, party: p.party?.short_name || p.party?.name || p.party_name, type: 'Payment Out', dr: p.net_amount, cr: 0 })),
       ...(purchases || []).map(i => ({ date: i.invoice_date, doc: i.invoice_no, party: i.seller?.short_name || i.seller?.name, type: 'Purchase Invoice', dr: 0, cr: i.total_amount })),
-      ...(receipts || []).map(p => ({ date: p.payment_date, doc: p.payment_no, party: p.party?.short_name || p.party?.name || p.party_name, type: 'Receipt', dr: 0, cr: p.net_amount })),
+      ...payVouchers.values(),
+      ...tdsLedgerRows,
+      ...journalLedgerRows,
       // Bill Discounting — disbursement is Dr (cash in), repayment is Cr (cash out)
       ...(bdEvents || []).map(e => ({ date: e.discounting_date, doc: '', party: e.bank?.name || e.bank_name, type: 'BD Disbursement', dr: e.net_proceeds || 0, cr: 0 })),
       ...myRepays.map(r => ({ date: r.repayment_date, doc: '', party: r.event?.bank?.name || r.event?.bank_name, type: 'BD Repayment', dr: 0, cr: (r.total_payment || r.amount) || 0 })),
@@ -734,7 +776,7 @@ function Ledger({ entities, fys, defaultEntityId }) {
     // CHANGED: Tally-style statement. Everything dated before the period start
     // rolls into the Opening Balance; the rest are the vouchers of the period.
     // Which side each entry posts to (Dr/Cr) is unchanged from before.
-    const VCH = { 'Sales Invoice': 'Sales', 'Purchase Invoice': 'Purchase', 'Receipt': 'Receipt', 'Payment Out': 'Payment', 'BD Disbursement': 'Bill Discounting', 'BD Repayment': 'BD Repayment' }
+    const VCH = { 'Sales Invoice': 'Sales', 'Purchase Invoice': 'Purchase', 'Receipt': 'Receipt', 'Payment Out': 'Payment', 'TDS': 'TDS', 'Journal': 'Journal', 'BD Disbursement': 'Bill Discounting', 'BD Repayment': 'BD Repayment' }
     const start = range?.start || null
     let opening = 0
     const period = []
@@ -1557,9 +1599,13 @@ function AgeingReport({ entities, defaultEntityId }) {
     ])
     const invIds = [...(receivables || []), ...(payables || [])].map(i => i.id)
     let tranchesByInvoice = new Map()
+    let settlements = new Map()
     if (invIds.length) {
-      const { data: tranches } = await supabase.from('invoice_payments').select('invoice_id, amount, tds_amount, adjustments').eq('is_deleted', false).in('invoice_id', invIds)
+      const { data: tranches } = await supabase.from('invoice_payments').select('invoice_id, amount, adjustments').eq('is_deleted', false).in('invoice_id', invIds)
       tranchesByInvoice = groupTranchesByInvoice(tranches)
+      // CHANGED (064): register TDS and journal set-offs also settle invoices.
+      const settle = await fetchSettlements(invIds)
+      settlements = groupSettlementsByInvoice(settle.tdsEntries, settle.setoffs)
     }
     // CHANGED: custom date range scopes WHICH invoices are included (by
     // invoice_date) — the overdue-days math itself stays relative to today,
@@ -1568,7 +1614,7 @@ function AgeingReport({ entities, defaultEntityId }) {
     const todayStr = today()
     function toRows(list, partyKey) {
       return (list || []).filter(inv => inDateRange(inv.invoice_date, range)).map(inv => {
-        const { pending } = computeInvoiceOutstanding(inv, tranchesByInvoice.get(inv.id))
+        const { pending } = computeInvoiceOutstanding(inv, tranchesByInvoice.get(inv.id), settlementFor(settlements, inv.id))
         const dueDate = inv.due_date || inv.invoice_date
         const daysOverdue = Math.floor((new Date(todayStr) - new Date(dueDate)) / 86400000)
         return { invoice_no: inv.invoice_no, date: inv.invoice_date, due_date: inv.due_date, party: inv[partyKey]?.short_name || inv[partyKey]?.name, pending, daysOverdue }

@@ -822,10 +822,9 @@ function NewInvoice() {
       return setToast({ message: `Invoice ${invoiceNo} was created, but its line items failed to save: ${linesErr.message}. Delete this invoice and try again.`, type: 'error' })
     }
 
-    // TDS/TCS is no longer recorded at invoice creation — it's recognized at
-    // payment time instead (Payments → Invoice Payment Tracker), which is the
-    // single source of truth going forward. See tds_tcs_entries: still read
-    // (never written) below for invoices created before this change.
+    // TDS/TCS is not recorded at invoice creation. CHANGED (064): it is
+    // entered per invoice in Payments → TDS / TCS (tds_tcs_entries), and
+    // shown read-only on the invoice detail below.
 
     // Mark PI as converted if applicable
     // CHANGED: only once the PI is FULLY invoiced — a part-invoiced PI stays
@@ -1142,7 +1141,7 @@ function InvoiceDetail() {
       // the rest, undercounting totals here vs the DB-side total_qty/
       // total_amount columns (recomputed directly in Postgres, no REST cap).
       fetchAllPages(() => supabase.from('invoice_lines').select('*').eq('invoice_id', id).order('line_no')),
-      supabase.from('tds_tcs_entries').select('*').eq('invoice_id', id),  // CHANGED
+      supabase.from('tds_tcs_entries').select('*').eq('invoice_id', id).eq('is_deleted', false),  // CHANGED (064): live register entries only
       supabase.from('hsn_master').select('*').eq('is_active', true),
       fetchAllPages(() => supabase.from('products').select('id,name,hsn_code,gst_rate,unit,default_rate')),
     ])
@@ -1932,7 +1931,7 @@ function InvoiceDetail() {
           <div style={{ padding: '10px 14px', background: C.bg, fontWeight: 700, fontSize: '13px', color: C.textMid }}>TDS / TCS Entries</div>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
             <thead>
-              <tr>{['Type','Section','Description','Base Amount','Rate %','Amount','Paid'].map(h => (
+              <tr>{['Type','Section','Description','Base Amount','Rate %','Amount'].map(h => (
                 <th key={h} style={{ padding: '7px 12px', textAlign: h==='Base Amount'||h==='Rate %'||h==='Amount'?'right':'left', fontSize: '11px', fontWeight: 700, color: C.textSoft, textTransform: 'uppercase', letterSpacing: '0.05em', background: C.bg, borderBottom: `1px solid ${C.border}` }}>{h}</th>
               ))}</tr>
             </thead>
@@ -1945,7 +1944,6 @@ function InvoiceDetail() {
                   <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{formatINR(r.base_amount)}</td>
                   <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right' }}>{r.rate}%</td>
                   <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}`, textAlign: 'right', fontWeight: 700 }}>{formatINR(r.amount)}</td>
-                  <td style={{ padding: '8px 12px', borderBottom: `1px solid ${C.border}` }}><Badge status={r.is_paid?'paid':'pending'} label={r.is_paid?'Paid':'Pending'} /></td>
                 </tr>
               ))}
             </tbody>
